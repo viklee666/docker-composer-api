@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
+import { loadCursorFastDefault, loadCursorMaxModeDefault } from "./gateway-settings.js";
 import { CursorKeyPool } from "./key-pool.js";
 import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
@@ -20,6 +21,9 @@ config.cursorSdkUseHttp1ForAgent = await loadCursorSdkUseHttp1ForAgent(store, co
 if (config.cursorSdkUseHttp1ForAgent) {
   await applyCursorSdkNetworkConfig(true);
 }
+// 管理后台持久化的模型默认开关优先于 env 默认值。
+config.cursorMaxMode = await loadCursorMaxModeDefault(store, config.cursorMaxMode);
+config.cursorFast = await loadCursorFastDefault(store, config.cursorFast);
 const keyPool = new CursorKeyPool(store);
 await keyPool.seedFromEnv(config.cursorApiKeys);
 

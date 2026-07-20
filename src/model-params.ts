@@ -82,7 +82,14 @@ const MAX_MODE_PARAM = /max.?mode|context|window|long|token|length|^1m$/i;
  * - grok: effort + fast；composer: fast；glm: reasoning[high|max]。
  * maxMode 的 context 档位仍按请求下发（如 1m），老型号不支持时由上游报错并入日志，优于静默丢弃。
  */
-const FALLBACK_FAMILIES: Array<{ pattern: RegExp; defs: ModelParameterDefinition[] }> = [
+interface FallbackFamily {
+  pattern: RegExp;
+  defs: ModelParameterDefinition[];
+  /** 该家族最大 context 档位与 fast=true 互斥（无 catalog variants 时的静态兜底约束，如 GPT-5.x）。 */
+  maxContextExcludesFast?: boolean;
+}
+
+const FALLBACK_FAMILIES: FallbackFamily[] = [
   {
     pattern: /codex/i,
     defs: [
@@ -91,18 +98,23 @@ const FALLBACK_FAMILIES: Array<{ pattern: RegExp; defs: ModelParameterDefinition
     ]
   },
   {
+    // Claude 系的 1m + fast=true 是合法组合，不设互斥。
     pattern: /claude|opus|sonnet|haiku|fable/i,
     defs: [
       boolDef("thinking"),
-      enumDef("context", ["200k", "1m"])
+      enumDef("context", ["200k", "1m"]),
+      boolDef("fast")
     ]
   },
   {
+    // GPT-5.x：context=1m 时只有 fast=false，最大 context 与 fast 互斥。
     pattern: /gpt/i,
     defs: [
       enumDef("reasoning", ["low", "medium", "high"]),
-      enumDef("context", ["272k", "1m"])
-    ]
+      enumDef("context", ["272k", "1m"]),
+      boolDef("fast")
+    ],
+    maxContextExcludesFast: true
   },
   {
     pattern: /grok/i,
@@ -129,9 +141,12 @@ function boolDef(id: string): ModelParameterDefinition {
   return { id, values: [{ value: "false" }, { value: "true" }] };
 }
 
+function fallbackFamilyFor(modelId: string): FallbackFamily | undefined {
+  return FALLBACK_FAMILIES.find((entry) => entry.pattern.test(modelId));
+}
+
 export function fallbackParameterDefinitions(modelId: string): ModelParameterDefinition[] {
-  const family = FALLBACK_FAMILIES.find((entry) => entry.pattern.test(modelId));
-  return family?.defs ?? [];
+  return fallbackFamilyFor(modelId)?.defs ?? [];
 }
 
 /**
@@ -302,8 +317,10 @@ export function reasoningEffortFromThinkingBudget(budget: number): string {
  *    只发部分参数时其余参数会落到“每个参数的第一个允许值”，可能偏离默认（如 context 从 1m 掉到 300k），
  *    所以只要有任何意图就先补全默认组合。
  * 2. 按参数定义把思考强度 / Max Mode / fast 意图映射到具体参数 id / 允许值。
- * 3. 目录发现失败时按模型家族的已知惯例兜底映射（而非静默丢弃），未命中的意图记入 dropped 供日志。
- * 4. 显式 params 始终最后生效并覆盖前面所有推导结果。
+ * 3. 用 variants（合法组合白名单）校正互斥组合：如 GPT-5.x 的 context=1m 只允许 fast=false，
+ *    Max Mode 与 fast 冲突时以 Max Mode 优先（除非只显式要了 fast）。Claude 系 1m+fast=true 合法则不动。
+ * 4. 目录发现失败时按模型家族的已知惯例兜底映射（而非静默丢弃），未命中的意图记入 dropped 供日志。
+ * 5. 显式 params 始终最后生效并覆盖前面所有推导结果。
  */
 export function resolveModelParams(
   catalog: ModelCatalog | undefined,
@@ -316,9 +333,11 @@ export function resolveModelParams(
   if (!hasSemantic && !intent.params?.length) return { params: [], dropped, usedFallback: false };
 
   let defs = catalog?.parameters ?? [];
+  let family: FallbackFamily | undefined;
   let usedFallback = false;
   if (catalog === undefined && hasSemantic) {
-    defs = fallbackParameterDefinitions(modelId);
+    family = fallbackFamilyFor(modelId);
+    defs = family?.defs ?? [];
     usedFallback = defs.length > 0;
   }
 
@@ -335,6 +354,8 @@ export function resolveModelParams(
     dropped.push(`fast=${intent.fast}`);
   }
 
+  resolveContextFastConflict(result, defs, catalog?.variants, family, intent, dropped);
+
   for (const param of intent.params ?? []) result.set(param.id, param.value);
 
   return {
@@ -342,6 +363,120 @@ export function resolveModelParams(
     dropped,
     usedFallback
   };
+}
+
+/**
+ * 校正 context 档位与 fast 的互斥组合。冲突判定优先用 catalog variants（每个模型真实的合法组合白名单），
+ * 无 variants 时退回家族静态约束（maxContextExcludesFast）。
+ * 冲突时的取舍：Max Mode（大 context）优先于 fast；仅显式要了 fast、没要 Max Mode 时才反过来降 context 保 fast。
+ */
+function resolveContextFastConflict(
+  result: Map<string, string>,
+  defs: ModelParameterDefinition[],
+  variants: ModelVariantDefinition[] | undefined,
+  family: FallbackFamily | undefined,
+  intent: ModelIntent,
+  dropped: string[]
+): void {
+  const contextDef = defs.find((def) =>
+    !isBooleanDef(def) && (MAX_MODE_PARAM.test(def.id) || (def.displayName ? MAX_MODE_PARAM.test(def.displayName) : false)));
+  const fastDef = defs.find((def) => /^fast$/i.test(def.id)) ?? defs.find((def) => /fast/i.test(def.id));
+  if (!contextDef || !fastDef) return;
+  const ctxId = contextDef.id;
+  const fastId = fastDef.id;
+  if (!result.has(ctxId) || !result.has(fastId)) return;
+  const ctxVal = result.get(ctxId) ?? "";
+  const fastVal = result.get(fastId) ?? "";
+
+  if (pairIsAllowed(variants, ctxId, ctxVal, fastId, fastVal, family, contextDef)) return;
+
+  // Max Mode 优先：显式要了 maxMode，或没有单独显式要 fast 时，保 context、改 fast。
+  if (intent.maxMode !== undefined || intent.fast === undefined) {
+    const fixedFast = fastValueForContext(variants, ctxId, ctxVal, fastId, family);
+    if (fixedFast !== undefined && fixedFast !== fastVal) {
+      result.set(fastId, fixedFast);
+      dropped.push(`fast=${fastVal} (not combinable with ${ctxId}=${ctxVal}; forced ${fastId}=${fixedFast})`);
+    }
+    return;
+  }
+  // 只显式要了 fast：保 fast、把 context 降到能与该 fast 共存的最大档位。
+  const fixedCtx = contextValueForFast(variants, ctxId, fastId, fastVal, contextDef);
+  if (fixedCtx !== undefined && fixedCtx !== ctxVal) {
+    result.set(ctxId, fixedCtx);
+    dropped.push(`maxMode context=${ctxVal} (not combinable with fast=${fastVal}; downgraded ${ctxId}=${fixedCtx})`);
+  }
+}
+
+function variantValue(variant: ModelVariantDefinition, id: string): string | undefined {
+  return variant.params.find((param) => param.id === id)?.value;
+}
+
+/** (context, fast) 组合是否合法：优先查 variants 白名单，无则退回家族静态约束。 */
+function pairIsAllowed(
+  variants: ModelVariantDefinition[] | undefined,
+  ctxId: string,
+  ctxVal: string,
+  fastId: string,
+  fastVal: string,
+  family: FallbackFamily | undefined,
+  contextDef: ModelParameterDefinition
+): boolean {
+  if (variants?.length) {
+    return variants.some((variant) => variantValue(variant, ctxId) === ctxVal && variantValue(variant, fastId) === fastVal);
+  }
+  if (family?.maxContextExcludesFast && fastVal === "true") {
+    return ctxVal !== maxContextValue(contextDef);
+  }
+  return true;
+}
+
+/** 给定 context 值，返回能与之共存的 fast 值（variants 里的实际取值；无 variants 时最大档强制 false）。 */
+function fastValueForContext(
+  variants: ModelVariantDefinition[] | undefined,
+  ctxId: string,
+  ctxVal: string,
+  fastId: string,
+  family: FallbackFamily | undefined
+): string | undefined {
+  if (variants?.length) {
+    for (const variant of variants) {
+      if (variantValue(variant, ctxId) === ctxVal) {
+        const value = variantValue(variant, fastId);
+        if (value !== undefined) return value;
+      }
+    }
+    return undefined;
+  }
+  return family?.maxContextExcludesFast ? "false" : undefined;
+}
+
+/** 给定 fast 值，返回能与之共存的最大 context 档位（variants 优先；无则取次大档）。 */
+function contextValueForFast(
+  variants: ModelVariantDefinition[] | undefined,
+  ctxId: string,
+  fastId: string,
+  fastVal: string,
+  contextDef: ModelParameterDefinition
+): string | undefined {
+  if (variants?.length) {
+    let best: string | undefined;
+    for (const variant of variants) {
+      if (variantValue(variant, fastId) !== fastVal) continue;
+      const value = variantValue(variant, ctxId);
+      if (value === undefined) continue;
+      if (best === undefined || contextSize(value) > contextSize(best)) best = value;
+    }
+    return best;
+  }
+  // 无 variants：退回定义里第二大的 context 档位（最大档与 fast 互斥）。
+  const sorted = [...contextDef.values].map((entry) => entry.value).sort((a, b) => contextSize(b) - contextSize(a));
+  return sorted[1] ?? sorted[0];
+}
+
+function maxContextValue(contextDef: ModelParameterDefinition): string {
+  return [...contextDef.values]
+    .map((entry) => entry.value)
+    .sort((a, b) => contextSize(b) - contextSize(a))[0] ?? "";
 }
 
 /** “跟随模型默认强度”的软等级：开思考但不覆盖模型默认 effort（如 Claude adaptive thinking）。 */

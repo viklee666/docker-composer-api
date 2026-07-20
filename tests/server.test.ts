@@ -1222,6 +1222,58 @@ test("admin settings can toggle Cursor SDK HTTP/1.1 mode", async () => {
   assert.equal(overview.json().config.cursorSdkUseHttp1ForAgent, true);
 });
 
+test("admin settings can toggle default Max Mode and Fast and they flow into requests", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, store } = await createTestApp({ runner });
+  const adminHeaders = { authorization: "Bearer gateway-key" };
+
+  const saved = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorMaxMode: true, cursorFast: true }
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(saved.json().config.cursorMaxMode, true);
+  assert.equal(saved.json().config.cursorFast, true);
+  assert.equal(await store.getSetting("cursorMaxModeDefault"), "on");
+  assert.equal(await store.getSetting("cursorFastDefault"), "on");
+
+  const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
+  assert.equal(overview.json().config.cursorMaxMode, true);
+  assert.equal(overview.json().config.cursorFast, true);
+
+  // 默认开关应流入实际请求（客户端未显式指定时）。
+  const chat = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(chat.statusCode, 200);
+  assert.equal(runner.lastInput?.maxMode, true);
+  assert.equal(runner.lastInput?.fast, true);
+
+  // 关闭后网关不再强加默认（交回客户端/模型）。
+  const off = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorMaxMode: false, cursorFast: false }
+  });
+  assert.equal(off.json().config.cursorMaxMode, false);
+  assert.equal(off.json().config.cursorFast, false);
+
+  await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hi" }] }
+  });
+  assert.equal(runner.lastInput?.maxMode, undefined);
+  assert.equal(runner.lastInput?.fast, undefined);
+});
+
 test("requests are recorded into admin logs and overview stats", async () => {
   const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
   const chat = await app.inject({
@@ -1275,6 +1327,7 @@ const claudeCatalog: ModelCatalog = {
   ]
 };
 
+// GPT-5.x：272k 有 fast 两态；1m 只有 fast=false（1m 与 fast 互斥），对照实测目录。
 const gptCatalog: ModelCatalog = {
   parameters: [
     { id: "context", values: [{ value: "272k" }, { value: "1m" }] },
@@ -1282,15 +1335,11 @@ const gptCatalog: ModelCatalog = {
     { id: "fast", values: [{ value: "false" }, { value: "true" }] }
   ],
   variants: [
-    {
-      displayName: "GPT-5.6",
-      isDefault: true,
-      params: [
-        { id: "context", value: "1m" },
-        { id: "reasoning", value: "medium" },
-        { id: "fast", value: "false" }
-      ]
-    }
+    { displayName: "GPT-5.6", params: [{ id: "context", value: "272k" }, { id: "reasoning", value: "medium" }, { id: "fast", value: "false" }] },
+    { displayName: "GPT-5.6", params: [{ id: "context", value: "272k" }, { id: "reasoning", value: "medium" }, { id: "fast", value: "true" }] },
+    { displayName: "GPT-5.6", params: [{ id: "context", value: "272k" }, { id: "reasoning", value: "xhigh" }, { id: "fast", value: "true" }] },
+    { displayName: "GPT-5.6", isDefault: true, params: [{ id: "context", value: "1m" }, { id: "reasoning", value: "medium" }, { id: "fast", value: "false" }] },
+    { displayName: "GPT-5.6", params: [{ id: "context", value: "1m" }, { id: "reasoning", value: "xhigh" }, { id: "fast", value: "false" }] }
   ]
 };
 
@@ -1328,6 +1377,40 @@ test("resolveModelParams maps codex-style reasoning and context downshift on GPT
     reasoning: "xhigh",
     fast: "true"
   });
+});
+
+test("resolveModelParams keeps Max Mode over fast when a GPT model cannot combine 1m + fast", () => {
+  const resolved = resolveModelParams(gptCatalog, { maxMode: true, fast: true }, "gpt-5.6-sol");
+  assert.equal(paramsMap(resolved.params).context, "1m");
+  assert.equal(paramsMap(resolved.params).fast, "false");
+  assert.ok(resolved.dropped.some((entry) => entry.includes("fast=true")));
+});
+
+test("resolveModelParams downgrades context to keep fast when only fast is requested on GPT", () => {
+  const resolved = resolveModelParams(gptCatalog, { fast: true }, "gpt-5.6-sol");
+  assert.equal(paramsMap(resolved.params).fast, "true");
+  assert.equal(paramsMap(resolved.params).context, "272k");
+});
+
+test("resolveModelParams allows 1m + fast together on Claude models that support it", () => {
+  const claudeWithFastVariants: ModelCatalog = {
+    parameters: claudeCatalog.parameters,
+    variants: [
+      { displayName: "Opus 4.8", isDefault: true, params: [{ id: "cyber", value: "false" }, { id: "thinking", value: "true" }, { id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "false" }] },
+      { displayName: "Opus 4.8", params: [{ id: "cyber", value: "false" }, { id: "thinking", value: "true" }, { id: "context", value: "1m" }, { id: "effort", value: "high" }, { id: "fast", value: "true" }] }
+    ]
+  };
+  const resolved = resolveModelParams(claudeWithFastVariants, { maxMode: true, fast: true }, "claude-opus-4-8");
+  assert.equal(paramsMap(resolved.params).context, "1m");
+  assert.equal(paramsMap(resolved.params).fast, "true");
+  assert.deepEqual(resolved.dropped, []);
+});
+
+test("resolveModelParams keeps Max Mode over fast on GPT even without catalog (family fallback)", () => {
+  const resolved = resolveModelParams(undefined, { maxMode: true, fast: true }, "gpt-5.6-sol");
+  assert.equal(resolved.usedFallback, true);
+  assert.equal(paramsMap(resolved.params).context, "1m");
+  assert.equal(paramsMap(resolved.params).fast, "false");
 });
 
 test("resolveModelParams falls back to family conventions when catalog discovery fails", () => {

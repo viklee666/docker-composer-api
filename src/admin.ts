@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
 import { ApiError, normalizeError } from "./errors.js";
+import { saveCursorFastDefault, saveCursorMaxModeDefault } from "./gateway-settings.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel } from "./models.js";
 import {
@@ -40,6 +41,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         requestTimeoutMs: deps.config.requestTimeoutMs,
         workingDirectory: deps.config.cursorWorkingDirectory,
         cursorSdkUseHttp1ForAgent,
+        cursorMaxMode: deps.config.cursorMaxMode === true,
+        cursorFast: deps.config.cursorFast === true,
         gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey)
       },
       keys: {
@@ -56,16 +59,45 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   app.post("/admin/api/settings", async (request) => {
     requireAdmin(request, deps);
     const body = objectBody(request.body);
-    if (typeof body.cursorSdkUseHttp1ForAgent !== "boolean") {
-      throw new ApiError("cursorSdkUseHttp1ForAgent must be a boolean.", 400, "invalid_request_error", "cursorSdkUseHttp1ForAgent");
+    let touched = false;
+
+    if (body.cursorSdkUseHttp1ForAgent !== undefined) {
+      if (typeof body.cursorSdkUseHttp1ForAgent !== "boolean") {
+        throw new ApiError("cursorSdkUseHttp1ForAgent must be a boolean.", 400, "invalid_request_error", "cursorSdkUseHttp1ForAgent");
+      }
+      deps.config.cursorSdkUseHttp1ForAgent = body.cursorSdkUseHttp1ForAgent;
+      await saveCursorSdkUseHttp1ForAgent(deps.store, body.cursorSdkUseHttp1ForAgent);
+      await (deps.applyCursorSdkNetworkConfig ?? applyCursorSdkNetworkConfig)(body.cursorSdkUseHttp1ForAgent);
+      touched = true;
     }
-    deps.config.cursorSdkUseHttp1ForAgent = body.cursorSdkUseHttp1ForAgent;
-    await saveCursorSdkUseHttp1ForAgent(deps.store, body.cursorSdkUseHttp1ForAgent);
-    await (deps.applyCursorSdkNetworkConfig ?? applyCursorSdkNetworkConfig)(body.cursorSdkUseHttp1ForAgent);
+
+    // Max Mode / Fast 默认开关：开启→网关对支持的模型强制默认；关闭→网关不强加默认（交回客户端/模型）。
+    if (body.cursorMaxMode !== undefined) {
+      if (typeof body.cursorMaxMode !== "boolean") {
+        throw new ApiError("cursorMaxMode must be a boolean.", 400, "invalid_request_error", "cursorMaxMode");
+      }
+      deps.config.cursorMaxMode = body.cursorMaxMode ? true : undefined;
+      await saveCursorMaxModeDefault(deps.store, body.cursorMaxMode);
+      touched = true;
+    }
+
+    if (body.cursorFast !== undefined) {
+      if (typeof body.cursorFast !== "boolean") {
+        throw new ApiError("cursorFast must be a boolean.", 400, "invalid_request_error", "cursorFast");
+      }
+      deps.config.cursorFast = body.cursorFast ? true : undefined;
+      await saveCursorFastDefault(deps.store, body.cursorFast);
+      touched = true;
+    }
+
+    if (!touched) throw new ApiError("No settings provided.", 400, "invalid_request_error");
+
     return {
       ok: true,
       config: {
-        cursorSdkUseHttp1ForAgent: body.cursorSdkUseHttp1ForAgent
+        cursorSdkUseHttp1ForAgent: deps.config.cursorSdkUseHttp1ForAgent,
+        cursorMaxMode: deps.config.cursorMaxMode === true,
+        cursorFast: deps.config.cursorFast === true
       }
     };
   });

@@ -143,13 +143,25 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   <div class="panel">
     <div class="head"><h2>运行设置</h2><span class="hint">设置会保存到数据库并立即影响后续新建的 Cursor local agent</span></div>
     <div class="body">
-      <div class="row">
+      <div class="row" style="margin-bottom:10px">
+        <label class="toggle" style="font-size:13px;color:var(--text)">
+          <input type="checkbox" id="max-mode-toggle">
+          支持的模型默认开启 Max Mode（大上下文 / 1M）
+        </label>
+        <label class="toggle" style="font-size:13px;color:var(--text)">
+          <input type="checkbox" id="fast-toggle">
+          支持的模型默认开启 Fast
+        </label>
+      </div>
+      <div class="row" style="margin-bottom:10px">
         <label class="toggle" style="font-size:13px;color:var(--text)">
           <input type="checkbox" id="sdk-http1-toggle">
           强制 Cursor local agent 使用 HTTP/1.1 + SSE
         </label>
+      </div>
+      <div class="row">
         <button id="btn-save-settings">保存设置</button>
-        <span class="muted small">代理或网络环境不兼容 HTTP/2 时可开启；已存在的 agent 会话可能需要新请求/新会话才完全生效。</span>
+        <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 用于代理不兼容 HTTP/2 的排查。</span>
       </div>
     </div>
   </div>
@@ -302,6 +314,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('chip-direct').textContent = '直传 key：' + (data.config.allowDirectCursorKeys ? '允许' : '禁止');
     $('chip-http1').textContent = 'HTTP：' + (data.config.cursorSdkUseHttp1ForAgent ? '1.1' : '默认');
     $('sdk-http1-toggle').checked = !!data.config.cursorSdkUseHttp1ForAgent;
+    $('max-mode-toggle').checked = !!data.config.cursorMaxMode;
+    $('fast-toggle').checked = !!data.config.cursorFast;
     $('st-keys').textContent = data.keys.active + ' / ' + data.keys.total;
     $('st-keys-d').textContent = '已禁用 ' + data.keys.disabled + ' 个';
     $('st-total').textContent = data.requests.total;
@@ -461,13 +475,19 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   });
 
   $('btn-save-settings').addEventListener('click', function(){
-    var enabled = $('sdk-http1-toggle').checked;
+    var body = {
+      cursorSdkUseHttp1ForAgent: $('sdk-http1-toggle').checked,
+      cursorMaxMode: $('max-mode-toggle').checked,
+      cursorFast: $('fast-toggle').checked
+    };
     var button = $('btn-save-settings');
     button.disabled = true;
     button.textContent = '保存中…';
-    api('POST', '/admin/api/settings', { cursorSdkUseHttp1ForAgent: enabled }).then(function(data){
-      toast(enabled ? '已开启 HTTP/1.1 模式' : '已关闭 HTTP/1.1 模式');
+    api('POST', '/admin/api/settings', body).then(function(data){
+      toast('设置已保存');
       $('chip-http1').textContent = 'HTTP：' + (data.config.cursorSdkUseHttp1ForAgent ? '1.1' : '默认');
+      $('max-mode-toggle').checked = !!data.config.cursorMaxMode;
+      $('fast-toggle').checked = !!data.config.cursorFast;
     }).catch(function(err){
       toast('保存设置失败：' + err.message, true);
       loadAll();
