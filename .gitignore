@@ -1,0 +1,30 @@
+node_modules
+dist
+.wrangler
+.dev.vars
+.env
+.env.*
+!.env.example
+sample-projects/
+*.log
+.DS_Store
+
+# 本地运行产生的状态库
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 常见本地私钥/证书
+*.pem
+*.key
+*.crt
+*.p12
+
+# 本地探测输出
+logs/

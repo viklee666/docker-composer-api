@@ -1,0 +1,32 @@
+services:
+  composer-api:
+    build:
+      context: .
+    # 仅绑定本机回环用于调试；外部流量一律经 shared_proxy 网络上的 nginx 反代
+    # （nginx 直接 proxy_pass http://composer-api:8787，不依赖此端口映射）。
+    # 如需彻底不暴露宿主机端口，删除下面两行即可。
+    ports:
+      - "127.0.0.1:${PORT:-8787}:8787"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      SQLITE_PATH: /data/state.sqlite
+      CURSOR_WORKING_DIRECTORY: /workspace
+    volumes:
+      - composer-api-data:/data
+      - composer-api-workspace:/workspace
+    networks:
+      - proxy
+    restart: unless-stopped
+
+volumes:
+  composer-api-data:
+  composer-api-workspace:
+
+networks:
+  proxy:
+    external: true
+    name: shared_proxy
