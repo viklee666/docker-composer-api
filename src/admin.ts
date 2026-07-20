@@ -53,54 +53,6 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     };
   });
 
-  app.get("/admin/api/persistent", async (request) => {
-    requireAdmin(request, deps);
-    return { persistent: deps.persistentAgent?.getStatus() ?? null };
-  });
-
-  app.post("/admin/api/persistent/start", async (request) => {
-    requireAdmin(request, deps);
-    if (!deps.persistentAgent) throw new ApiError("Persistent agent manager is unavailable.", 503, "persistent_unavailable");
-    const body = objectBody(request.body);
-    const keyId = typeof body.keyId === "string" && body.keyId.trim() ? body.keyId.trim() : undefined;
-    const key = keyId
-      ? (await deps.keyPool.list()).find((item) => item.id === keyId)
-      : await deps.keyPool.pickActive(new Set());
-    if (!key) throw new ApiError("No active Cursor key available for persistent agent.", 429, "insufficient_quota");
-    const model = normalizeModel(body.model);
-    const httpMode = parseHttpMode(body.httpMode);
-    const modelParams = parseModelParams(body.modelParams);
-    deps.persistentAgent.start({
-      apiKey: key.apiKey,
-      model,
-      modelParams,
-      httpMode,
-      cwd: deps.config.cursorWorkingDirectory,
-      maxAttempts: positiveInteger(body.maxAttempts, 1000),
-      readyTimeoutMs: positiveInteger(body.readyTimeoutMs, 45_000),
-      responseTimeoutMs: positiveInteger(body.responseTimeoutMs, deps.config.requestTimeoutMs),
-      systemPrompt: typeof body.systemPrompt === "string" ? body.systemPrompt : undefined,
-      userPrompt: typeof body.userPrompt === "string" ? body.userPrompt : undefined,
-      routeApiTraffic: body.routeApiTraffic === true
-    });
-    return { ok: true, persistent: deps.persistentAgent.getStatus() };
-  });
-
-  app.post("/admin/api/persistent/stop", async (request) => {
-    requireAdmin(request, deps);
-    await deps.persistentAgent?.stop();
-    return { ok: true, persistent: deps.persistentAgent?.getStatus() ?? null };
-  });
-
-  app.post("/admin/api/persistent/route", async (request) => {
-    requireAdmin(request, deps);
-    if (!deps.persistentAgent) throw new ApiError("Persistent agent manager is unavailable.", 503, "persistent_unavailable");
-    const body = objectBody(request.body);
-    if (typeof body.enabled !== "boolean") throw new ApiError("enabled must be a boolean.", 400, "invalid_request_error", "enabled");
-    deps.persistentAgent.setRouteApiTraffic(body.enabled);
-    return { ok: true, persistent: deps.persistentAgent.getStatus() };
-  });
-
   app.post("/admin/api/settings", async (request) => {
     requireAdmin(request, deps);
     const body = objectBody(request.body);
@@ -280,30 +232,4 @@ function keyId(request: FastifyRequest): string {
 
 function objectBody(body: unknown): Record<string, unknown> {
   return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
-}
-
-function parseHttpMode(value: unknown): "default" | "1.1" | "2" {
-  return value === "1.1" || value === "2" || value === "default" ? value : "default";
-}
-
-function parseModelParams(value: unknown): Array<{ id: string; value: string }> | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  let parsed: unknown;
-  try {
-    parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
-  } catch {
-    throw new ApiError("modelParams must be valid JSON.", 400, "invalid_request_error", "modelParams");
-  }
-  if (!Array.isArray(parsed)) throw new ApiError("modelParams must be a JSON array.", 400, "invalid_request_error", "modelParams");
-  return parsed.flatMap((item) => {
-    const record = item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
-    return typeof record?.id === "string" && typeof record.value === "string"
-      ? [{ id: record.id, value: record.value }]
-      : [];
-  });
-}
-
-function positiveInteger(value: unknown, fallback: number): number {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

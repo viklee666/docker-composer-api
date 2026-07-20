@@ -7,7 +7,6 @@ import type { CursorKeyPool } from "./key-pool.js";
 import { errorMessage } from "./key-pool.js";
 import { mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-params.js";
 import { listAvailableModels, openAiModelList, openAiModelObject, type ModelLister } from "./models.js";
-import type { PersistentAgentManager } from "./persistent-agent.js";
 import {
   anthropicMessageObject,
   anthropicToolUse,
@@ -47,7 +46,6 @@ export interface AppDeps {
   modelLister?: ModelLister;
   /** SDK 网络配置应用器，测试时可注入桩以避免加载真实 SDK。 */
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
-  persistentAgent?: PersistentAgentManager;
 }
 
 interface RequestLog {

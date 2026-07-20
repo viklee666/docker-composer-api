@@ -3,7 +3,6 @@ import { CursorSdkRunner } from "./cursor-runner.js";
 import { CursorKeyPool } from "./key-pool.js";
 import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
-import { PersistentAgentManager, PersistentRoutingRunner } from "./persistent-agent.js";
 import { applyCursorSdkNetworkConfig, loadCursorSdkUseHttp1ForAgent } from "./sdk-network.js";
 import { createApp } from "./server.js";
 import { SqliteStateStore } from "./store.js";
@@ -34,13 +33,11 @@ const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
   maxKeyAttempts: config.maxKeyAttempts,
   maxTransientAttempts: config.maxTransientAttempts
 });
-const persistentAgent = new PersistentAgentManager();
 const app = createApp({
   config,
   store,
-  runner: new PersistentRoutingRunner(persistentAgent, runner),
+  runner,
   keyPool,
-  persistentAgent,
   startedAt: Date.now()
 });
 

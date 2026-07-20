@@ -155,29 +155,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   </div>
 
   <div class="panel">
-    <div class="head"><h2>持久 active run（实验）</h2><span class="hint">后台反复尝试启动一个长期工具循环；ready 后可接管后续 API 请求，失败时自动回落原逻辑</span></div>
-    <div class="body">
-      <div class="row" style="margin-bottom:10px">
-        <select id="persistent-model" style="min-width:180px"></select>
-        <select id="persistent-http" style="min-width:120px">
-          <option value="default">HTTP 默认</option>
-          <option value="2">HTTP/2</option>
-          <option value="1.1">HTTP/1.1</option>
-        </select>
-        <input id="persistent-attempts" value="1000" style="width:110px" title="最大重试次数">
-        <label class="toggle" style="font-size:13px;color:var(--text)"><input type="checkbox" id="persistent-route"> 接管 API 流量</label>
-        <button class="primary" id="btn-persistent-start">启动</button>
-        <button class="danger" id="btn-persistent-stop">停止</button>
-        <button id="btn-persistent-refresh">刷新状态</button>
-      </div>
-      <textarea id="persistent-params" rows="2" style="width:100%;margin-bottom:10px" placeholder='模型参数 JSON 数组，例如 [{"id":"context","value":"max"},{"id":"thinking","value":"medium"}]'></textarea>
-      <textarea id="persistent-system" rows="5" style="width:100%;margin-bottom:10px" placeholder="系统提示词（留空使用默认持久循环提示）"></textarea>
-      <textarea id="persistent-user" rows="2" style="width:100%;margin-bottom:10px" placeholder="启动提示词（留空使用默认：立即调用 wait_for_user_input）"></textarea>
-      <div id="persistent-status" class="mono small muted">状态：-</div>
-    </div>
-  </div>
-
-  <div class="panel">
     <div class="head">
       <h2>Cursor Key 池</h2>
       <span class="hint">按下表顺序取第一个可用 key（↑↓ 可调整）；额度不足/失效自动禁用并切换下一个，上游临时报错则自动换下一个但不禁用，恢复后请手动启用；全部禁用时 API 统一返回无有效 key</span>
@@ -342,35 +319,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         select.appendChild(option);
       });
     }
-    var persistentSelect = $('persistent-model');
-    if (persistentSelect.options.length === 0 && data.models) {
-      data.models.forEach(function(id){
-        var option = document.createElement('option');
-        option.value = id;
-        option.textContent = id;
-        persistentSelect.appendChild(option);
-      });
-      persistentSelect.value = data.models.indexOf('claude-fable-5') >= 0 ? 'claude-fable-5' : data.models[0];
-    }
-  }
-
-  function renderPersistent(data){
-    var p = data && data.persistent;
-    if (!p) {
-      $('persistent-status').textContent = '状态：不可用';
-      return;
-    }
-    $('persistent-route').checked = !!p.routeApiTraffic;
-    $('persistent-status').textContent = '状态：' + p.status
-      + ' | route=' + p.routeApiTraffic
-      + ' | model=' + (p.model || '-')
-      + ' | http=' + (p.httpMode || '-')
-      + ' | attempts=' + p.attempts
-      + ' | successes=' + p.successes
-      + ' | failures=' + p.failures
-      + ' | waiting=' + p.waiting
-      + ' | active=' + p.activeRequest
-      + (p.lastError ? ' | error=' + p.lastError : '');
   }
 
   var lastKeys = [];
@@ -469,13 +417,11 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     Promise.all([
       api('GET', '/admin/api/overview'),
       api('GET', '/admin/api/keys'),
-      api('GET', '/admin/api/logs?limit=50'),
-      api('GET', '/admin/api/persistent')
+      api('GET', '/admin/api/logs?limit=50')
     ]).then(function(results){
       renderOverview(results[0]);
       renderKeys(results[1].keys);
       renderLogs(results[2].logs);
-      renderPersistent(results[3]);
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('加载失败：' + err.message, true);
     }).finally(function(){
@@ -529,42 +475,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       button.disabled = false;
       button.textContent = '保存设置';
     });
-  });
-
-  $('btn-persistent-refresh').addEventListener('click', function(){
-    api('GET', '/admin/api/persistent').then(renderPersistent)
-      .catch(function(err){ toast('刷新持久会话失败：' + err.message, true); });
-  });
-
-  $('btn-persistent-start').addEventListener('click', function(){
-    var paramsText = $('persistent-params').value.trim();
-    var body = {
-      model: $('persistent-model').value || 'claude-fable-5',
-      httpMode: $('persistent-http').value,
-      maxAttempts: Number($('persistent-attempts').value) || 1000,
-      routeApiTraffic: $('persistent-route').checked,
-      systemPrompt: $('persistent-system').value,
-      userPrompt: $('persistent-user').value
-    };
-    if (paramsText) body.modelParams = paramsText;
-    api('POST', '/admin/api/persistent/start', body).then(function(data){
-      toast('已开始后台启动持久 active run');
-      renderPersistent(data);
-    }).catch(function(err){ toast('启动失败：' + err.message, true); });
-  });
-
-  $('btn-persistent-stop').addEventListener('click', function(){
-    api('POST', '/admin/api/persistent/stop').then(function(data){
-      toast('已停止持久 active run');
-      renderPersistent(data);
-    }).catch(function(err){ toast('停止失败：' + err.message, true); });
-  });
-
-  $('persistent-route').addEventListener('change', function(){
-    api('POST', '/admin/api/persistent/route', { enabled: $('persistent-route').checked }).then(function(data){
-      renderPersistent(data);
-      toast($('persistent-route').checked ? '已开启 API 接管' : '已关闭 API 接管');
-    }).catch(function(err){ toast('切换接管失败：' + err.message, true); loadAll(); });
   });
 
   $('keys-body').addEventListener('click', function(event){
