@@ -288,7 +288,9 @@ export class CursorSdkRunner implements CursorRunner {
       apiKey: input.apiKey,
       model: resolved.model,
       name: "Docker Composer API",
-      local: { cwd: input.workingDirectory || this.input.defaultWorkingDirectory },
+      // settingSources: [] 显式关闭环境规则加载，绝不把调用方机器/项目/团队的 Cursor 规则
+      //（~/.cursor、.cursor/rules、AGENTS.md 等）注入到请求里，避免夹带额外提示词。
+      local: { cwd: input.workingDirectory || this.input.defaultWorkingDirectory, settingSources: [] },
       clientVersion: this.input.sdkClientVersion,
       ...(resolved.mode ? { mode: resolved.mode } : {})
     };

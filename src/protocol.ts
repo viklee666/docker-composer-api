@@ -31,7 +31,7 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
   const messages = arrayField(record, "messages");
   rejectCommonUnsupported(record);
   const tools = parseOpenAiTools(record.tools, record.tool_choice);
-  const transcript: string[] = [systemDirective("OpenAI Chat Completions", tools)];
+  const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
   transcript.push("", "Conversation:");
   const images: GatewayImage[] = [];
@@ -46,7 +46,6 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
     }
     if (Array.isArray(item.tool_calls)) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(item.tool_calls)}`);
   }
-  appendGenerationOptions(transcript, record);
   appendToolReminder(transcript, tools);
   return basePrepared(record, transcript.join("\n"), images, tools, messages);
 }
@@ -56,7 +55,7 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   rejectCommonUnsupported(record);
   const tools = parseOpenAiTools(record.tools, record.tool_choice);
   const images: GatewayImage[] = [];
-  const transcript: string[] = [systemDirective("OpenAI Responses API", tools)];
+  const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
   const instructions = typeof record.instructions === "string" ? record.instructions.trim() : "";
   if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
@@ -66,7 +65,6 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   transcript.push("", "INPUT:");
   const inputItems = normalizedResponseInput(record.input);
   transcript.push(responseInputToTextAndImages(record.input, images));
-  appendGenerationOptions(transcript, record);
   appendToolReminder(transcript, tools);
   return basePrepared(record, transcript.join("\n"), images, tools, inputItems);
 }
@@ -78,7 +76,7 @@ export function prepareAnthropicMessages(body: unknown): PreparedRequest {
   const messages = arrayField(record, "messages");
   const tools = parseAnthropicTools(record.tools, record.tool_choice);
   const images: GatewayImage[] = [];
-  const transcript: string[] = [systemDirective("Anthropic Messages API", tools)];
+  const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
   const system = anthropicSystemText(record.system, images);
   if (system) transcript.push("", `SYSTEM:\n${system}`);
@@ -88,7 +86,6 @@ export function prepareAnthropicMessages(body: unknown): PreparedRequest {
     const role = stringField(item, "role", "user");
     transcript.push(`${role.toUpperCase()}: ${anthropicContentToTextAndImages(item.content, images) || "[empty]"}`);
   }
-  appendAnthropicOptions(transcript, record);
   appendToolReminder(transcript, tools);
   return basePrepared(record, transcript.join("\n"), images, tools, messages);
 }
@@ -400,23 +397,19 @@ function rejectCommonUnsupported(record: Record<string, unknown>): void {
   if (record.audio !== undefined) throw new ApiError("audio output is not supported.", 400, "unsupported_parameter", "audio");
 }
 
-function systemDirective(protocol: string, tools: GatewayTool[]): string {
+/**
+ * 网关注入的最小化前导指令：
+ * - 无工具：只保留一句防止底层 Cursor agent 擅自动文件/命令的护栏（尽量不夹带其它提示词）。
+ * - 有工具：保留客户端工具协议（这是工具调用能正常工作的必要说明，不能省）。
+ */
+function systemDirective(tools: GatewayTool[]): string {
+  if (!tools.length) return "Respond to the conversation below directly. Do not use tools or edit files.";
   return [
-    `You are serving a ${protocol} request through Cursor Composer.`,
-    "Answer directly unless a client-provided tool is required.",
-    "Never run local commands or edit files inside the gateway container.",
-    ...(tools.length
-      ? [
-          "",
-          "CLIENT TOOLS PROTOCOL:",
-          "The caller registered external tools (listed under TOOLS below). They are exposed to you as Cursor SDK custom user tools and are executed by the CALLER on their machine, not by you and not by your environment.",
-          "Treat every listed tool as available and callable at all times. Use the exact tool name and input schema shown under TOOLS.",
-          "Never claim a listed tool is unavailable. Never substitute Cursor builtin shell/file/search tools for a listed client tool.",
-          "When the request requires a listed tool, call the registered client tool through the tool interface. If and only if the tool interface is unavailable, your ENTIRE reply must consist of only fallback tool call block(s) in exactly this format, with no other prose:",
-          '<tool_call>{"name":"tool_name","arguments":{"key":"value"}}</tool_call>',
-          "The caller will execute the tool(s) and send the results back in a follow-up request; answer with text only after results arrive (TOOL RESULT messages)."
-        ]
-      : ["Return only final answer text."])
+    "The caller registered external tools (listed under TOOLS below), executed by the CALLER on their machine, not by you.",
+    "Treat every listed tool as available. Use the exact tool name and input schema shown under TOOLS; never claim a listed tool is unavailable and never substitute a builtin tool for it.",
+    "When a listed tool is needed, call it through the tool interface. Only if the tool interface is unavailable, reply with ONLY fallback tool call block(s) in exactly this format and no other prose:",
+    '<tool_call>{"name":"tool_name","arguments":{"key":"value"}}</tool_call>',
+    "The caller executes the tool(s) and returns results in a follow-up request; answer with text only after TOOL RESULT messages arrive."
   ].join("\n");
 }
 
@@ -434,28 +427,6 @@ function appendToolReminder(transcript: string[], tools: GatewayTool[]): void {
     "",
     `REMINDER: The client tools [${tools.map((tool) => tool.name).join(", ")}] are provided by the caller and always available. If the latest user request requires one of them and its TOOL RESULT is not in the conversation yet, call the registered client tool by exact name; use <tool_call> fallback only if no tool interface is available.`
   );
-}
-
-function appendGenerationOptions(transcript: string[], record: Record<string, unknown>): void {
-  const options = {
-    max_tokens: record.max_tokens ?? record.max_output_tokens ?? null,
-    temperature: record.temperature ?? null,
-    top_p: record.top_p ?? null,
-    stop: record.stop ?? null,
-    response_format: record.response_format ?? record.text ?? null
-  };
-  transcript.push("", `GENERATION_OPTIONS: ${JSON.stringify(options)}`);
-}
-
-function appendAnthropicOptions(transcript: string[], record: Record<string, unknown>): void {
-  const options = {
-    max_tokens: record.max_tokens ?? null,
-    temperature: record.temperature ?? null,
-    top_p: record.top_p ?? null,
-    stop_sequences: record.stop_sequences ?? null,
-    metadata: record.metadata ?? null
-  };
-  transcript.push("", `ANTHROPIC_OPTIONS: ${JSON.stringify(options)}`);
 }
 
 function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
