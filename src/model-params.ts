@@ -149,9 +149,19 @@ export function parseModelSpec(raw: unknown): ModelSpec {
   let rest = text;
   const explicitParams = new Map<string, string>();
 
+  // ACP / Claude Code 风格的方括号后缀：`model[key=value,...]`（显式 params）或裸 token（`[1m]` / `[fast]` / `[high]`）。
+  // Claude Code 指向自定义 base URL 时会把 `[1m]` 原样透传进请求体 model 字段（且会丢掉 context-1m beta 头），
+  // 所以这里必须能从裸 token 识别 Max Mode，否则 Claude Code 的 1M 设置到不了网关。
   const bracket = /\[([^\][]*)\]/.exec(rest);
   if (bracket) {
-    for (const param of parseModelParamsSpec(bracket[1]) ?? []) explicitParams.set(param.id, param.value);
+    for (const token of bracket[1].split(/[,;\n]/).map((item) => item.trim()).filter(Boolean)) {
+      const eq = token.indexOf("=");
+      if (eq > 0) {
+        explicitParams.set(token.slice(0, eq).trim(), token.slice(eq + 1).trim());
+      } else {
+        applyBareSuffixToken(intent, token);
+      }
+    }
     rest = (rest.slice(0, bracket.index) + rest.slice(bracket.index + bracket[0].length)).trim();
   }
 
@@ -187,6 +197,37 @@ export function parseModelSpec(raw: unknown): ModelSpec {
   }
 
   return { model: rest.trim(), intent };
+}
+
+/** 上下文/大窗口 token（如 1m / 273k / 200000），出现即视为开启 Max Mode。 */
+const CONTEXT_SIZE_TOKEN = /^\d+(\.\d+)?[km]?$/i;
+
+/**
+ * 解析方括号里不带 `=` 的裸 token，按取值语义分类（与位置无关）：
+ * - 上下文档位（1m/273k/...）或 max-mode/long → maxMode=true；nomax/small/default → maxMode=false
+ * - fast/slow → fast
+ * - 其余（low/medium/high/xhigh/max/none...）→ 思考强度
+ */
+function applyBareSuffixToken(intent: ModelIntent, token: string): void {
+  const value = token.trim().toLowerCase();
+  if (!value) return;
+  if ((CONTEXT_SIZE_TOKEN.test(value) && /[km]$/.test(value)) || ["max-mode", "maxmode", "long", "1m"].includes(value)) {
+    if (intent.maxMode === undefined) intent.maxMode = true;
+    return;
+  }
+  if (["nomax", "no-max", "small", "default-context"].includes(value)) {
+    if (intent.maxMode === undefined) intent.maxMode = false;
+    return;
+  }
+  if (value === "fast") {
+    if (intent.fast === undefined) intent.fast = true;
+    return;
+  }
+  if (["slow", "nofast", "no-fast"].includes(value)) {
+    if (intent.fast === undefined) intent.fast = false;
+    return;
+  }
+  if (intent.reasoningEffort === undefined) intent.reasoningEffort = value;
 }
 
 /** 解析 `id=value,id2=value2`（或 `;` 分隔）或 JSON 数组形式的 model.params。 */

@@ -153,6 +153,8 @@ http://127.0.0.1:8787
 模型 id 后缀（适合只能改模型名的客户端，如 `ANTHROPIC_MODEL`）：
 
 ```txt
+claude-opus-4-8[1m]               # 方括号后缀（Claude Code 原生写法），[1m] 开 Max Mode
+claude-opus-4-8[1m,xhigh,fast]    # 方括号里可组合：1m=Max Mode、xhigh=思考强度、fast
 claude-opus-4-8@1m:xhigh          # @1m 开 Max Mode，:xhigh 思考强度
 gpt-5.5@1m:high#fast=false        # #id=value 显式 model.params
 claude-opus-4-8[thinking=true,context=1m,effort=xhigh]   # ACP 风格显式参数
@@ -164,6 +166,22 @@ composer-2.5:fast                 # fast 变体
 环境变量默认值（客户端未显式指定时生效）：`CURSOR_REASONING_EFFORT`、`CURSOR_MAX_MODE`、`CURSOR_FAST`、`CURSOR_MODEL_PARAMS`、`CURSOR_AGENT_MODE`。
 
 优先级（低 → 高）：env 默认 < 请求头 < 请求体语义字段 < 模型 id 后缀 < 显式 `model_params`。
+
+### Claude Code 的 Max Mode / 1M 特别说明
+
+Claude Code 指向自定义 `ANTHROPIC_BASE_URL` 时**不会**发送 `anthropic-beta: context-1m` 头（[claude-code#68522](https://github.com/anthropics/claude-code/issues/68522) 已确认），`/model` 里选的 `opus[1m]` 也不会保留。所以只在 Claude Code 界面里选 1M，网关收不到 Max Mode 信号，计费不会按 Max Mode 计。
+
+可靠做法是用 `ANTHROPIC_MODEL` 带 `[1m]` 后缀（Claude Code 在网关模式下会把它原样透传进请求体 model 字段，本网关会识别为 Max Mode）：
+
+```powershell
+$env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 context 参数的模型
+```
+
+注意：
+
+- Max Mode 需要模型本身带 `context` 参数（claude 系、gpt-5.x 系等）。`composer-2.5` 只有 `fast`、**没有 context 档位，无法开 Max Mode**，带 `[1m]` 也会被忽略。
+- 想全局强制开启，也可以在网关侧设 `CURSOR_MAX_MODE=true`（对所有请求生效）。
+- 用 `GET /v1/models` 看某模型的 `cursor_parameters` 是否包含 `context`，即可判断它能否 Max Mode。
 
 说明：
 

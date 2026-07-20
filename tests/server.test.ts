@@ -1361,6 +1361,26 @@ test("parseModelSpec supports ACP bracket params plus @/:/# suffixes", () => {
   assert.deepEqual(paramsMap(suffixes.intent.params ?? []), { fast: "false" });
 });
 
+test("parseModelSpec reads Claude Code style bare [1m] suffix as Max Mode", () => {
+  // Claude Code 指向自定义 base URL 时把 ANTHROPIC_MODEL='<model>[1m]' 原样透传进 model 字段。
+  const opus = parseModelSpec("claude-opus-4-8[1m]");
+  assert.equal(opus.model, "claude-opus-4-8");
+  assert.equal(opus.intent.maxMode, true);
+
+  const gpt = parseModelSpec("gpt-5.6-sol[1m]");
+  assert.equal(gpt.model, "gpt-5.6-sol");
+  assert.equal(gpt.intent.maxMode, true);
+
+  const combo = parseModelSpec("claude-opus-4-8[1m,high,fast]");
+  assert.equal(combo.model, "claude-opus-4-8");
+  assert.equal(combo.intent.maxMode, true);
+  assert.equal(combo.intent.reasoningEffort, "high");
+  assert.equal(combo.intent.fast, true);
+
+  const context200k = parseModelSpec("claude-sonnet-4-6[200k]");
+  assert.equal(context200k.intent.maxMode, true);
+});
+
 test("anthropic thinking budget and context-1m beta header flow into the run request", async () => {
   const runner = new FakeRunner({ text: "ok" });
   const { app } = await createTestApp({ runner });
