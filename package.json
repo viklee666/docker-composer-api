@@ -1,6 +1,6 @@
 {
   "name": "docker-composer-api",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Docker-deployable OpenAI and Anthropic compatible API gateway for Cursor Composer.",
@@ -11,7 +11,7 @@
     "start": "node dist/src/index.js"
   },
   "dependencies": {
-    "@cursor/sdk": "^1.0.13",
+    "@cursor/sdk": "^1.0.27",
     "fastify": "^5.6.2"
   },
   "devDependencies": {

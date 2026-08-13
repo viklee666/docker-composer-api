@@ -98,7 +98,9 @@ export class KeyRotatingRunner implements CursorRunner {
       let emitted = false;
       try {
         for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey }, signal)) {
-          emitted = true;
+          // 非流式请求里 thinking 会被聚合器丢弃，不算“已交付产出”，失败后仍可安全换 key 重试；
+          // 流式请求的 thinking 已实际发给客户端，重试会把两个 run 的思考拼进同一响应，不再重试。
+          if (event.type !== "thinking" || input.stream) emitted = true;
           yield event;
         }
         return;

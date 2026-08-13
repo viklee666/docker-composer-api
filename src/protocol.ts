@@ -110,6 +110,7 @@ export function toRunRequest(input: {
     model: input.prepared.model,
     prompt: input.prepared.prompt,
     sessionKey: input.sessionKey,
+    stream: input.prepared.stream,
     workingDirectory: input.workingDirectory,
     images: input.prepared.images,
     tools: input.prepared.tools,
@@ -276,24 +277,46 @@ export function responseListObject(inputItems: unknown[]): Record<string, unknow
 
 export function parseToolMarkers(text: string): CursorRunResult {
   const toolCalls: GatewayToolCall[] = [];
-  const cleaned = text.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (_match, raw: string) => {
+  const cleaned = text.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (match, raw: string) => {
     const parsed = parseToolCallJson(raw);
-    if (parsed) toolCalls.push(parsed);
+    if (!parsed) return match; // 解析失败保留原文，避免工具调用与正文一起被静默吞掉。
+    toolCalls.push(parsed);
     return "";
   }).trim();
   return { text: cleaned, toolCalls };
 }
 
-function parseToolCallJson(raw: string): GatewayToolCall | undefined {
+/**
+ * 解析 <tool_call> 标记内的 JSON。容错处理模型常见的输出偏差：
+ * 代码围栏包裹、`arguments` 是字符串化 JSON（OpenAI 原生格式）。解析失败返回 undefined，由调用方保留原文。
+ */
+export function parseToolCallJson(raw: string): GatewayToolCall | undefined {
   try {
-    const value = JSON.parse(raw.trim()) as unknown;
+    const stripped = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+    const value = JSON.parse(stripped) as unknown;
     const record = asRecord(value, "tool_call");
     const name = stringField(record, "name");
-    const args = asRecord(record.arguments ?? record.input ?? {}, "tool_call.arguments");
-    return { id: typeof record.id === "string" ? record.id : `call_${randomUUID().replaceAll("-", "")}`, name, arguments: args };
+    const args = toolCallArguments(record.arguments ?? record.input);
+    if (!args) return undefined;
+    const id = typeof record.id === "string" && record.id.trim() ? record.id : `call_${randomUUID().replaceAll("-", "")}`;
+    return { id, name, arguments: args };
   } catch {
     return undefined;
   }
+}
+
+/** arguments 可能是对象，也可能是字符串化 JSON（模型极常见的输出方式）。 */
+function toolCallArguments(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined || value === null) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return asOptionalRecord(parsed) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return asOptionalRecord(value);
 }
 
 function basePrepared(record: Record<string, unknown>, prompt: string, images: GatewayImage[], tools: GatewayTool[], inputItems: unknown[]): PreparedRequest {
@@ -537,6 +560,8 @@ function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[])
         images.push(imageFromUrl(source.url));
       }
       parts.push("[image:attached]");
+    } else if (record.type === "thinking" || record.type === "redacted_thinking") {
+      // 客户端回传的历史思考块（含网关的占位签名）不进入合成 prompt：纯内部推理，原样注入只会污染提示词、浪费 token。
     } else if (record.type === "tool_use") {
       parts.push(`ASSISTANT TOOL_USE: ${JSON.stringify(record)}`);
     } else if (record.type === "tool_result") {

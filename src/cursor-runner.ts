@@ -2,8 +2,8 @@ import { randomUUID, createHash } from "node:crypto";
 import { ApiError } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage } from "./key-pool.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
-import { parseToolMarkers } from "./protocol.js";
-import { createSdkCustomTools, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
+import { parseToolCallJson, parseToolMarkers } from "./protocol.js";
+import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
 import type {
   AgentMode,
   CursorRunRequest,
@@ -50,6 +50,8 @@ export class CursorSdkRunner implements CursorRunner {
       sdkClientVersion: string;
       /** 为 API 网关默认使用“每次请求 fresh agent”，避免远端 agent 会话长期累积/污染后所有请求持续 502。 */
       disableSessionResume?: boolean;
+      /** 允许 agent 在网关容器内使用内置工具（默认 false：SDK >=1.0.27 下用 tools 限制为纯文本/仅 MCP）。 */
+      allowBuiltinTools?: boolean;
       /** 用于按模型发现目录（Cursor.models.list() 的参数定义 + variants），把思考强度/Max Mode 等语义意图解析成合法 model.params。 */
       getModelCatalog?: (modelId: string, apiKey?: string) => Promise<ModelCatalog | undefined>;
     },
@@ -72,6 +74,12 @@ export class CursorSdkRunner implements CursorRunner {
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     if (signal?.aborted) throw new ApiError("Request was aborted.", 499, "request_aborted");
     const id = sessionId(input);
+    // stateless 模式（默认）下每请求都是独立 fresh agent，没有共享会话状态需要保护；
+    // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
+    if (this.input.disableSessionResume) {
+      yield* this.streamLocked(input, signal, id);
+      return;
+    }
     yield* this.withSessionLock(id, () => this.streamLocked(input, signal, id));
   }
 
@@ -103,7 +111,7 @@ export class CursorSdkRunner implements CursorRunner {
     }
 
     const agent = await factory.create(this.agentOptions(input, resolved)).catch((error) => {
-      throw keySemanticApiError(input.model, error) ?? error;
+      throw keySemanticApiError(input.model, error) ?? modelUnavailableError(error) ?? error;
     });
     yield* this.runWithAgent(agent, input, signal, id, resolved);
   }
@@ -125,7 +133,12 @@ export class CursorSdkRunner implements CursorRunner {
     const resolved = resolveModelParams(catalog, intent, input.model);
     logDroppedIntent(input.model, resolved.dropped, resolved.usedFallback);
     const model: ResolvedModelRun["model"] = { id: input.model };
-    if (resolved.params.length) model.params = resolved.params;
+    if (resolved.params.length) {
+      model.params = resolved.params;
+      // 正向可观测性：记录实际下发的 model.params（同组合 10 分钟内只打一次），便于对照 Cursor 仪表盘核实 fast/Max Mode 是否生效。
+      const summary = resolved.params.map((param) => `${param.id}=${param.value}`).join(",");
+      logDeduped(`sent\0${input.model}\0${summary}`, `[model-params] model="${input.model}" sending params: ${summary}`);
+    }
     return { model, ...(intent.mode ? { mode: intent.mode } : {}) };
   }
 
@@ -152,100 +165,237 @@ export class CursorSdkRunner implements CursorRunner {
     id: string,
     resolved: ResolvedModelRun
   ): AsyncIterable<CursorStreamEvent> {
+    let activeRun: RunLike | undefined;
+    let finishedNormally = false;
+    // onDelta（SDK 逐 token 回调）与 run.stream()（消息级事件）合流进同一个队列消费：
+    // 文本以 token 粒度实时下发；tool_call / 错误归因仍走消息级事件。
+    const queue = new AsyncQueue<QueueItem>();
+    const onAbort = () => queue.push({ kind: "abort" });
     try {
       if (signal?.aborted) throw new ApiError("Request was aborted.", 499, "request_aborted");
       const capturedToolCalls: GatewayToolCall[] = [];
-      const customTools = createSdkCustomTools(input.tools, (toolCall) => pushToolCall(capturedToolCalls, toolCall));
-      const run = await this.sendWithOptionalCustomTools(agent, input, customTools, resolved);
+      // capture 回调除记录调用外还推一个唤醒项：队列空等时也能立即处理 capture 并取消 run。
+      const customTools = createSdkCustomTools(input.tools, (toolCall) => {
+        pushToolCall(capturedToolCalls, toolCall);
+        queue.push({ kind: "captured" });
+      });
+      const onDelta = (args: { update: unknown }) => {
+        queue.push({ kind: "delta", update: args?.update });
+      };
+      const run = await this.sendWithOptionalCustomTools(agent, input, customTools, resolved, onDelta);
+      activeRun = run;
+      // abort 必须能唤醒空队列等待，否则超时/断连时上游无事件的 run 会永久挂住。
+      signal?.addEventListener("abort", onAbort, { once: true });
+      // abort 若恰好发生在 await send() 期间，事件在注册 listener 前已触发，必须补推一次。
+      if (signal?.aborted) queue.push({ kind: "abort" });
+      void (async () => {
+        try {
+          for await (const event of run.stream()) queue.push({ kind: "event", event });
+          queue.push({ kind: "end" });
+        } catch (error) {
+          queue.push({ kind: "end", error });
+        }
+      })();
+
       const textParts: string[] = [];
       const toolCalls: GatewayToolCall[] = [];
       const streamErrorDetails: string[] = [];
+      // 有客户端工具时用增量 marker 过滤器实现“乐观流式”：正文实时下发，只暂扣可能是 <tool_call> 前缀的尾部。
+      const filter = input.tools.length ? new ToolMarkerFilter() : undefined;
+      // 文本/思考各锁定单一来源（delta 或 message），防止来源交错时重复或丢字。
+      let textSource: "none" | "delta" | "message" = "none";
+      let thinkingSource: "none" | "delta" | "message" = "none";
+      let streamError: unknown;
+      const cancelRun = () => run.cancel?.().catch(() => undefined);
+      // 过滤 marker/事件里未被客户端声明的工具调用（转发只会让客户端报 unknown tool）。
+      const keepDeclaredOnly = (calls: GatewayToolCall[]): GatewayToolCall[] => calls.filter((toolCall) => {
+        if (input.tools.length && matchesClientTool(toolCall, input.tools)) return true;
+        logDeduped(
+          `unmatched\0${input.model}\0${toolCall.name}`,
+          `[tool-compat] model="${input.model}" dropped tool call "${toolCall.name}" not declared by the client`
+        );
+        return false;
+      });
 
-      try {
-        try {
-          for await (const event of run.stream()) {
-            if (signal?.aborted) {
-              await run.cancel?.().catch(() => undefined);
-              throw new ApiError("Request was aborted.", 499, "request_aborted");
+      loop: for (;;) {
+        const item = await queue.next();
+        if (signal?.aborted || item.kind === "abort") {
+          await cancelRun();
+          throw new ApiError("Request was aborted.", 499, "request_aborted");
+        }
+        let chunk = "";
+        // 事件里的工具调用延后到文本处理之后再转发：同一 assistant 事件可能同时带 text 和 tool_use，文本必须先下发。
+        let eventToolCalls: GatewayToolCall[] = [];
+        if (item.kind === "delta") {
+          const update = asRecord(item.update);
+          const type = typeof update?.type === "string" ? update.type : "";
+          // 空字符串 delta 不锁定来源，否则后续合法的消息级全文会被误屏蔽。
+          if (type === "text-delta" && typeof update?.text === "string" && update.text && textSource !== "message") {
+            textSource = "delta";
+            chunk = update.text;
+          } else if (type === "thinking-delta" && typeof update?.text === "string" && update.text && thinkingSource !== "message") {
+            thinkingSource = "delta";
+            yield { type: "thinking", text: update.text };
+          }
+        } else if (item.kind === "event") {
+          const event = item.event;
+          const thinking = thinkingFromSdkEvent(event);
+          if (thinking && thinkingSource !== "delta") {
+            thinkingSource = "message";
+            yield { type: "thinking", text: thinking };
+          }
+          const text = textFromSdkEvent(event);
+          // onDelta 已产出过文本时跳过消息级全文，避免同一段内容双份输出。
+          if (text && textSource !== "delta") {
+            textSource = "message";
+            chunk = text;
+          }
+          const errorDetail = errorDetailFromSdkEvent(event);
+          if (errorDetail) streamErrorDetails.push(errorDetail);
+          eventToolCalls = keepDeclaredOnly(toolCallsFromSdkEvent(event))
+            .map((toolCall) => normalizeToolCallForClient(toolCall, input.tools));
+        } else if (item.kind === "end") {
+          streamError = item.error;
+          break;
+        }
+        // item.kind === "captured" 只是唤醒，落到下方统一的 captured 检查。
+
+        if (chunk) {
+          if (!filter) {
+            textParts.push(chunk);
+            yield { type: "text", text: chunk };
+          } else {
+            const safe = filter.push(chunk);
+            if (safe) {
+              textParts.push(safe);
+              yield { type: "text", text: safe };
             }
-            const text = textFromSdkEvent(event);
-            if (text) {
-              textParts.push(text);
-              if (!input.tools.length) yield { type: "text", text };
-            }
-            const errorDetail = errorDetailFromSdkEvent(event);
-            if (errorDetail) streamErrorDetails.push(errorDetail);
-            const sdkToolCalls = toolCallsFromSdkEvent(event);
-            if (sdkToolCalls.length) {
-              for (const toolCall of sdkToolCalls) {
-                const normalized = normalizeToolCallForClient(toolCall, input.tools);
-                pushToolCall(toolCalls, normalized);
-                yield { type: "tool_call", toolCall: normalized };
+            const markerCalls = filter.takeToolCalls();
+            if (markerCalls.length) {
+              const declared = keepDeclaredOnly(markerCalls);
+              if (declared.length) {
+                // 先 cancel 再 yield：消费方（客户端断连）可能在 yield 处终止本生成器，取消不能排在其后。
+                await cancelRun();
+                for (const toolCall of normalizeToolCallsForClient(declared, input.tools)) {
+                  pushToolCall(toolCalls, toolCall);
+                  yield { type: "tool_call", toolCall };
+                }
+                break loop;
               }
-              // 捕获工具调用后立即取消，避免 SDK 在容器内继续执行本地工具。
-              await run.cancel?.().catch(() => undefined);
-              break;
-            }
-            const captured = pendingCapturedToolCalls(capturedToolCalls, toolCalls);
-            if (captured.length) {
-              for (const toolCall of captured) {
-                pushToolCall(toolCalls, toolCall);
-                yield { type: "tool_call", toolCall };
+              // 全部 marker 都未被客户端声明（已记日志丢弃）：取回 marker 之后暂存的正文，继续正常流式。
+              const held = filter.takeHeldText();
+              if (held) {
+                textParts.push(held);
+                yield { type: "text", text: held };
               }
-              await run.cancel?.().catch(() => undefined);
-              break;
             }
           }
-        } catch (error) {
-          if (signal?.aborted || !capturedToolCalls.length) throw error;
-          // 自定义工具回调已捕获到调用时，即使 SDK 后续因取消/工具结果报错，也应把调用返回给客户端。
         }
-      } finally {
-        // Cursor SDK 的 wait 可能在取消工具调用后抛错；此处只用它补齐纯文本结果。
+
+        if (eventToolCalls.length) {
+          // 先取消，避免 SDK 在容器内继续执行本地工具，也防止消费方提前终止时漏掉取消。
+          await cancelRun();
+          for (const toolCall of eventToolCalls) {
+            pushToolCall(toolCalls, toolCall);
+            yield { type: "tool_call", toolCall };
+          }
+          break;
+        }
+
+        const captured = pendingCapturedToolCalls(capturedToolCalls, toolCalls);
+        if (captured.length) {
+          await cancelRun();
+          for (const toolCall of captured) {
+            pushToolCall(toolCalls, toolCall);
+            yield { type: "tool_call", toolCall };
+          }
+          break;
+        }
+      }
+
+      // 自定义工具回调已捕获到调用时，即使 SDK 流因取消/工具结果报错，也应把调用返回给客户端。
+      if (streamError && (signal?.aborted || !capturedToolCalls.length)) throw streamError;
+
+      // 吐出 marker 过滤器暂扣的尾部文本（未构成完整 marker 的部分）；有工具调用时该尾部多为残缺 marker，丢弃。
+      if (filter && !toolCalls.length && !capturedToolCalls.length) {
+        const rest = filter.flush();
+        if (rest) {
+          textParts.push(rest);
+          yield { type: "text", text: rest };
+        }
       }
 
       const missedCapturedToolCalls = pendingCapturedToolCalls(capturedToolCalls, toolCalls);
       if (missedCapturedToolCalls.length) {
+        await cancelRun();
         for (const toolCall of missedCapturedToolCalls) {
           pushToolCall(toolCalls, toolCall);
           yield { type: "tool_call", toolCall };
         }
-        await run.cancel?.().catch(() => undefined);
       }
 
-      const waited = await run.wait().catch(() => undefined);
+      // wait() 也要能被 abort 打断：上游卡死时客户端断连/超时不能永久挂在这里。
+      let waitError: unknown;
+      let waited: unknown;
+      try {
+        waited = await raceWithAbort(run.wait(), signal);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === "request_aborted") {
+          await cancelRun();
+          throw error;
+        }
+        waitError = error;
+      }
+      // wait 期间才到达的 capture 也要补发（execute 回调可能与 cancel/wait 并发）。
+      for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
+        pushToolCall(toolCalls, toolCall);
+        yield { type: "tool_call", toolCall };
+      }
       const waitedText = resultText(waited);
       if (!toolCalls.length && !textParts.length && waitedText) {
-        textParts.push(waitedText);
-        yield { type: "text", text: waitedText };
+        // 流阶段没有任何产出、只有 wait() 的最终文本时才使用它；仍需做一次静态 marker 解析。
+        const parsed = input.tools.length ? parseToolMarkers(waitedText) : { text: waitedText, toolCalls: [] };
+        const declared = keepDeclaredOnly(parsed.toolCalls);
+        if (declared.length) {
+          for (const toolCall of normalizeToolCallsForClient(declared, input.tools)) {
+            pushToolCall(toolCalls, toolCall);
+            yield { type: "tool_call", toolCall };
+          }
+        }
+        if (parsed.text && !declared.length) {
+          textParts.push(parsed.text);
+          yield { type: "text", text: parsed.text };
+        }
       }
 
-      // run 以 error 收场且没有任何产出时必须显式报错，否则会变成空 200。
-      // Cursor SDK 在 run 失败时通常只回裸 status="error"、不带 error/message 详情（官方已确认的 SDK 行为），
-      // 真实原因可能是：额度/配额耗尽、上游临时容量不足（resource_exhausted，多会自行恢复）、
-      // key 失效，或该模型不被 API/SDK 通道支持。这里尽量从结果里提取可用详情，避免单一归因误导排查。
-      if (!textParts.length && !toolCalls.length && runStatus(waited) === "error") {
+      // run 以 error/cancelled 收场且没有任何产出时必须显式报错，否则会变成空 200。
+      //（本网关自己的 cancel 都发生在已产出工具调用/文本之后，零产出的 cancelled 一定是外部/异常取消。）
+      // SDK >=1.0.23 的失败 run 携带结构化 error（message/code），此处尽量提取真实原因
+      //（如区域限制 "not supported in your region"、额度耗尽等），避免单一归因误导排查。
+      const terminalStatus = runStatus(waited);
+      if (!textParts.length && !toolCalls.length && (terminalStatus === "error" || terminalStatus === "cancelled")) {
         throw upstreamRunError(input.model, uniqueJoined([...streamErrorDetails, runErrorDetail(waited)]));
       }
+      // wait() 本身 reject 且毫无产出时同样不能变成空 200（旧实现遗留问题）。
+      if (!textParts.length && !toolCalls.length && waited === undefined && waitError) {
+        const keyError = keySemanticApiError(input.model, waitError);
+        if (keyError) throw keyError;
+        throw upstreamRunError(input.model, uniqueJoined([...streamErrorDetails, errorMessage(waitError)]));
+      }
 
-      const parsed = parseToolMarkers(textParts.join(""));
-      const finalToolCalls = normalizeToolCallsForClient(toolCalls.length ? toolCalls : parsed.toolCalls, input.tools);
-      const finalText = finalToolCalls.length ? "" : parsed.text;
-      if (input.tools.length && !finalToolCalls.length && finalText) {
-        yield { type: "text", text: finalText };
-      }
-      if (input.tools.length && finalToolCalls.length && !toolCalls.length) {
-        for (const toolCall of finalToolCalls) yield { type: "tool_call", toolCall };
-      }
       const result: CursorRunResult = {
-        text: finalText,
-        toolCalls: finalToolCalls,
+        text: textParts.join("").trim(),
+        toolCalls: [...toolCalls],
         agentId: agent.agentId,
         runId: run.id
       };
       if (!this.input.disableSessionResume && agent.agentId) await this.store.saveSession(id, agent.agentId);
       yield { type: "done", result };
+      finishedNormally = true;
     } finally {
+      signal?.removeEventListener("abort", onAbort);
+      // 消费方提前终止（客户端断连触发生成器 return()）时兜底取消 run，避免上游继续跑。
+      if (!finishedNormally && activeRun) await activeRun.cancel?.().catch(() => undefined);
       await disposeAgent(agent);
     }
   }
@@ -254,11 +404,13 @@ export class CursorSdkRunner implements CursorRunner {
     agent: AgentLike,
     input: CursorRunRequest,
     customTools: Record<string, unknown> | undefined,
-    resolved: ResolvedModelRun
+    resolved: ResolvedModelRun,
+    onDelta: (args: { update: unknown }) => void
   ): Promise<RunLike> {
     const options = () => ({
       model: resolved.model,
       idempotencyKey: randomUUID(),
+      onDelta,
       ...(resolved.mode ? { mode: resolved.mode } : {})
     });
     if (!customTools) return agent.send(this.sdkMessage(input), options());
@@ -292,6 +444,10 @@ export class CursorSdkRunner implements CursorRunner {
       //（~/.cursor、.cursor/rules、AGENTS.md 等）注入到请求里，避免夹带额外提示词。
       local: { cwd: input.workingDirectory || this.input.defaultWorkingDirectory, settingSources: [] },
       clientVersion: this.input.sdkClientVersion,
+      // SDK >=1.0.27 的内置工具限制：无客户端工具 → []（纯文本，agent 不能动网关容器的文件/命令）；
+      // 有客户端工具 → 只留 "mcp" 元工具通道（send 时注入的 customTools 经 custom-user-tools MCP server 暴露）。
+      // 这从根上阻止 agent 在网关侧真实执行 shell/edit 后又把调用转发给客户端造成双重执行。
+      ...(this.input.allowBuiltinTools ? {} : { tools: input.tools.length ? ["mcp"] : [] }),
       ...(resolved.mode ? { mode: resolved.mode } : {})
     };
   }
@@ -307,28 +463,192 @@ export class CursorSdkRunner implements CursorRunner {
   }
 }
 
-/** 相同 (model, 详情) 的丢弃/兜底日志 10 分钟内只打一次，避免高流量刷屏。 */
-const droppedIntentLoggedAt = new Map<string, number>();
-const DROPPED_INTENT_LOG_TTL_MS = 10 * 60 * 1000;
+/** 相同 key 的日志 10 分钟内只打一次，避免高流量刷屏。 */
+const dedupedLogAt = new Map<string, number>();
+const DEDUPED_LOG_TTL_MS = 10 * 60 * 1000;
+
+function logDeduped(key: string, message: string): void {
+  const last = dedupedLogAt.get(key) ?? 0;
+  const now = Date.now();
+  if (now - last < DEDUPED_LOG_TTL_MS) return;
+  // 模型/参数/工具名都可能被请求方制造高基数：先清过期项；仍超限则按插入顺序淘汰最旧，保证硬上限。
+  if (dedupedLogAt.size >= 1000) {
+    for (const [existingKey, at] of dedupedLogAt) {
+      if (now - at >= DEDUPED_LOG_TTL_MS) dedupedLogAt.delete(existingKey);
+    }
+    while (dedupedLogAt.size >= 1000) {
+      const oldest = dedupedLogAt.keys().next().value;
+      if (oldest === undefined) break;
+      dedupedLogAt.delete(oldest);
+    }
+  }
+  dedupedLogAt.set(key, now);
+  console.error(message);
+}
+
+/** 让一个 promise 可被 AbortSignal 打断（abort → 499）；正常 settle 时清理监听器。 */
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => undefined);
+    return Promise.reject(new ApiError("Request was aborted.", 499, "request_aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new ApiError("Request was aborted.", 499, "request_aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    );
+  });
+}
 
 function logDroppedIntent(model: string, dropped: string[], usedFallback: boolean): void {
   if (!dropped.length && !usedFallback) return;
   const detail = [
     dropped.length ? `dropped: ${dropped.join(", ")} (no matching model parameter)` : "",
-    usedFallback ? "catalog discovery unavailable; used built-in family fallback mapping" : ""
+    usedFallback ? "catalog parameter definitions unavailable; used built-in family fallback mapping" : ""
   ].filter(Boolean).join("; ");
-  const key = `${model}\0${detail}`;
-  const last = droppedIntentLoggedAt.get(key) ?? 0;
-  const now = Date.now();
-  if (now - last < DROPPED_INTENT_LOG_TTL_MS) return;
-  droppedIntentLoggedAt.set(key, now);
-  console.error(`[model-params] model="${model}" ${detail}`);
+  logDeduped(`dropped\0${model}\0${detail}`, `[model-params] model="${model}" ${detail}`);
+}
+
+/** onDelta 回调与 run.stream() 事件合流用的异步队列（单消费者）。 */
+type QueueItem =
+  | { kind: "delta"; update: unknown }
+  | { kind: "event"; event: unknown }
+  /** AbortSignal 触发：唤醒空队列等待，立即取消并抛 499。 */
+  | { kind: "abort" }
+  /** customTools execute 捕获到调用：唤醒消费循环即时处理（本身不带数据）。 */
+  | { kind: "captured" }
+  | { kind: "end"; error?: unknown };
+
+class AsyncQueue<T> {
+  private readonly items: T[] = [];
+  private readonly resolvers: Array<(item: T) => void> = [];
+
+  push(item: T): void {
+    const resolve = this.resolvers.shift();
+    if (resolve) resolve(item);
+    else this.items.push(item);
+  }
+
+  next(): Promise<T> {
+    const item = this.items.shift();
+    if (item !== undefined) return Promise.resolve(item);
+    return new Promise<T>((resolve) => this.resolvers.push(resolve));
+  }
+}
+
+const MARKER_OPEN = "<tool_call>";
+const MARKER_CLOSE = "</tool_call>";
+/** 未闭合 marker 的最大暂扣字节数，超过按普通文本放行。 */
+const MAX_MARKER_BUFFER = 64 * 1024;
+
+/**
+ * 流式 <tool_call> 标记过滤器：正文实时放行，只暂扣可能是 marker 前缀的尾部（最多 10 个字符）。
+ * 每次 push 会解析 buffer 里**全部**完整 marker；解析失败的 marker 原文放行（不静默吞内容）。
+ * 首个成功解析的 marker 之后的正文进入 held 暂存区——不能先于工具调用下发；
+ * 若调用方把全部 marker 调用判为未声明而丢弃，可用 takeHeldText() 取回继续流式。
+ */
+class ToolMarkerFilter {
+  private buffer = "";
+  private held = "";
+  private pendingToolCalls: GatewayToolCall[] = [];
+
+  /** 送入新文本，返回可以安全下发的部分（首个已解析 marker 之前的正文）。 */
+  push(chunk: string): string {
+    this.buffer += chunk;
+    let out = "";
+    const append = (text: string) => {
+      if (!text) return;
+      if (this.pendingToolCalls.length) this.held += text;
+      else out += text;
+    };
+    for (;;) {
+      const start = this.buffer.indexOf(MARKER_OPEN);
+      if (start >= 0) {
+        const end = this.buffer.indexOf(MARKER_CLOSE, start + MARKER_OPEN.length);
+        if (end < 0) {
+          // marker 已开但长时间不闭合：超过上限（按 UTF-16 code unit 计）当普通文本放行，避免无界缓冲。
+          if (this.buffer.length - start > MAX_MARKER_BUFFER) {
+            append(this.buffer);
+            this.buffer = "";
+            break;
+          }
+          // marker 已开但未闭合：放行 marker 前的正文，暂扣其余等待闭合。
+          append(this.buffer.slice(0, start));
+          this.buffer = this.buffer.slice(start);
+          break;
+        }
+        append(this.buffer.slice(0, start));
+        const raw = this.buffer.slice(start + MARKER_OPEN.length, end);
+        this.buffer = this.buffer.slice(end + MARKER_CLOSE.length);
+        const parsed = parseToolCallJson(raw);
+        if (parsed) this.pendingToolCalls.push(parsed);
+        else append(MARKER_OPEN + raw + MARKER_CLOSE);
+        continue;
+      }
+      const hold = this.holdFrom();
+      append(this.buffer.slice(0, hold));
+      this.buffer = this.buffer.slice(hold);
+      break;
+    }
+    return out;
+  }
+
+  /** 取走并清空已解析到的 marker 工具调用。 */
+  takeToolCalls(): GatewayToolCall[] {
+    const calls = this.pendingToolCalls;
+    this.pendingToolCalls = [];
+    return calls;
+  }
+
+  /** 取回 marker 之后暂存的正文（全部 marker 被判为未声明丢弃时恢复流式用）。 */
+  takeHeldText(): string {
+    const held = this.held;
+    this.held = "";
+    return held;
+  }
+
+  /** 流结束时取回暂存正文 + 暂扣尾部（未构成完整 marker 的部分）。 */
+  flush(): string {
+    const rest = this.held + this.buffer;
+    this.held = "";
+    this.buffer = "";
+    return rest;
+  }
+
+  /** buffer 尾部可能是 MARKER_OPEN 前缀的最早位置。 */
+  private holdFrom(): number {
+    const max = Math.min(this.buffer.length, MARKER_OPEN.length - 1);
+    for (let len = max; len > 0; len -= 1) {
+      if (MARKER_OPEN.startsWith(this.buffer.slice(this.buffer.length - len))) return this.buffer.length - len;
+    }
+    return this.buffer.length;
+  }
 }
 
 function sessionId(input: CursorRunRequest): string {
   return createHash("sha256")
     .update([input.apiKey, input.model, input.sessionKey, input.workingDirectory ?? ""].join("\0"))
     .digest("hex");
+}
+
+/** 从消息级 SDK 事件里提取思考文本（onDelta 不可用时的兜底通道）。 */
+function thinkingFromSdkEvent(event: unknown): string {
+  const record = asRecord(event);
+  if (!record) return "";
+  const type = typeof record.type === "string" ? record.type : "";
+  if (type !== "thinking" && type !== "thinkingMessage") return "";
+  if (typeof record.text === "string") return record.text;
+  const message = asRecord(record.message);
+  return typeof message?.text === "string" ? message.text : "";
 }
 
 function textFromSdkEvent(event: unknown): string {
@@ -415,6 +735,17 @@ function runErrorDetail(value: unknown): string {
  * 注意：quota/auth 文案里不含 "upstream_run_failed" token，以免又被 transient 正则抢先命中。
  */
 export function upstreamRunError(model: string, detail: string): ApiError {
+  // 模型对该账号/区域不可用（如 "This model provider is not supported in your region"）：
+  // 换 key 大概率无解（同团队/同出口区域），直接 403 透出真实原因而不是笼统的 502。
+  // 注意只匹配明确的区域限制文案，避免把临时容量不足（"model not available" 类措辞）误判为永久限制。
+  if (/not (supported|available) in your (region|country)|model provider is not supported/i.test(detail)) {
+    return new ApiError(
+      `Cursor upstream cannot run model "${model}": ${detail}. ` +
+      "See https://cursor.com/docs/account/regions - this model provider is restricted for this account or egress region.",
+      403,
+      "model_unavailable"
+    );
+  }
   const kind = detail ? classifyErrorText(detail) : undefined;
   if (kind === "quota") {
     return new ApiError(
@@ -441,6 +772,15 @@ export function upstreamRunError(model: string, detail: string): ApiError {
     502,
     "upstream_run_failed"
   );
+}
+
+/** SDK 在 Agent.create/send 阶段就拒绝了模型 id（"Cannot use this model: ..."）→ 400 而非笼统 500。 */
+function modelUnavailableError(error: unknown): ApiError | undefined {
+  const message = errorMessage(error);
+  if (/cannot use this model/i.test(message)) {
+    return new ApiError(message, 400, "model_not_found", "model");
+  }
+  return undefined;
 }
 
 function keySemanticApiError(model: string, error: unknown): ApiError | undefined {

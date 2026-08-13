@@ -13,6 +13,12 @@ export interface GatewayConfig {
   sdkClientVersion: string;
   /** 默认禁用 SDK agent resume，避免长期复用同一远端 agent 导致跨请求状态污染/老会话卡死。 */
   cursorSdkDisableSessionResume: boolean;
+  /**
+   * 是否允许 Cursor agent 在网关容器内使用自己的内置工具（shell/edit/grep 等）。
+   * 默认 false：无客户端工具时纯文本模式，有客户端工具时只保留 MCP 元工具通道（customTools 经此暴露），
+   * 防止 agent 在网关侧真实执行文件/命令操作后又把调用转发给客户端造成双重执行。
+   */
+  cursorAllowBuiltinTools: boolean;
   /** 强制 Cursor local agent 使用 HTTP/1.1 + SSE（env: CURSOR_SDK_USE_HTTP1_FOR_AGENT）。 */
   cursorSdkUseHttp1ForAgent: boolean;
   /** 单次请求轮换 key 的最大尝试数（env: MAX_KEY_ATTEMPTS）。 */
@@ -106,6 +112,8 @@ export interface CursorRunRequest {
   model: string;
   prompt: string;
   sessionKey: string;
+  /** 客户端是否以流式消费本请求（影响 key 轮换重试策略：流式下已发出的 thinking 视为已交付）。 */
+  stream?: boolean;
   workingDirectory?: string;
   images: GatewayImage[];
   tools: GatewayTool[];
@@ -135,6 +143,8 @@ export interface CursorRunResult {
 
 export type CursorStreamEvent =
   | { type: "text"; text: string }
+  /** 模型思考过程增量（Anthropic thinking_delta / OpenAI reasoning_content），可选消费。 */
+  | { type: "thinking"; text: string }
   | { type: "tool_call"; toolCall: GatewayToolCall }
   | { type: "done"; result: CursorRunResult };
 

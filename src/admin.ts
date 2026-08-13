@@ -173,7 +173,13 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       sessionKey: `admin-connectivity-test-${globalThis.crypto.randomUUID()}`,
       workingDirectory: deps.config.cursorWorkingDirectory,
       images: [],
-      tools: []
+      tools: [],
+      // 联通性测试也带上网关默认意图（fast/Max Mode 等），否则仪表盘里这些测试请求永远显示非 fast，误导排查。
+      reasoningEffort: deps.config.cursorReasoningEffort,
+      maxMode: deps.config.cursorMaxMode,
+      fast: deps.config.cursorFast,
+      modelParams: deps.config.cursorModelParams,
+      mode: deps.config.cursorAgentMode
     };
     // 指定 keyId 时只验证该 key（绕过密钥池轮换），便于逐个定位到底是哪个 key 不可用。
     if (keyId) {

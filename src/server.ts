@@ -116,7 +116,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       controls: requestModelControls(request, deps.config)
     });
     if (prepared.stream) {
-      return sendSse(reply, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, run, deps })));
+      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, run, deps, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return chatCompletionObject({ id, created, prepared, output });
@@ -142,7 +143,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       controls: requestModelControls(request, deps.config)
     });
     if (prepared.stream) {
-      return sendSse(reply, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, run, deps })));
+      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, run, deps, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     const response = responseObject({ id, created, prepared, output, previousResponseId });
@@ -189,7 +191,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       controls: requestModelControls(request, deps.config)
     });
     if (prepared.stream) {
-      return sendSse(reply, withStreamLog(deps, log, anthropicStream({ id, prepared, run, deps })));
+      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, run, deps, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return anthropicMessageObject({ id, prepared, output });
@@ -277,6 +280,9 @@ async function* withStreamLog(deps: AppDeps, log: RequestLog, chunks: AsyncItera
   } catch (error) {
     finishLog(deps, log, normalizeError(error).statusCode, errorMessage(error));
     throw error;
+  } finally {
+    // 客户端断连时生成器被 return()，上面两条路径都不会执行；这里兜底记 499，请求日志不再丢失。
+    if (!log.finished) finishLog(deps, log, 499, "client disconnected before the stream completed");
   }
 }
 
@@ -295,7 +301,43 @@ function sendSse(reply: FastifyReply, chunks: AsyncIterable<string>): FastifyRep
     .header("content-type", "text/event-stream; charset=utf-8")
     .header("cache-control", "no-cache, no-transform")
     .header("connection", "keep-alive")
+    // Nginx 反代默认 proxy_buffering on 会把 SSE 攒成大块（表现为流式卡顿/成块到达），显式要求不缓冲。
+    .header("x-accel-buffering", "no")
     .send(Readable.from(chunks));
+}
+
+/**
+ * 流式请求的取消控制：客户端断连（socket close）立即 abort 底层 run；
+ * 超时按“无输出空闲时间”计（每写出一个 SSE chunk 重置），避免误杀仍在正常吐字的长回答。
+ */
+function streamAbort(request: FastifyRequest, idleTimeoutMs: number): { signal: AbortSignal; touch: () => void; done: () => void } {
+  const controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  const socket = request.raw.socket;
+  const onClose = () => controller.abort();
+  socket?.once?.("close", onClose);
+  return {
+    signal: controller.signal,
+    touch: () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+    },
+    done: () => {
+      clearTimeout(timer);
+      socket?.removeListener?.("close", onClose);
+    }
+  };
+}
+
+async function* withStreamAbort(abort: { touch: () => void; done: () => void }, chunks: AsyncIterable<string>): AsyncIterable<string> {
+  try {
+    for await (const chunk of chunks) {
+      abort.touch();
+      yield chunk;
+    }
+  } finally {
+    abort.done();
+  }
 }
 
 async function* chatStream(input: {
@@ -305,6 +347,7 @@ async function* chatStream(input: {
   auth: AuthContext;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  signal?: AbortSignal;
 }): AsyncIterable<string> {
   yield sse({
     id: input.id,
@@ -314,8 +357,17 @@ async function* chatStream(input: {
     choices: [{ index: 0, delta: { role: "assistant" }, logprobs: null, finish_reason: null }]
   });
   let final: CursorRunResult = { text: "", toolCalls: [] };
-  for await (const event of input.deps.runner.stream(input.run)) {
-    if (event.type === "text" && event.text) {
+  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    if (event.type === "thinking" && event.text) {
+      // DeepSeek 惯例的 reasoning_content 增量，兼容多数 OpenAI 客户端；不识别的客户端会忽略该字段。
+      yield sse({
+        id: input.id,
+        object: "chat.completion.chunk",
+        created: input.created,
+        model: input.prepared.model,
+        choices: [{ index: 0, delta: { reasoning_content: event.text }, logprobs: null, finish_reason: null }]
+      });
+    } else if (event.type === "text" && event.text) {
       final.text += event.text;
       yield sse({
         id: input.id,
@@ -363,6 +415,7 @@ async function* responsesStream(input: {
   auth: AuthContext;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  signal?: AbortSignal;
 }): AsyncIterable<string> {
   const base = {
     id: input.id,
@@ -379,16 +432,19 @@ async function* responsesStream(input: {
 
   let textStarted = false;
   let final: CursorRunResult = { text: "", toolCalls: [] };
-  for await (const event of input.deps.runner.stream(input.run)) {
-    if (event.type === "text" && event.text) {
+  const messageId = `msg_${input.id.slice(5)}`;
+  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    if (event.type === "thinking" && event.text) {
+      // Responses 协议没有轻量的思考增量事件；发 SSE 注释行保活（重置空闲超时、防反代断连），客户端解析器会忽略注释。
+      yield ": thinking\n\n";
+    } else if (event.type === "text" && event.text) {
       if (!textStarted) {
         textStarted = true;
-        const messageId = `msg_${input.id.slice(5)}`;
         yield sse({ type: "response.output_item.added", output_index: 0, item: { id: messageId, type: "message", status: "in_progress", role: "assistant", content: [] } }, "response.output_item.added");
         yield sse({ type: "response.content_part.added", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, "response.content_part.added");
       }
       final.text += event.text;
-      yield sse({ type: "response.output_text.delta", item_id: `msg_${input.id.slice(5)}`, output_index: 0, content_index: 0, delta: event.text }, "response.output_text.delta");
+      yield sse({ type: "response.output_text.delta", item_id: messageId, output_index: 0, content_index: 0, delta: event.text }, "response.output_text.delta");
     } else if (event.type === "tool_call") {
       final.toolCalls.push(event.toolCall);
       const item = responseToolCallItem(event.toolCall);
@@ -398,6 +454,17 @@ async function* responsesStream(input: {
     } else if (event.type === "done") {
       final = event.result;
     }
+  }
+
+  // 文本 item 的规范收尾事件（严格客户端靠这些结束状态机）。
+  if (textStarted) {
+    yield sse({ type: "response.output_text.done", item_id: messageId, output_index: 0, content_index: 0, text: final.text }, "response.output_text.done");
+    yield sse({ type: "response.content_part.done", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: final.text, annotations: [] } }, "response.content_part.done");
+    yield sse({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { id: messageId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: final.text, annotations: [] }] }
+    }, "response.output_item.done");
   }
 
   const response = responseObject({ id: input.id, created: input.created, prepared: input.prepared, output: final, previousResponseId: input.previousResponseId });
@@ -410,6 +477,7 @@ async function* anthropicStream(input: {
   prepared: PreparedRequest;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  signal?: AbortSignal;
 }): AsyncIterable<string> {
   yield sse({
     type: "message_start",
@@ -424,35 +492,71 @@ async function* anthropicStream(input: {
       usage: { input_tokens: Math.ceil(input.prepared.prompt.length / 4), output_tokens: 0 }
     }
   }, "message_start");
-  let textStarted = false;
+  let nextIndex = 0;
+  let openIndex = -1;
+  let openType: "text" | "thinking" | null = null;
   let text = "";
+  let thinkingChars = 0;
   const toolCalls: CursorRunResult["toolCalls"] = [];
-  for await (const event of input.deps.runner.stream(input.run)) {
-    if (event.type === "text" && event.text) {
-      if (!textStarted) {
-        textStarted = true;
-        yield sse({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, "content_block_start");
+  const closeOpenBlock = (): string[] => {
+    if (openType === null) return [];
+    const chunks: string[] = [];
+    // Anthropic 协议要求 thinking 块在 stop 前有 signature_delta；网关无真实签名，发一个不透明占位签名
+    // 保证严格客户端（Claude Code）能正常收块。历史消息里的 thinking 块本网关按纯文本处理，不校验签名。
+    if (openType === "thinking") {
+      chunks.push(sse({ type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: GATEWAY_THINKING_SIGNATURE } }, "content_block_delta"));
+    }
+    chunks.push(sse({ type: "content_block_stop", index: openIndex }, "content_block_stop"));
+    openType = null;
+    return chunks;
+  };
+  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    if (event.type === "thinking" && event.text) {
+      if (openType !== "thinking") {
+        yield* closeOpenBlock();
+        openIndex = nextIndex;
+        nextIndex += 1;
+        openType = "thinking";
+        yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "" } }, "content_block_start");
+      }
+      thinkingChars += event.text.length;
+      yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: event.text } }, "content_block_delta");
+    } else if (event.type === "text" && event.text) {
+      if (openType !== "text") {
+        yield* closeOpenBlock();
+        openIndex = nextIndex;
+        nextIndex += 1;
+        openType = "text";
+        yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "text", text: "" } }, "content_block_start");
       }
       text += event.text;
-      yield sse({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: event.text } }, "content_block_delta");
+      yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "text_delta", text: event.text } }, "content_block_delta");
     } else if (event.type === "tool_call") {
+      yield* closeOpenBlock();
       toolCalls.push(event.toolCall);
-      const index = textStarted ? toolCalls.length : toolCalls.length - 1;
-      yield sse({ type: "content_block_start", index, content_block: anthropicToolUse(event.toolCall) }, "content_block_start");
+      const index = nextIndex;
+      nextIndex += 1;
+      // Anthropic 官方语义：tool_use 的 content_block_start.input 恒为 {}，
+      // 完整参数只通过 input_json_delta 下发——按规范实现的客户端（含 Claude Code）靠累积 partial_json 得到 input。
+      yield sse({ type: "content_block_start", index, content_block: { ...anthropicToolUse(event.toolCall), input: {} } }, "content_block_start");
+      yield sse({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(event.toolCall.arguments ?? {}) } }, "content_block_delta");
       yield sse({ type: "content_block_stop", index }, "content_block_stop");
     } else if (event.type === "done") {
       text = event.result.text || text;
       toolCalls.splice(0, toolCalls.length, ...event.result.toolCalls);
     }
   }
-  if (textStarted) yield sse({ type: "content_block_stop", index: 0 }, "content_block_stop");
+  yield* closeOpenBlock();
   yield sse({
     type: "message_delta",
     delta: { stop_reason: toolCalls.length ? "tool_use" : "end_turn", stop_sequence: null },
-    usage: anthropicUsage(input.prepared.prompt.length, text.length + JSON.stringify(toolCalls).length)
+    usage: anthropicUsage(input.prepared.prompt.length, text.length + thinkingChars + JSON.stringify(toolCalls).length)
   }, "message_delta");
   yield sse({ type: "message_stop" }, "message_stop");
 }
+
+/** 网关自产 thinking 块的占位签名（Anthropic 协议要求非空 signature_delta；本网关不校验回传签名）。 */
+const GATEWAY_THINKING_SIGNATURE = Buffer.from("docker-composer-api:opaque-thinking-signature").toString("base64");
 
 async function saveResponse(deps: AppDeps, auth: AuthContext, id: string, response: Record<string, unknown>, inputItems: unknown[]): Promise<void> {
   const now = new Date().toISOString();

@@ -1,18 +1,13 @@
+# @cursor/sdk >=1.0.27 不再依赖原生编译的 sqlite3（改用 Node 内置 node:sqlite），无需 python3/make/g++ 工具链。
 FROM node:22-bookworm-slim AS deps
 
 WORKDIR /app
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci
 
 FROM node:22-bookworm-slim AS prod-deps
 
 WORKDIR /app
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 

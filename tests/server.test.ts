@@ -10,6 +10,7 @@ import { CursorKeyPool, classifyKeyFailure } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
 import type { ModelLister } from "../src/models.js";
+import { parseToolMarkers } from "../src/protocol.js";
 import { createApp } from "../src/server.js";
 import { MemoryStateStore, SqliteStateStore } from "../src/store.js";
 import { normalizeToolCallForClient } from "../src/tool-compat.js";
@@ -25,9 +26,10 @@ const baseConfig: GatewayConfig = {
   sqlitePath: ":memory:",
   cursorWorkingDirectory: "/workspace",
   requestTimeoutMs: 10_000,
-  sdkClientVersion: "sdk-1.0.18",
+  sdkClientVersion: "sdk-1.0.27",
   cursorSdkDisableSessionResume: true,
   cursorSdkUseHttp1ForAgent: false,
+  cursorAllowBuiltinTools: false,
   maxKeyAttempts: 10,
   maxTransientAttempts: 3
 };
@@ -1606,6 +1608,636 @@ test("CursorSdkRunner sends resolved model.params to the SDK agent", async () =>
   assert.deepEqual(paramsMap(createdModel.params ?? []), paramsMap(sentModel.params));
 });
 
+// ===== 新增修复的回归测试 =====
+
+test("anthropic streaming tool_use emits input via input_json_delta with empty start input", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({
+      text: "",
+      toolCalls: [{ id: "call_weather", name: "get_weather", arguments: { city: "Paris", unit: "celsius" } }]
+    })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      stream: true,
+      tools: [{ name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } } } }],
+      messages: [{ role: "user", content: "Weather in Paris?" }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  const chunks = response.body.split("\n\n");
+  const start = chunks.find((chunk) => chunk.includes("content_block_start") && chunk.includes('"tool_use"'));
+  assert.ok(start, "should emit tool_use content_block_start");
+  // Anthropic 官方语义：start 的 input 恒为空对象，完整参数走 input_json_delta。
+  assert.match(start, /"input":\{\}/);
+  const delta = chunks.find((chunk) => chunk.includes("input_json_delta"));
+  assert.ok(delta, "should emit input_json_delta");
+  assert.ok(delta.includes("Paris") && delta.includes("celsius"), "partial_json should carry the full arguments");
+});
+
+test("CursorSdkRunner streams text optimistically with tools and holds back tool_call markers", async () => {
+  let sdkRun: FakeSdkRun | undefined;
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-marker",
+      send: async () => {
+        sdkRun = new FakeSdkRun({
+          streamEvents: async function* () {
+            yield { type: "assistant", message: { content: [{ type: "text", text: "Let me check. <tool_" }] } };
+            yield { type: "assistant", message: { content: [{ type: "text", text: 'call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>' }] } };
+          },
+          waitResult: { status: "cancelled" }
+        });
+        return sdkRun;
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const events: CursorStreamEvent[] = [];
+  for await (const event of runner.stream({
+    protocol: "anthropic-messages",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "weather",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: [{ name: "get_weather", inputSchema: { type: "object", properties: { city: { type: "string" } } } }]
+  })) {
+    events.push(event);
+  }
+  // 正文在 marker 之前实时下发（不再等 run 结束才一次性吐出）。
+  const textEvents = events.filter((event) => event.type === "text");
+  assert.ok(textEvents.length >= 1, "text before the marker must stream live");
+  assert.equal(textEvents.map((event) => event.type === "text" ? event.text : "").join(""), "Let me check. ");
+  const toolEvents = events.filter((event) => event.type === "tool_call");
+  assert.equal(toolEvents.length, 1);
+  assert.deepEqual(toolEvents[0].type === "tool_call" ? toolEvents[0].toolCall.arguments : {}, { city: "Paris" });
+  // 捕获 marker 工具调用后取消 run，避免继续烧 token。
+  assert.equal(sdkRun?.cancelled, true);
+});
+
+test("CursorSdkRunner streams token-level text from onDelta and dedupes message-level text", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-delta",
+      send: async (_message, options) => {
+        const onDelta = options.onDelta as (args: { update: unknown }) => void;
+        return new FakeSdkRun({
+          streamEvents: async function* () {
+            onDelta({ update: { type: "thinking-delta", text: "pondering" } });
+            onDelta({ update: { type: "text-delta", text: "he" } });
+            onDelta({ update: { type: "text-delta", text: "llo" } });
+            // 消息级全文事件必须被去重，不能再输出一遍。
+            yield { type: "assistant", message: { content: [{ type: "text", text: "hello" }] } };
+          },
+          waitResult: { status: "finished", result: "hello" }
+        });
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const events: CursorStreamEvent[] = [];
+  for await (const event of runner.stream({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  })) {
+    events.push(event);
+  }
+  const thinking = events.filter((event) => event.type === "thinking");
+  assert.equal(thinking.length, 1);
+  const texts = events.filter((event): event is { type: "text"; text: string } => event.type === "text").map((event) => event.text);
+  assert.deepEqual(texts, ["he", "llo"]);
+  const done = events.find((event) => event.type === "done");
+  assert.equal(done?.type === "done" ? done.result.text : "", "hello");
+});
+
+test("CursorSdkRunner does not forward agent-native tool calls the client never declared", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-native",
+      send: async () => new FakeSdkRun({
+        streamEvents: async function* () {
+          yield { type: "tool_call", call_id: "call_sem", name: "semsearch", status: "completed", args: { query: "weather" } };
+          yield { type: "assistant", message: { content: [{ type: "text", text: "the answer" }] } };
+        },
+        waitResult: { status: "finished", result: "the answer" }
+      })
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const result = await runner.run({
+    protocol: "anthropic-messages",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "weather",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: [{ name: "get_weather", inputSchema: { type: "object", properties: { city: { type: "string" } } } }]
+  });
+  assert.deepEqual(result.toolCalls, []);
+  assert.equal(result.text, "the answer");
+});
+
+test("CursorSdkRunner restricts SDK builtin tools: [] without client tools, mcp-only with client tools", async () => {
+  const createOptions: Record<string, unknown>[] = [];
+  const factory: AgentFactory = {
+    create: async (options) => {
+      createOptions.push(options);
+      return {
+        agentId: "agent-tools-restrict",
+        send: async () => new FakeSdkRun({ waitResult: { status: "finished", result: "ok" } })
+      };
+    }
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const base = {
+    protocol: "openai-chat" as const,
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: []
+  };
+  await runner.run({ ...base, tools: [] });
+  await runner.run({ ...base, tools: [{ name: "get_weather" }] });
+  assert.deepEqual(createOptions[0].tools, []);
+  assert.deepEqual(createOptions[1].tools, ["mcp"]);
+});
+
+test("CursorSdkRunner skips the session lock in stateless (disableSessionResume) mode", async () => {
+  let sendCount = 0;
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let firstStarted!: () => void;
+  const firstStreamStarted = new Promise<void>((resolve) => {
+    firstStarted = resolve;
+  });
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-parallel",
+      send: async () => {
+        sendCount += 1;
+        const current = sendCount;
+        return new FakeSdkRun({
+          streamEvents: async function* () {
+            if (current === 1) {
+              firstStarted();
+              await firstCanFinish;
+            }
+          },
+          waitResult: { status: "finished", result: `run ${current}` }
+        });
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), {
+    defaultWorkingDirectory: "/workspace",
+    sdkClientVersion: "test",
+    disableSessionResume: true
+  }, factory);
+  const input: CursorRunRequest = {
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "same-session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  };
+
+  const first = runner.run(input);
+  await firstStreamStarted;
+  const second = runner.run(input);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  // stateless 模式下并发请求不被会话锁串行化：第二个请求应立即开跑。
+  assert.equal(sendCount, 2, "second request must not wait for the first in stateless mode");
+  releaseFirst();
+  assert.equal((await first).text, "run 1");
+  assert.equal((await second).text, "run 2");
+});
+
+test("parseToolMarkers keeps unparsable markers verbatim and tolerates stringified arguments", () => {
+  // arguments 是字符串化 JSON（OpenAI 原生格式）：必须能解析。
+  const stringified = parseToolMarkers('<tool_call>{"name":"get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}</tool_call>');
+  assert.equal(stringified.toolCalls.length, 1);
+  assert.deepEqual(stringified.toolCalls[0].arguments, { city: "Paris" });
+
+  // 解析失败的 marker 保留原文，不再连同正文一起被静默吞掉。
+  const broken = parseToolMarkers("before <tool_call>not json at all</tool_call> after");
+  assert.equal(broken.toolCalls.length, 0);
+  assert.match(broken.text, /not json at all/);
+});
+
+test("resolveModelParams falls back to family mapping when the catalog entry has no parameter definitions", () => {
+  const resolved = resolveModelParams({}, { fast: true }, "composer-2.5");
+  assert.equal(resolved.usedFallback, true);
+  assert.deepEqual(paramsMap(resolved.params), { fast: "true" });
+  assert.deepEqual(resolved.dropped, []);
+});
+
+test("CursorSdkRunner abort wakes an idle stream and cancels the run", async () => {
+  let sdkRun: FakeSdkRun | undefined;
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-abort",
+      send: async () => {
+        sdkRun = new FakeSdkRun({
+          // 上游永远不产生任何事件：abort 必须能唤醒空队列等待。
+          streamEvents: async function* () {
+            await new Promise(() => undefined);
+          },
+          waitResult: { status: "cancelled" }
+        });
+        return sdkRun;
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const controller = new AbortController();
+  const pending = runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  }, controller.signal);
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(
+    () => pending,
+    (error) => error instanceof ApiError && error.statusCode === 499 && error.code === "request_aborted"
+  );
+  assert.equal(sdkRun?.cancelled, true, "abort must cancel the underlying SDK run");
+});
+
+test("normalizeToolCallForClient maps Claude Code Grep flag keys without chain rewrites", () => {
+  const flagTools: GatewayTool[] = [{
+    name: "Grep",
+    inputSchema: { type: "object", properties: { pattern: { type: "string" }, "-A": { type: "number" }, "-i": { type: "boolean" } } }
+  }];
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c1", name: "grep", arguments: { pattern: "x", contextAfter: 3, caseInsensitive: true } }, flagTools),
+    { id: "c1", name: "Grep", arguments: { pattern: "x", "-A": 3, "-i": true } }
+  );
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c2", name: "grep", arguments: { pattern: "x", context_after: 3 } }, flagTools),
+    { id: "c2", name: "Grep", arguments: { pattern: "x", "-A": 3 } }
+  );
+
+  // schema 同时含 context_after 与 -A：contextAfter 落到 context_after，且不再链式改写到 -A；
+  // 原本就是 context_after 的参数保持不动。
+  const bothTools: GatewayTool[] = [{
+    name: "Grep",
+    inputSchema: { type: "object", properties: { pattern: { type: "string" }, context_after: { type: "number" }, "-A": { type: "number" } } }
+  }];
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c3", name: "grep", arguments: { pattern: "x", contextAfter: 3 } }, bothTools),
+    { id: "c3", name: "Grep", arguments: { pattern: "x", context_after: 3 } }
+  );
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c4", name: "grep", arguments: { pattern: "x", context_after: 3 } }, bothTools),
+    { id: "c4", name: "Grep", arguments: { pattern: "x", context_after: 3 } }
+  );
+
+  // 无 schema 时不猜测 flag 风格键。
+  const schemaless: GatewayTool[] = [{ name: "Grep" }];
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c5", name: "grep", arguments: { context_after: 3 } }, schemaless),
+    { id: "c5", name: "Grep", arguments: { context_after: 3 } }
+  );
+});
+
+test("CursorSdkRunner drops marker tool calls for tools the client never declared", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-marker-unmatched",
+      send: async () => new FakeSdkRun({
+        streamEvents: async function* () {
+          yield { type: "assistant", message: { content: [{ type: "text", text: 'ok <tool_call>{"name":"semsearch","arguments":{"q":"x"}}</tool_call> done' }] } };
+        },
+        waitResult: { status: "finished", result: "" }
+      })
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const result = await runner.run({
+    protocol: "anthropic-messages",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "weather",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: [{ name: "get_weather", inputSchema: { type: "object", properties: { city: { type: "string" } } } }]
+  });
+  assert.deepEqual(result.toolCalls, [], "undeclared marker tool call must not be forwarded");
+  // 精确断言：marker 前后的正文都保留、marker 本体不泄漏。
+  assert.equal(result.text, "ok  done");
+  assert.ok(!result.text.includes("<tool_call>"), "marker must not leak into the text");
+});
+
+test("CursorSdkRunner keeps a declared marker call that follows a dropped undeclared one in the same chunk", async () => {
+  let sdkRun: FakeSdkRun | undefined;
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-multi-marker",
+      send: async () => {
+        sdkRun = new FakeSdkRun({
+          streamEvents: async function* () {
+            yield {
+              type: "assistant",
+              message: {
+                content: [{
+                  type: "text",
+                  text: 'a <tool_call>{"name":"semsearch","arguments":{"q":"x"}}</tool_call> b <tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call> c'
+                }]
+              }
+            };
+          },
+          waitResult: { status: "cancelled" }
+        });
+        return sdkRun;
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const events: CursorStreamEvent[] = [];
+  for await (const event of runner.stream({
+    protocol: "anthropic-messages",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "weather",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: [{ name: "get_weather", inputSchema: { type: "object", properties: { city: { type: "string" } } } }]
+  })) {
+    events.push(event);
+  }
+  const toolEvents = events.filter((event): event is { type: "tool_call"; toolCall: { id: string; name: string; arguments: Record<string, unknown> } } => event.type === "tool_call");
+  assert.equal(toolEvents.length, 1, "only the declared marker call is forwarded");
+  assert.equal(toolEvents[0].toolCall.name, "get_weather");
+  assert.deepEqual(toolEvents[0].toolCall.arguments, { city: "Paris" });
+  assert.equal(sdkRun?.cancelled, true);
+});
+
+test("CursorSdkRunner ignores empty text-delta and still accepts message-level text", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-empty-delta",
+      send: async (_message, options) => {
+        const onDelta = options.onDelta as (args: { update: unknown }) => void;
+        return new FakeSdkRun({
+          streamEvents: async function* () {
+            // 空 delta 不能锁定文本来源为 delta，否则后面的消息级全文会被丢。
+            onDelta({ update: { type: "text-delta", text: "" } });
+            yield { type: "assistant", message: { content: [{ type: "text", text: "hello" }] } };
+          },
+          waitResult: { status: "finished", result: "hello" }
+        });
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const result = await runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  });
+  assert.equal(result.text, "hello");
+});
+
+test("CursorSdkRunner abort interrupts a hung run.wait()", async () => {
+  let sdkRun: FakeSdkRun | undefined;
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-hung-wait",
+      send: async () => {
+        sdkRun = new FakeSdkRun({
+          // 流立即结束，但 wait() 永不返回：abort 必须能打断。
+          streamEvents: async function* () { /* empty */ },
+          waitResult: undefined,
+          hangWait: true
+        });
+        return sdkRun;
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const controller = new AbortController();
+  const pending = runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  }, controller.signal);
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(
+    () => pending,
+    (error) => error instanceof ApiError && error.statusCode === 499 && error.code === "request_aborted"
+  );
+});
+
+test("CursorSdkRunner surfaces a cancelled run with zero output as an upstream error", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-external-cancel",
+      send: async () => new FakeSdkRun({ waitResult: { status: "cancelled" } })
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  await assert.rejects(
+    () => runner.run({
+      protocol: "openai-chat",
+      apiKey: "cursor-key",
+      useKeyPool: false,
+      model: "composer-2.5",
+      prompt: "hello",
+      sessionKey: "session",
+      workingDirectory: "/workspace",
+      images: [],
+      tools: []
+    }),
+    (error) => error instanceof ApiError && error.statusCode === 502 && error.code === "upstream_run_failed"
+  );
+});
+
+test("KeyRotatingRunner retries after thinking only for non-streaming requests", async () => {
+  const makeInner = (): CursorRunner => ({
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (input: CursorRunRequest): AsyncIterable<CursorStreamEvent> {
+      if (input.apiKey === "key-a") {
+        yield { type: "thinking", text: "hmm" };
+        throw new ApiError("Cursor upstream run ended in error", 502, "upstream_run_failed");
+      }
+      yield { type: "text", text: "ok" };
+      yield { type: "done", result: { text: "ok", toolCalls: [] } };
+    }
+  });
+  const baseInput: CursorRunRequest = {
+    protocol: "anthropic-messages",
+    apiKey: "",
+    useKeyPool: true,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  };
+
+  // 非流式：thinking 会被聚合器丢弃 → 允许换 key 重试，最终成功。
+  {
+    const store = new MemoryStateStore();
+    const keyPool = new CursorKeyPool(store);
+    await keyPool.seedFromEnv(["key-a", "key-b"]);
+    const rotating = new KeyRotatingRunner(makeInner(), keyPool);
+    const result = await rotating.run({ ...baseInput, stream: false });
+    assert.equal(result.text, "ok");
+  }
+
+  // 流式：thinking 已发给客户端 → 不再透明重试，透出上游错误。
+  {
+    const store = new MemoryStateStore();
+    const keyPool = new CursorKeyPool(store);
+    await keyPool.seedFromEnv(["key-a", "key-b"]);
+    const rotating = new KeyRotatingRunner(makeInner(), keyPool);
+    await assert.rejects(async () => {
+      for await (const event of rotating.stream({ ...baseInput, stream: true })) {
+        void event;
+      }
+    }, (error) => error instanceof ApiError && error.code === "upstream_run_failed");
+  }
+});
+
+test("responses stream keeps alive during thinking and emits completion events", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["pondering"], chunks: ["answer"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Say hello" }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /^: thinking$/m, "thinking should surface as SSE keepalive comments");
+  assert.match(response.body, /event: response\.output_text\.done/);
+  assert.match(response.body, /event: response\.content_part\.done/);
+  assert.match(response.body, /event: response\.output_item\.done/);
+  assert.match(response.body, /event: response\.completed/);
+});
+
+test("normalizeToolCallForClient removes redundant synonym source keys when the target is already set", () => {
+  const tools: GatewayTool[] = [{
+    name: "Write",
+    inputSchema: { type: "object", properties: { file_path: { type: "string" }, content: { type: "string" } } }
+  }];
+  const normalized = normalizeToolCallForClient(
+    { id: "c1", name: "write", arguments: { path: "a.md", fileText: "hello", file_text: "hello" } },
+    tools
+  );
+  // fileText/file_text 同义并存：content 只取一次，schema 外的冗余键全部清除。
+  assert.deepEqual(normalized, { id: "c1", name: "Write", arguments: { file_path: "a.md", content: "hello" } });
+});
+
+test("anthropic history thinking blocks are excluded from the synthesized prompt", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Hello" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "secret internal reasoning", signature: "fake-sig" },
+            { type: "text", text: "earlier answer" }
+          ]
+        },
+        { role: "user", content: "Continue" }
+      ]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(!runner.lastInput?.prompt.includes("secret internal reasoning"), "thinking content must not enter the prompt");
+  assert.ok(!runner.lastInput?.prompt.includes("fake-sig"), "thinking signature must not enter the prompt");
+  assert.ok(runner.lastInput?.prompt.includes("earlier answer"), "regular assistant text stays in the prompt");
+});
+
+test("anthropic stream emits thinking blocks with signature_delta before stop", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["let me think"], chunks: ["answer"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  const body = response.body;
+  assert.match(body, /"content_block_start".*"type":"thinking"/);
+  assert.match(body, /thinking_delta/);
+  assert.match(body, /signature_delta/);
+  // thinking 块的 stop 之前必须先有 signature_delta（Anthropic 协议要求）。
+  assert.ok(body.indexOf("signature_delta") < body.indexOf("content_block_stop"), "signature_delta must precede the thinking block stop");
+  // thinking 块之后正文以独立 text 块（index 1）下发。
+  assert.match(body, /"index":1.*"type":"text"|"type":"text".*"index":1/);
+});
+
+test("openai chat stream forwards thinking as reasoning_content deltas", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["pondering"], chunks: ["answer"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /"reasoning_content":"pondering"/);
+  assert.match(response.body, /"content":"answer"/);
+});
+
 async function createTestApp(options: {
   runner?: FakeRunner;
   store?: MemoryStateStore;
@@ -1644,6 +2276,8 @@ class FakeSdkRun {
   constructor(private readonly input: {
     streamEvents?: () => AsyncIterable<unknown>;
     waitResult?: unknown;
+    /** wait() 永不返回，用于验证 abort 能打断挂死的 wait。 */
+    hangWait?: boolean;
   } = {}) {}
 
   async *stream(): AsyncIterable<unknown> {
@@ -1651,6 +2285,7 @@ class FakeSdkRun {
   }
 
   async wait(): Promise<unknown> {
+    if (this.input.hangWait) return new Promise(() => undefined);
     return this.input.waitResult ?? { status: "finished", result: "" };
   }
 
@@ -1666,7 +2301,7 @@ class FakeRunner implements CursorRunner {
   readonly failFor = new Map<string, string>();
   readonly failWith = new Map<string, Error>();
 
-  constructor(private readonly output: Partial<CursorRunResult> & { chunks?: string[] } = {}) {}
+  constructor(private readonly output: Partial<CursorRunResult> & { chunks?: string[]; thinking?: string[] } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
     this.lastApiKey = input.apiKey;
@@ -1686,6 +2321,9 @@ class FakeRunner implements CursorRunner {
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    for (const thinking of this.output.thinking ?? []) {
+      yield { type: "thinking", text: thinking };
+    }
     const chunks = this.output.chunks ?? (this.output.text ? [this.output.text] : []);
     let text = "";
     for (const chunk of chunks) {

@@ -11,13 +11,22 @@ import type {
 } from "./types.js";
 
 const REQUEST_LOG_KEEP = 5000;
+/** 每 N 条插入才跑一次日志裁剪，避免热路径上每条日志都带一次 OFFSET 全表扫描的 DELETE。 */
+const REQUEST_LOG_CLEANUP_EVERY = 100;
 
 export class SqliteStateStore implements StateStore {
   private readonly db: DatabaseSync;
+  private requestLogInsertCount = 0;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
+    try {
+      // WAL 显著降低写入对读的阻塞；node:sqlite 是同步 API，写路径短暂阻塞事件循环，WAL 让它更短。
+      this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    } catch {
+      // 内存库等场景不支持 WAL，忽略。
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sdk_sessions (
         id TEXT PRIMARY KEY,
@@ -75,6 +84,18 @@ export class SqliteStateStore implements StateStore {
       );
     `);
     this.migrateCursorKeySortOrder();
+    // 启动时先裁剪一次：cleanup 每 100 条才跑，计数器重启归零后历史积压需要这里兜底。
+    this.trimRequestLogs();
+  }
+
+  private trimRequestLogs(): void {
+    this.db
+      .prepare(
+        `DELETE FROM request_logs WHERE id IN (
+           SELECT id FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?
+         )`
+      )
+      .run(REQUEST_LOG_KEEP);
   }
 
   /** 老库升级：补 sort_order 列并按原插入顺序（rowid）回填，保持既有取用顺序不变。 */
@@ -275,13 +296,10 @@ export class SqliteStateStore implements StateStore {
         record.stream ? 1 : 0,
         record.error ?? null
       );
-    this.db
-      .prepare(
-        `DELETE FROM request_logs WHERE id IN (
-           SELECT id FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?
-         )`
-      )
-      .run(REQUEST_LOG_KEEP);
+    this.requestLogInsertCount += 1;
+    if (this.requestLogInsertCount % REQUEST_LOG_CLEANUP_EVERY === 0) {
+      this.trimRequestLogs();
+    }
   }
 
   async listRequestLogs(limit: number): Promise<RequestLogRecord[]> {

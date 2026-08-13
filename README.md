@@ -5,10 +5,14 @@
 ## 功能
 
 - OpenAI Chat Completions / Responses、Anthropic Messages 三种协议兼容
-- 模型参数透传：Claude Code 的 thinking、Codex 的 reasoning effort、1M 上下文（Max Mode）等自动映射为 Cursor `model.params`
+- 真·逐 token 流式：消费 Cursor SDK 的 `onDelta` 回调；带 tools 的请求（如 Claude Code 全部请求）也乐观流式输出，只暂扣可能是 `<tool_call>` 标记前缀的尾部
+- 思考过程透传：Anthropic 端点输出 `thinking_delta` 内容块，OpenAI Chat 端点输出 `reasoning_content` 增量，消除思考期的长时间静默
+- 工具调用按 Anthropic 官方语义流式下发（`tool_use` 的 start `input` 为 `{}`、参数经 `input_json_delta`），Claude Code 等严格实现的客户端不再读到空参数
+- 模型参数透传：Claude Code 的 thinking、Codex 的 reasoning effort、1M 上下文（Max Mode）等自动映射为 Cursor `model.params`；实际下发的参数会打 `[model-params] sending params` 日志便于核对
+- 默认用 SDK（>=1.0.27）的内置工具限制阻止 Cursor agent 在网关容器里执行 shell/edit，防止与客户端工具双重执行
 - Cursor key 池：多 key 顺序取用，额度不足/key 失效自动禁用并切换下一个；额度恢复后在后台手动重新启用
 - `/admin` Web 管理后台：key 增删启停、请求日志、用量统计、联通性测试
-- 请求日志落 SQLite（保留最近 5000 条）
+- 请求日志落 SQLite（保留约 5000 条，批量裁剪）
 
 ## 快速开始
 
@@ -33,8 +37,10 @@ ALLOW_DIRECT_CURSOR_KEYS=true
 - `GATEWAY_API_KEY` 是客户端调用本项目 API 时使用的网关 key。
 - `ADMIN_PASSWORD` 是 `/admin` 后台密码；留空时会退回使用 `GATEWAY_API_KEY`。
 - `ALLOW_DIRECT_CURSOR_KEYS=true` 时，也允许客户端直接把 Cursor key 当作 API key 传入。
-- `CURSOR_SDK_DISABLE_SESSION_RESUME=true`（默认）时，每次 API 请求都创建 fresh Cursor SDK agent，不恢复旧 agent。OpenAI/Anthropic 客户端本身会把上下文放在请求里，这个模式能避免服务运行一段时间后旧 SDK 会话/远端 agent 状态污染，导致所有请求持续 502。
+- `CURSOR_SDK_DISABLE_SESSION_RESUME=true`（默认）时，每次 API 请求都创建 fresh Cursor SDK agent，不恢复旧 agent。OpenAI/Anthropic 客户端本身会把上下文放在请求里，这个模式能避免服务运行一段时间后旧 SDK 会话/远端 agent 状态污染，导致所有请求持续 502。该模式下并发请求不加会话锁，可以真正并行。
 - `CURSOR_SDK_USE_HTTP1_FOR_AGENT=true` 时，强制 Cursor local agent backend streams 使用 HTTP/1.1 + SSE，可用于代理/网络环境不兼容 HTTP/2 的排查。
+- `CURSOR_ALLOW_BUILTIN_TOOLS=false`（默认）时，通过 SDK 的 `tools` 限制禁止 Cursor agent 在网关容器内使用内置工具（shell/edit/grep 等）：无客户端工具的请求为纯文本模式，有客户端工具的请求只保留 MCP 元工具通道。
+- SSE 响应带 `x-accel-buffering: no`；用 Nginx 反代时仍建议显式配置 `proxy_buffering off`，否则流式会被反代攒成大块。
 
 Web 管理后台 key 池示例：
 
@@ -185,7 +191,9 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 
 说明：
 
-- 映射基于 `Cursor.models.list()` 返回的该模型参数定义与默认 variant（补全默认参数组合，避免只发部分参数时其余参数掉到首个允许值）；目录发现失败时按模型家族已知惯例兜底映射，命中不了的意图会记入服务日志（`[model-params]`）而不是静默丢弃。
+- 映射基于 `Cursor.models.list()` 返回的该模型参数定义与默认 variant（补全默认参数组合，避免只发部分参数时其余参数掉到首个允许值）；目录发现失败或目录条目缺参数定义时按模型家族已知惯例兜底映射，命中不了的意图会记入服务日志（`[model-params]`）而不是静默丢弃；实际下发的参数也会打 `[model-params] sending params` 日志（同组合 10 分钟内一条）。
+- 模型目录缓存 10 分钟；请求了缓存里没有的模型会立刻强刷一次目录（30 秒限频），新上线的模型无需等缓存过期。
+- 上游 run 失败时透传 SDK（>=1.0.23）的结构化错误详情；命中区域限制（如 "This model provider is not supported in your region"，Claude 系模型在部分出口区域不可用）时返回 403 `model_unavailable` 并附原文，而不是笼统的 502。
 - `GET /v1/models` 会在每个模型上返回 `cursor_parameters`（参数定义）与 `cursor_variants`（预设组合），可用来确认某模型支持哪些参数与取值。
 - `temperature` / `top_p` / `max_tokens` 等采样参数 Cursor SDK 不支持，仅作为提示词附注传递。
 

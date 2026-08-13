@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { GatewayModel, ModelParameterDefinition, ModelVariantDefinition } from "./types.js";
 
 /** 上游不可达且无缓存时的静态兜底列表。 */
@@ -27,19 +28,60 @@ export type ModelLister = (apiKey?: string) => Promise<ModelListResult>;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 /** 发现失败后的负缓存时长：短暂避开对上游的每请求重试，同时保证恢复后能较快重新发现。 */
 const FAILURE_RETRY_MS = 60 * 1000;
-let cache: { models: ModelEntry[]; at: number } | undefined;
-let lastFailureAt = 0;
+/** 未知模型触发的强制刷新最短间隔：防止乱填模型 id 的请求打爆上游。 */
+const FORCED_REFRESH_MIN_INTERVAL_MS = 30 * 1000;
+/** 缓存桶数量上限：ALLOW_DIRECT_CURSOR_KEYS 时每个客户端 key 一个桶，必须设上限防无界增长。 */
+const MAX_CACHE_BUCKETS = 64;
+/** 目录缓存按 apiKey 分桶：key 池可能混用不同账号/团队的 key，各账号可用模型与参数定义可能不同。 */
+const caches = new Map<string, { models: ModelEntry[]; at: number }>();
+/** 失败负缓存同样按桶记录：一个无效 direct key 的失败不应让其他有效 key 也被挡在上游之外。 */
+const failureAt = new Map<string, number>();
+let lastForcedRefreshAt = 0;
+
+function cacheBucket(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+}
+
+function setCache(bucket: string, entry: { models: ModelEntry[]; at: number }): void {
+  caches.set(bucket, entry);
+  while (caches.size > MAX_CACHE_BUCKETS) {
+    let oldestKey: string | undefined;
+    let oldestAt = Infinity;
+    for (const [key, value] of caches) {
+      if (value.at < oldestAt) {
+        oldestAt = value.at;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) break;
+    caches.delete(oldestKey);
+  }
+}
+
+function anyCache(): { models: ModelEntry[]; at: number } | undefined {
+  let latest: { models: ModelEntry[]; at: number } | undefined;
+  for (const entry of caches.values()) {
+    if (!latest || entry.at > latest.at) latest = entry;
+  }
+  return latest;
+}
 
 /**
- * 从 Cursor 后台拉取当前账号可用模型（Cursor.models.list），10 分钟缓存；
+ * 从 Cursor 后台拉取当前账号可用模型（Cursor.models.list），10 分钟缓存（按 apiKey 分桶）；
  * 无 key、上游失败时依次退回缓存、静态兜底列表。失败后 1 分钟内不再重试上游，避免放大故障。
+ * forceRefresh 时绕过 TTL（用于“请求了缓存里没有的模型”场景，让新上线模型即刻可用）。
  */
-export async function listAvailableModels(apiKey?: string): Promise<ModelListResult> {
-  if (!apiKey) return cache ? { models: cache.models, source: "cursor" } : fallbackModels();
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
-    return { models: cache.models, source: "cursor" };
+export async function listAvailableModels(apiKey?: string, forceRefresh = false): Promise<ModelListResult> {
+  if (!apiKey) {
+    const fallbackCache = anyCache();
+    return fallbackCache ? { models: fallbackCache.models, source: "cursor" } : fallbackModels();
   }
-  if (!cache && Date.now() - lastFailureAt < FAILURE_RETRY_MS) return fallbackModels();
+  const bucket = cacheBucket(apiKey);
+  const cached = caches.get(bucket);
+  if (!forceRefresh && cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    return { models: cached.models, source: "cursor" };
+  }
+  if (!cached && Date.now() - (failureAt.get(bucket) ?? 0) < FAILURE_RETRY_MS) return fallbackModels();
   try {
     const sdk = await import("@cursor/sdk") as Record<string, unknown>;
     const cursor = sdk.Cursor as
@@ -48,15 +90,21 @@ export async function listAvailableModels(apiKey?: string): Promise<ModelListRes
     const listed = await cursor?.models?.list?.({ apiKey });
     const models = parseSdkModels(listed);
     if (models.length) {
-      cache = { models, at: Date.now() };
+      setCache(bucket, { models, at: Date.now() });
       return { models, source: "cursor" };
     }
   } catch (error) {
-    lastFailureAt = Date.now();
+    failureAt.set(bucket, Date.now());
+    // 与目录缓存共用同一上限语义，防止 direct key 制造无界增长。
+    while (failureAt.size > MAX_CACHE_BUCKETS) {
+      const oldest = failureAt.keys().next().value;
+      if (oldest === undefined) break;
+      failureAt.delete(oldest);
+    }
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[models] Cursor.models.list() failed: ${message.slice(0, 200)}`);
   }
-  return cache ? { models: cache.models, source: "cursor" } : fallbackModels();
+  return cached ? { models: cached.models, source: "cursor" } : fallbackModels();
 }
 
 export function openAiModelList(models: ModelEntry[]): Record<string, unknown> {
@@ -87,6 +135,22 @@ export function openAiModelObject(model: ModelEntry): Record<string, unknown> {
 export async function getModelCatalogEntry(modelId: string, apiKey?: string): Promise<ModelEntry | undefined> {
   if (!modelId) return undefined;
   const { models } = await listAvailableModels(apiKey);
+  const found = findModel(models, modelId);
+  if (found) return found;
+  if (!apiKey) return undefined;
+  // 目录刚从上游实时拉取过（不是旧缓存）→ 上游确实没有该模型，立刻再刷一次没有意义。
+  const entry = caches.get(cacheBucket(apiKey));
+  if (entry && Date.now() - entry.at < FORCED_REFRESH_MIN_INTERVAL_MS) return undefined;
+  // 缓存里没有该模型：可能是刚上线的新模型，强刷一次目录（全局限频 30s），避免新模型要等 10 分钟缓存过期才可用。
+  if (Date.now() - lastForcedRefreshAt >= FORCED_REFRESH_MIN_INTERVAL_MS) {
+    lastForcedRefreshAt = Date.now();
+    const refreshed = await listAvailableModels(apiKey, true);
+    return findModel(refreshed.models, modelId);
+  }
+  return undefined;
+}
+
+function findModel(models: ModelEntry[], modelId: string): ModelEntry | undefined {
   const target = modelId.trim().toLowerCase();
   return models.find((model) =>
     model.id.toLowerCase() === target || model.aliases.some((alias) => alias.toLowerCase() === target));

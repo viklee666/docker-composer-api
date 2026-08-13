@@ -335,7 +335,9 @@ export function resolveModelParams(
   let defs = catalog?.parameters ?? [];
   let family: FallbackFamily | undefined;
   let usedFallback = false;
-  if (catalog === undefined && hasSemantic) {
+  // 目录整体缺失，或目录条目存在但没有参数定义（静态兜底列表 / 陈旧缓存条目），都走家族兜底——
+  // 否则 composer 等模型的 fast 意图会在“目录发现失败但条目命中”时被静默丢弃。
+  if (!defs.length && hasSemantic) {
     family = fallbackFamilyFor(modelId);
     defs = family?.defs ?? [];
     usedFallback = defs.length > 0;

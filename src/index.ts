@@ -31,6 +31,7 @@ const sdkRunner = new CursorSdkRunner(store, {
   defaultWorkingDirectory: config.cursorWorkingDirectory,
   sdkClientVersion: config.sdkClientVersion,
   disableSessionResume: config.cursorSdkDisableSessionResume,
+  allowBuiltinTools: config.cursorAllowBuiltinTools,
   getModelCatalog: getModelCatalogEntry
 });
 const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
@@ -50,3 +51,26 @@ console.log(`Docker Composer API listening on http://${config.host}:${config.por
 console.log(`Admin panel available at /admin (${config.adminPassword ? "enabled" : "disabled: set ADMIN_PASSWORD"})`);
 if (config.cursorSdkDisableSessionResume) console.log("Cursor SDK session resume disabled (stateless per request)");
 if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1.1 mode enabled");
+
+// 启动即预热 SDK：默认路径下 SDK 是首个请求才懒加载的，冷加载 + 本地执行器初始化会拖慢首请求的首 token。
+// 预热失败不影响服务（首请求会再走懒加载）。
+void (async () => {
+  try {
+    const sdk = await import("@cursor/sdk") as {
+      createAgentPlatform?: () => Promise<{ prewarmLocalWorkspace?: (options: Record<string, unknown>) => Promise<() => Promise<void>> }>;
+    };
+    console.log("Cursor SDK preloaded");
+    const poolKey = (await keyPool.list()).find((key) => key.status === "active");
+    if (!sdk.createAgentPlatform || !poolKey) return;
+    // 预扫描工作区（规则/忽略文件等），让首个 send() 少一段准备时间。
+    // 返回的 release 函数用于停止缓存维护；网关生命周期内持续复用工作区，不调用。
+    const platform = await sdk.createAgentPlatform();
+    await platform.prewarmLocalWorkspace?.({
+      apiKey: poolKey.apiKey,
+      local: { cwd: config.cursorWorkingDirectory, settingSources: [] }
+    });
+    console.log("Cursor workspace prewarmed");
+  } catch (error) {
+    console.error(`[prewarm] Cursor SDK preload failed (first request will lazy-load): ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
+  }
+})();
