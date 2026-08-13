@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { ApiError } from "./errors.js";
 import {
   mergeIntents,
@@ -112,12 +112,17 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   return prepared;
 }
 
-export function prepareAnthropicMessages(body: unknown): PreparedRequest {
+/**
+ * @param options.countTokens `/v1/messages/count_tokens` 的请求体按官方 schema 就没有 max_tokens 字段，
+ *   不该触发缺字段日志——那条日志只记一次，被 count_tokens 抢先触发后，真正遗漏 max_tokens 的
+ *   messages 请求就再也不会被记录。
+ */
+export function prepareAnthropicMessages(body: unknown, options?: { countTokens?: boolean }): PreparedRequest {
   const record = objectBody(body);
   // Anthropic 的 thinking 不再拒绝：映射为 Cursor 的思考强度（reasoning/effort/thinking 参数）透传给 SDK。
   if (record.mcp_servers !== undefined) throw new ApiError("Anthropic server tools are not supported; pass client tools in tools instead.", 400, "unsupported_parameter", "mcp_servers");
   // 官方 max_tokens 必填，但它在本网关上本来也不生效：宽松客户端只记一次日志，不拒绝请求。
-  if (record.max_tokens === undefined) {
+  if (!options?.countTokens && record.max_tokens === undefined) {
     logOnce("anthropic-missing-max-tokens", "[anthropic] request omitted the required max_tokens field; accepted anyway (the parameter has no effect on the Cursor upstream).");
   }
   const messages = arrayField(record, "messages");
@@ -317,9 +322,11 @@ export function anthropicMessageObject(input: { id: string; prepared: PreparedRe
   const content: Record<string, unknown>[] = [];
   const reasoning = input.output.reasoningText ?? "";
   const visibility = input.prepared.thinkingVisibility ?? "off";
+  // 计入输出的思考字符：与流式一致，display:"omitted" 下思考照样发生（只是不下发文本），仍要计数。
+  const thinkingChars = visibility === "off" ? 0 : reasoning.length;
   if (reasoning && visibility !== "off") {
     // display:"omitted" 的官方语义：仍返回 thinking 块（含 signature），但省略思考文本。
-    content.push({ type: "thinking", thinking: visibility === "omitted" ? "" : reasoning, signature: GATEWAY_THINKING_SIGNATURE });
+    content.push({ type: "thinking", thinking: visibility === "omitted" ? "" : reasoning, signature: gatewayThinkingSignature() });
   }
   if (input.output.text || !input.output.toolCalls.length) content.push({ type: "text", text: input.output.text });
   for (const toolCall of input.output.toolCalls) content.push(anthropicToolUse(toolCall));
@@ -331,12 +338,22 @@ export function anthropicMessageObject(input: { id: string; prepared: PreparedRe
     content,
     stop_reason: input.output.toolCalls.length ? "tool_use" : "end_turn",
     stop_sequence: null,
-    usage: anthropicUsage(input.prepared.prompt.length, input.output.text.length + JSON.stringify(content).length)
+    // 与流式同口径：正文 + 思考字符 + 工具调用 JSON。旧写法用 JSON.stringify(content)，
+    // 而 content 里已经含正文与思考全文，正文被算两遍——同一次对话走两种模式报出的 output_tokens 差近一倍。
+    usage: anthropicUsage(
+      input.prepared.prompt.length,
+      input.output.text.length + thinkingChars + JSON.stringify(input.output.toolCalls).length
+    )
   };
 }
 
-/** 网关自产 thinking 块的占位签名（Anthropic 协议要求非空 signature；本网关不校验回传签名）。 */
-export const GATEWAY_THINKING_SIGNATURE = Buffer.from("docker-composer-api:opaque-thinking-signature").toString("base64");
+/**
+ * 网关自产 thinking 块的不透明签名（Anthropic 协议要求非空 signature；本网关不校验回传签名）。
+ * 每块单独生成：固定常量 base64 解开就是明文，且所有响应共用一个值，容易被误当成可校验的凭据。
+ */
+export function gatewayThinkingSignature(): string {
+  return randomBytes(64).toString("base64");
+}
 
 /** 关闭思考的强度取值：命中即视为客户端明确不要 thinking 块。 */
 const THINKING_DISABLED = new Set(["none", "off", "false", "disabled", "disable", "no", "0"]);
@@ -457,6 +474,14 @@ export function anthropicUsage(inputChars: number, outputChars: number): Record<
     cache_read_input_tokens: 0,
     output_tokens: estimateTokens(outputChars)
   };
+}
+
+/**
+ * `/v1/messages/count_tokens` 的响应体。与 `anthropicUsage` 的 input_tokens 同口径：
+ * 客户端拿它做预算判断时，不会和随后真实请求报出的用量对不上。
+ */
+export function anthropicTokenCount(prepared: PreparedRequest): Record<string, unknown> {
+  return { input_tokens: estimateTokens(prepared.prompt.length) };
 }
 
 export function responseListObject(inputItems: unknown[]): Record<string, unknown> {

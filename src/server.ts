@@ -19,10 +19,11 @@ import { mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-pa
 import { listAvailableModels, openAiModelList, openAiModelObject, type ModelLister } from "./models.js";
 import {
   anthropicMessageObject,
+  anthropicTokenCount,
   anthropicToolUse,
   anthropicUsage,
   chatCompletionObject,
-  GATEWAY_THINKING_SIGNATURE,
+  gatewayThinkingSignature,
   openAiToolCall,
   openAiUsage,
   prepareAnthropicMessages,
@@ -95,14 +96,14 @@ export function createApp(deps: AppDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error, request, reply) => {
-    const normalized = normalizeError(error);
-    if (request.url.startsWith("/v1/messages")) {
-      // Anthropic 客户端从 request-id 头/字段拿排查用的请求标识。
-      const requestId = anthropicRequestId(request);
-      reply.header("request-id", requestId).status(normalized.statusCode).send(anthropicError(normalized, requestId));
-      return;
-    }
-    reply.status(openAiStatus(normalized.statusCode)).send(openAiError(normalized));
+    sendProtocolError(request, reply, normalizeError(error));
+  });
+
+  // 未命中任何路由时 Fastify 默认回 {message,error,statusCode}：既不是 Anthropic 信封也不是 OpenAI 信封，
+  // 严格 SDK 解不出错误原因。走与抛错路径相同的分流。
+  app.setNotFoundHandler((request, reply) => {
+    const path = request.url.split("?")[0];
+    sendProtocolError(request, reply, new ApiError(`Unknown endpoint: ${request.method} ${path}`, 404, "not_found"));
   });
 
   app.get("/health", async () => ({
@@ -203,6 +204,15 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const record = await deps.store.getResponse(id, auth.ownerHash);
     if (!record) throw new ApiError("Response not found.", 404, "not_found");
     return responseListObject(record.inputItems);
+  });
+
+  /**
+   * 官方 token 预估端点：只做请求解析与估算，不落请求日志、不碰 runner 与密钥池。
+   * 与 /v1/messages 是两条独立静态路由，注册顺序无关。
+   */
+  app.post("/v1/messages/count_tokens", async (request) => {
+    authenticate(request, deps.config);
+    return anthropicTokenCount(prepareAnthropicMessages(request.body, { countTokens: true }));
   });
 
   app.post("/v1/messages", async (request, reply) => {
@@ -722,10 +732,10 @@ async function* anthropicStream(input: {
     const closeOpenBlock = (): string[] => {
       if (openType === null) return [];
       const chunks: string[] = [];
-      // Anthropic 协议要求 thinking 块在 stop 前有 signature_delta；网关无真实签名，发一个不透明占位签名
+      // Anthropic 协议要求 thinking 块在 stop 前有 signature_delta；网关无真实签名，发一个不透明签名
       // 保证严格客户端（Claude Code）能正常收块。历史消息里的 thinking 块本网关按纯文本处理，不校验签名。
       if (openType === "thinking") {
-        chunks.push(sse({ type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: GATEWAY_THINKING_SIGNATURE } }, "content_block_delta"));
+        chunks.push(sse({ type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: gatewayThinkingSignature() } }, "content_block_delta"));
       }
       chunks.push(sse({ type: "content_block_stop", index: openIndex }, "content_block_stop"));
       openType = null;
@@ -844,6 +854,20 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 function booleanHeader(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
   return !["0", "false", "no", "off"].includes(value.toLowerCase());
+}
+
+/**
+ * 按端点协议选择错误信封：/v1/messages 系列用 Anthropic 形状（含 request_id），其余用 OpenAI 形状。
+ * 抛错路径与未命中路由路径共用同一实现，避免两处漂移。
+ */
+function sendProtocolError(request: FastifyRequest, reply: FastifyReply, error: ApiError): void {
+  if (request.url.startsWith("/v1/messages")) {
+    // Anthropic 客户端从 request-id 头/字段拿排查用的请求标识。
+    const requestId = anthropicRequestId(request);
+    reply.header("request-id", requestId).status(error.statusCode).send(anthropicError(error, requestId));
+    return;
+  }
+  reply.status(openAiStatus(error.statusCode)).send(openAiError(error));
 }
 
 /** 每个 /v1/messages 请求一个稳定的 request id：响应头与错误体里必须是同一个值。 */

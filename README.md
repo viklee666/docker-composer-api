@@ -123,6 +123,7 @@ http://127.0.0.1:8787/admin
 - `DELETE /v1/responses/:id`
 - `GET /v1/responses/:id/input_items`
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`（按合成 prompt 估算 `input_tokens`，与真实请求的 usage 同口径；不消耗上游额度）
 - `GET /admin`（管理后台页面）
 - `/admin/api/*`（管理 API，Bearer `ADMIN_PASSWORD` 鉴权）
 
@@ -206,7 +207,7 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 
 - **采样与长度参数不生效**：`temperature` / `top_p` / `max_tokens`（含 `max_completion_tokens` / `max_output_tokens`）/ `stop` / `response_format` / `text.format` 等 Cursor SDK 不支持。网关接受这些字段并在 Responses 快照里原样回显，但不会改变生成行为，也不会作为提示词附注注入 prompt。
 - **usage 是估算值**：Cursor SDK 不透出 token 计数，所有 `usage` 字段按字符数 / 4 估算（Responses 的 `reasoning_tokens` 同样按思考文本估算并计入 `output_tokens`）。**仅供粗略参考，不可用于计费或配额核算**，请以 Cursor 官方仪表盘为准。
-- **thinking 签名不可跨 provider 校验**：Anthropic 端点的 thinking 块带的是网关生成的占位 `signature`（上游不提供真实签名）。它只保证严格客户端能正常收块，**回传给 Anthropic 官方 API 无法通过校验**；本网关自己也不校验客户端回传的签名，历史 thinking 块不会进入合成 prompt。thinking 块仅在客户端显式请求思考（`thinking` 字段 / `reasoning_effort` / 模型 id 思考强度后缀）时输出；`thinking:{type:"disabled"}` 或 `thinking.display:"omitted"` 时不回传思考内容（但思考强度仍照常下发给上游）。
+- **thinking 签名不可跨 provider 校验**：Anthropic 端点的 thinking 块带的是网关按块随机生成的不透明 `signature`（上游不提供真实签名）。它只保证严格客户端能正常收块，**回传给 Anthropic 官方 API 无法通过校验**；本网关自己也不校验客户端回传的签名，历史 thinking 块不会进入合成 prompt。thinking 块仅在客户端显式请求思考（`thinking` 字段 / `reasoning_effort` / 模型 id 思考强度后缀）时输出；`thinking:{type:"disabled"}` 或 `thinking.display:"omitted"` 时不回传思考内容（但思考强度仍照常下发给上游）。
 - **stop_reason 只有 `end_turn` / `tool_use`**：上游不区分 `max_tokens` / `stop_sequence` 等终止原因。
 - **Anthropic `max_tokens` 缺失只记日志不拒绝**：官方要求必填，这里为兼容宽松客户端放行（该参数本来也不生效）。
 - **不支持的内容与工具**：Anthropic `document` / PDF 内容块返回 400（上游只接受文本与图片，请客户端侧抽取文本后作为 text 块发送）；`n>1`、`audio`、`modalities`、内置工具（web search 等）明确 400 或忽略；`logprobs: true` 返回 400（`logprobs: false` 与 `top_logprobs` 接受但不生效）。

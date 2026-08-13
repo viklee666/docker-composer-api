@@ -4406,3 +4406,113 @@ test("ephemeral agent store round-trips records, pages run events and stays boun
   const listed = await store.agents.list({ filter: { limit: 1000 } });
   assert.ok(listed.items.length <= 256, `agent buckets must stay bounded, saw ${listed.items.length}`);
 });
+
+// ---------------------------------------------------------------------------
+// thinking 签名 / usage 口径 / 404 信封 / count_tokens
+// ---------------------------------------------------------------------------
+
+test("thinking signatures are per-block opaque values rather than a shared constant", async () => {
+  const headers = { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" };
+  const payload = {
+    model: "composer-2.5",
+    max_tokens: 64,
+    thinking: { type: "enabled", budget_tokens: 2048 },
+    messages: [{ role: "user", content: "Hello" }]
+  };
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["deep thought"], text: "answer" }) });
+  const signatureOf = (body: string): string => {
+    const content = (JSON.parse(body) as { content: { type: string; signature?: string }[] }).content;
+    const signature = content.find((block) => block.type === "thinking")?.signature;
+    assert.ok(signature, "thinking 块必须带非空 signature");
+    return signature;
+  };
+
+  const first = signatureOf((await app.inject({ method: "POST", url: "/v1/messages", headers, payload })).body);
+  const second = signatureOf((await app.inject({ method: "POST", url: "/v1/messages", headers, payload })).body);
+  const streamed = await app.inject({ method: "POST", url: "/v1/messages", headers, payload: { ...payload, stream: true } });
+  const streamedSignature = sseFrames(streamed.body)
+    .map((frame) => frame.data as { delta?: { type?: string; signature?: string } } | undefined)
+    .find((data) => data?.delta?.type === "signature_delta")?.delta?.signature;
+  assert.ok(streamedSignature, "流式 thinking 块要以 signature_delta 收尾");
+
+  assert.equal(new Set([first, second, streamedSignature]).size, 3, "每个 thinking 块要有独立签名，不能是编译期常量");
+  // 旧实现是 base64("docker-composer-api:opaque-thinking-signature")，解开即明文，容易被误当成可校验凭据。
+  for (const signature of [first, second, streamedSignature]) {
+    assert.ok(signature.length >= 64, "签名要足够长，避免被当成可校验的短凭据");
+    assert.ok(!Buffer.from(signature, "base64").toString("utf8").includes("docker-composer-api"), "签名不得解码出可读明文");
+  }
+});
+
+test("anthropic output_tokens are identical between streaming and non-streaming", async () => {
+  const headers = { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" };
+  const payload = {
+    model: "composer-2.5",
+    max_tokens: 64,
+    thinking: { type: "enabled", budget_tokens: 2048 },
+    messages: [{ role: "user", content: "Hello" }]
+  };
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["deep thought"], text: "answer" }) });
+
+  const plain = await app.inject({ method: "POST", url: "/v1/messages", headers, payload });
+  const streamed = await app.inject({ method: "POST", url: "/v1/messages", headers, payload: { ...payload, stream: true } });
+  const messageDelta = sseFrames(streamed.body)
+    .map((frame) => frame.data as { type?: string; usage?: { output_tokens: number } } | undefined)
+    .find((data) => data?.type === "message_delta");
+  assert.ok(messageDelta?.usage, "message_delta 必须带 usage");
+
+  // 正文只算一次：旧的非流式实现用 JSON.stringify(content)，而 content 里已含正文与思考全文，
+  // 同一次对话走两种模式报出的 output_tokens 差近一倍。
+  const expected = Math.ceil(("answer".length + "deep thought".length + "[]".length) / 4);
+  assert.equal(plain.json().usage.output_tokens, expected);
+  assert.equal(messageDelta.usage.output_tokens, expected);
+});
+
+test("unknown routes answer with the endpoint's own error envelope", async () => {
+  const { app } = await createTestApp();
+
+  const anthropic = await app.inject({
+    method: "POST",
+    url: "/v1/messages/batches",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {}
+  });
+  assert.equal(anthropic.statusCode, 404);
+  const anthropicBody = anthropic.json();
+  assert.equal(anthropicBody.type, "error");
+  assert.equal(anthropicBody.error.type, "not_found_error");
+  // 头与错误体里必须是同一个 request id，否则客户端拿去排查时对不上。
+  assert.ok(typeof anthropicBody.request_id === "string" && anthropicBody.request_id.startsWith("req_"));
+  assert.equal(anthropic.headers["request-id"], anthropicBody.request_id);
+
+  const openai = await app.inject({
+    method: "POST",
+    url: "/v1/embeddings",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {}
+  });
+  assert.equal(openai.statusCode, 404);
+  assert.equal(openai.json().error.type, "invalid_request_error");
+  assert.equal(openai.json().error.code, "not_found");
+});
+
+test("count_tokens estimates input tokens without reaching the runner", async () => {
+  const runner = new FakeRunner({ text: "answer" });
+  const { app } = await createTestApp({ runner });
+  const headers = { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" };
+  const payload = { model: "composer-2.5", messages: [{ role: "user", content: "Hello there" }] };
+
+  const counted = await app.inject({ method: "POST", url: "/v1/messages/count_tokens", headers, payload });
+  assert.equal(counted.statusCode, 200);
+  const estimated = counted.json().input_tokens as number;
+  assert.ok(Number.isInteger(estimated) && estimated > 0);
+  // 不消耗上游额度，也不占用密钥池。
+  assert.equal(runner.lastApiKey, "");
+
+  // 与真实请求同口径：客户端拿它做预算判断时不会和随后报出的 usage 对不上。
+  const real = await app.inject({ method: "POST", url: "/v1/messages", headers, payload: { ...payload, max_tokens: 64 } });
+  assert.equal(real.json().usage.input_tokens, estimated);
+
+  const unauthorized = await app.inject({ method: "POST", url: "/v1/messages/count_tokens", payload });
+  assert.equal(unauthorized.statusCode, 401);
+  assert.equal(unauthorized.json().error.type, "authentication_error");
+});
