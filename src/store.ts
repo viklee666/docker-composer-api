@@ -58,6 +58,7 @@ export class SqliteStateStore implements StateStore {
         last_used_at TEXT,
         last_error TEXT,
         request_count INTEGER NOT NULL DEFAULT 0,
+        failure_count INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
 
@@ -83,7 +84,7 @@ export class SqliteStateStore implements StateStore {
         updated_at TEXT NOT NULL
       );
     `);
-    this.migrateCursorKeySortOrder();
+    this.migrateCursorKeyColumns();
     // 启动时先裁剪一次：cleanup 每 100 条才跑，计数器重启归零后历史积压需要这里兜底。
     this.trimRequestLogs();
   }
@@ -98,13 +99,19 @@ export class SqliteStateStore implements StateStore {
       .run(REQUEST_LOG_KEEP);
   }
 
-  /** 老库升级：补 sort_order 列并按原插入顺序（rowid）回填，保持既有取用顺序不变。 */
-  private migrateCursorKeySortOrder(): void {
-    const columns = this.db.prepare("PRAGMA table_info(cursor_keys)").all() as { name?: unknown }[];
-    if (!columns.some((column) => column.name === "sort_order")) {
+  /** 老库升级：补后加的列。sort_order 按原插入顺序（rowid）回填，保持既有取用顺序不变。 */
+  private migrateCursorKeyColumns(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(cursor_keys)").all() as { name?: unknown }[])
+        .map((column) => String(column.name))
+    );
+    if (!columns.has("sort_order")) {
       this.db.exec("ALTER TABLE cursor_keys ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0");
     }
     this.db.exec("UPDATE cursor_keys SET sort_order = rowid WHERE sort_order = 0");
+    if (!columns.has("failure_count")) {
+      this.db.exec("ALTER TABLE cursor_keys ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   async getSession(id: string): Promise<string | undefined> {
@@ -184,8 +191,8 @@ export class SqliteStateStore implements StateStore {
   async insertCursorKey(record: CursorKeyRecord): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, failure_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -199,6 +206,7 @@ export class SqliteStateStore implements StateStore {
         record.lastUsedAt ?? null,
         record.lastError ?? null,
         record.requestCount,
+        record.failureCount,
         record.createdAt
       );
   }
@@ -234,8 +242,15 @@ export class SqliteStateStore implements StateStore {
       sets.push("last_error = ?");
       values.push(patch.lastError);
     }
+    if (patch.failureCount !== undefined) {
+      sets.push("failure_count = ?");
+      values.push(patch.failureCount);
+    }
     if (patch.incrementRequestCount) {
       sets.push("request_count = request_count + 1");
+    }
+    if (patch.incrementFailureCount) {
+      sets.push("failure_count = failure_count + 1");
     }
     if (!sets.length) return false;
     const result = this.db
@@ -399,7 +414,9 @@ export class MemoryStateStore implements StateStore {
     if (patch.disabledAt !== undefined) key.disabledAt = patch.disabledAt ?? undefined;
     if (patch.lastUsedAt !== undefined) key.lastUsedAt = patch.lastUsedAt;
     if (patch.lastError !== undefined) key.lastError = patch.lastError ?? undefined;
+    if (patch.failureCount !== undefined) key.failureCount = patch.failureCount;
     if (patch.incrementRequestCount) key.requestCount += 1;
+    if (patch.incrementFailureCount) key.failureCount += 1;
     return true;
   }
 
@@ -479,6 +496,7 @@ function rowToKey(row: Record<string, unknown>): CursorKeyRecord {
     lastUsedAt: optional(row.last_used_at),
     lastError: optional(row.last_error),
     requestCount: Number(row.request_count ?? 0),
+    failureCount: Number(row.failure_count ?? 0),
     createdAt: String(row.created_at)
   };
 }

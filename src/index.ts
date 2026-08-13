@@ -1,7 +1,12 @@
 import { createEphemeralAgentStore } from "./agent-store.js";
 import { loadConfig } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
-import { loadCursorFastDefault, loadCursorMaxModeDefault } from "./gateway-settings.js";
+import {
+  loadAutoDisableKeys,
+  loadAutoDisableThreshold,
+  loadCursorFastDefault,
+  loadCursorMaxModeDefault
+} from "./gateway-settings.js";
 import { CursorKeyPool } from "./key-pool.js";
 import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
@@ -25,7 +30,13 @@ if (config.cursorSdkUseHttp1ForAgent) {
 // 管理后台持久化的模型默认开关优先于 env 默认值。
 config.cursorMaxMode = await loadCursorMaxModeDefault(store, config.cursorMaxMode);
 config.cursorFast = await loadCursorFastDefault(store, config.cursorFast);
-const keyPool = new CursorKeyPool(store);
+// 自动禁用策略同样以后台持久化设置优先，改完即时生效且重启后保留。
+config.autoDisableKeys = await loadAutoDisableKeys(store, config.autoDisableKeys);
+config.autoDisableThreshold = await loadAutoDisableThreshold(store, config.autoDisableThreshold);
+const keyPool = new CursorKeyPool(store, {
+  enabled: config.autoDisableKeys,
+  threshold: config.autoDisableThreshold
+});
 await keyPool.seedFromEnv(config.cursorApiKeys);
 
 const sdkRunner = new CursorSdkRunner(store, {

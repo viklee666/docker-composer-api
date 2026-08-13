@@ -799,7 +799,7 @@ export function upstreamRunError(model: string, detail: string): ApiError {
   if (kind === "quota") {
     return new ApiError(
       `Cursor upstream run ended in error for model "${model}": ${detail}. ` +
-      "This key appears to be out of quota/credit; the gateway will disable it and rotate to the next pool key.",
+      "This key appears to be out of quota/credit; the gateway rotates to the next pool key, and disables this one only after it keeps failing (auto-disable policy is configurable in /admin).",
       402,
       "insufficient_quota"
     );
@@ -807,7 +807,7 @@ export function upstreamRunError(model: string, detail: string): ApiError {
   if (kind === "auth") {
     return new ApiError(
       `Cursor upstream run ended in error for model "${model}": ${detail}. ` +
-      "This key appears invalid or unauthorized; the gateway will disable it and rotate to the next pool key.",
+      "This key appears invalid or unauthorized; the gateway rotates to the next pool key, and disables this one only after it keeps failing (auto-disable policy is configurable in /admin).",
       401,
       "unauthorized"
     );
@@ -849,7 +849,7 @@ function keySemanticApiError(model: string, error: unknown): ApiError | undefine
   if (failure === "quota") {
     return new ApiError(
       `Cursor upstream rejected the request for model "${model}": ${detail || "quota/credit exhausted"}. ` +
-      "This key appears to be out of quota/credit; the gateway will disable it and rotate to the next pool key.",
+      "This key appears to be out of quota/credit; the gateway rotates to the next pool key, and disables this one only after it keeps failing (auto-disable policy is configurable in /admin).",
       402,
       "insufficient_quota"
     );
@@ -857,7 +857,7 @@ function keySemanticApiError(model: string, error: unknown): ApiError | undefine
   if (failure === "auth") {
     return new ApiError(
       `Cursor upstream rejected the request for model "${model}": ${detail || "invalid or unauthorized API key"}. ` +
-      "This key appears invalid or unauthorized; the gateway will disable it and rotate to the next pool key.",
+      "This key appears invalid or unauthorized; the gateway rotates to the next pool key, and disables this one only after it keeps failing (auto-disable policy is configurable in /admin).",
       401,
       "unauthorized"
     );

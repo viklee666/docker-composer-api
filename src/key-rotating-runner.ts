@@ -11,24 +11,23 @@ import type {
 /** 单次请求最多尝试的 key 数默认上限，避免 key 极多时无界轮换放大上游压力。可由 MAX_KEY_ATTEMPTS 覆盖。 */
 const DEFAULT_MAX_KEY_ATTEMPTS = 10;
 /**
- * 单次请求中 transient（上游无详情 error）软失败的默认重试上限。
- * 避免某模型在所有 key 上都不可用时把整池 key 试一遍白烧额度；超过即停手透出 502。可由 MAX_TRANSIENT_KEY_ATTEMPTS 覆盖。
+ * 单次请求中软失败（换了 key 但没禁用）的默认重试上限。
+ * 避免某模型在所有 key 上都不可用时把整池 key 试一遍白烧额度；超过即停手透出上游错误。可由 MAX_TRANSIENT_KEY_ATTEMPTS 覆盖。
  */
 const DEFAULT_MAX_TRANSIENT_ATTEMPTS = 3;
 
 export interface KeyRotatingOptions {
   /** 单次请求最多尝试的 key 数（含成功前的失败次数）。默认 10。 */
   maxKeyAttempts?: number;
-  /** 单次请求 transient 软失败的最大次数，超过则不再换 key、直接透出上游错误（502）。默认 3。 */
+  /** 单次请求软失败的最大次数，超过则不再换 key、直接透出上游错误。默认 3。 */
   maxTransientAttempts?: number;
 }
 
 /**
  * 包装真实 runner：useKeyPool 的请求按后台设置的顺序取 key 调上游；
- * - 命中额度不足/无效 key（quota/auth）时禁用该 key 并自动换下一个重试；
- * - 命中上游无详情 error（transient）时不禁用、但仍换下一个 key 重试，
- *   让队首坏 key 不再拖死后续有效 key；transient 累计到上限或全部 key 都 transient 失败时透出真实上游错误（502）；
- * - 全部 key 已被禁用/耗尽时返回 429 insufficient_quota（无有效 key）。
+ * - 上游报 key 级错误时把失败交给 key 池记账（是否禁用由自动禁用策略决定），随后换下一个 key 重试；
+ * - 未被禁用的失败算软失败：累计到上限或所有 key 都软失败时，透出真实上游错误而不是笼统的"无有效 key"；
+ * - 确实把 key 全禁完/池里没有可用 key 时才返回 429 insufficient_quota。
  */
 export class KeyRotatingRunner implements CursorRunner {
   private readonly maxKeyAttempts: number;
@@ -66,13 +65,13 @@ export class KeyRotatingRunner implements CursorRunner {
     }
 
     const attempted = new Set<string>();
-    // 最近一次 transient（上游无详情 error）错误；所有 key 都 transient 失败时透出它而非误报额度耗尽。
-    let transientError: unknown;
-    let transientCount = 0;
+    // 最近一次软失败（换过 key 但没禁用）的错误；所有 key 都软失败时透出它而非误报额度耗尽。
+    let softError: unknown;
+    let softCount = 0;
     for (;;) {
       const key = await this.pool.pickActive(attempted);
       if (!key) {
-        if (transientError) throw transientError;
+        if (softError) throw softError;
         throw new ApiError(
           attempted.size
             ? "No valid Cursor API key available: all keys are exhausted or invalid and were disabled automatically. Re-enable keys in the admin panel after quota recovers."
@@ -84,7 +83,7 @@ export class KeyRotatingRunner implements CursorRunner {
         );
       }
       if (attempted.size >= this.maxKeyAttempts) {
-        if (transientError) throw transientError;
+        if (softError) throw softError;
         throw new ApiError(
           "Exhausted Cursor API key rotation attempts without success.",
           502,
@@ -115,20 +114,22 @@ export class KeyRotatingRunner implements CursorRunner {
           yield event;
         }
         if (buffering) yield* buffered;
+        // 跑通即认为该 key 健康：清掉连续失败计数，偶发失败不会跨请求累积到禁用阈值。
+        await this.pool.recordSuccess(key.id);
         return;
       } catch (error) {
         const failure = classifyKeyFailure(error);
-        if (failure === "quota" || failure === "auth") {
-          await this.pool.disable(key.id, failure, errorMessage(error));
-        } else if (failure === "transient") {
-          // 不禁用：原因不确定，可能只是上游临时容量不足；记下错误后换下一个 key 重试。
-          transientError = error;
-          transientCount += 1;
+        // 是否禁用由 key 池的自动禁用策略决定（可关闭，也可要求连续失败若干次）。
+        const disabled = failure ? await this.pool.reportFailure(key.id, failure, errorMessage(error)) : false;
+        if (failure && !disabled) {
+          // 该 key 仍留在池里：记下错误后换下一个 key，全部软失败时把它透出去。
+          softError = error;
+          softCount += 1;
         }
         // 已向客户端吐出过内容时无法安全重试；非 key 级错误原样抛出。
         if (!failure || emitted || signal?.aborted) throw error;
-        // transient 软失败累计到上限：停手透出上游错误，避免某模型在整池 key 上都不可用时把额度试个遍。
-        if (failure === "transient" && transientCount >= this.maxTransientAttempts) throw error;
+        // 软失败累计到上限：停手透出上游错误，避免某模型在整池 key 上都不可用时把额度试个遍。
+        if (!disabled && softCount >= this.maxTransientAttempts) throw error;
       }
     }
   }

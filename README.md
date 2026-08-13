@@ -10,7 +10,7 @@
 - 工具调用按 Anthropic 官方语义流式下发（`tool_use` 的 start `input` 为 `{}`、参数经 `input_json_delta`），Claude Code 等严格实现的客户端不再读到空参数
 - 模型参数透传：Claude Code 的 thinking、Codex 的 reasoning effort、1M 上下文（Max Mode）等自动映射为 Cursor `model.params`；实际下发的参数会打 `[model-params] sending params` 日志便于核对
 - 默认用 SDK（>=1.0.27）的内置工具限制阻止 Cursor agent 在网关容器里执行 shell/edit，防止与客户端工具双重执行
-- Cursor key 池：多 key 顺序取用，额度不足/key 失效自动禁用并切换下一个；额度恢复后在后台手动重新启用
+- Cursor key 池：多 key 顺序取用，额度不足/key 失效自动切换下一个；连续失败到阈值才自动禁用（阈值可调，也可整个关掉），额度恢复后在后台手动重新启用
 - `/admin` Web 管理后台：key 增删启停、请求日志、用量统计、联通性测试
 - 请求日志落 SQLite（保留约 5000 条，批量裁剪）
 
@@ -211,16 +211,19 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 ## 多 key 自动切换
 
 - 网关模式按管理后台设置的顺序使用第一个 `active` 的 key（后台可随时用 ↑↓ 调整优先级）
-- 上游返回额度不足（usage limit / quota / 402 等）或 key 无效（401 / invalid api key）时：自动禁用该 key 并立即换下一个重试，客户端无感
-- 全部 key 不可用时所有 API 请求统一返回 `429 insufficient_quota`（无有效 key）
+- 上游返回额度不足（usage limit / quota / 402 等）或 key 无效（401 / invalid api key）时：立即换下一个 key 重试，客户端无感；同一个 key **连续**失败到阈值（默认 2 次）才会被自动禁用
+- 成功一次即清零该 key 的连续失败计数，偶发抖动不会累积成禁用；后台「启用」也会清零，不会刚启用就被上一次的旧错误再禁掉
+- 不想让网关碰 key 的启停状态：后台「运行设置」关掉自动禁用（或 `AUTO_DISABLE_KEYS=false`），出错的 key 只本次跳过，永不自动停用
+- 以下情况只换 key、从不计入自动禁用：上游无详情的 run error、Cursor 会话态认证抖动（`Authentication error ... try logging out and back in`，这不代表 key 失效）
+- 临时性 429 rate limit 既不换 key 也不禁用，原样按 429 透出让客户端退避
+- 全部 key 都被禁用时所有 API 请求统一返回 `429 insufficient_quota`（无有效 key）；只是软失败没被禁用时，透出的是上游真实错误
 - 禁用的 key 不会自动恢复；确认额度恢复后在管理后台手动「启用」
-- 临时性 429 rate limit 不会触发禁用
 
 ## 管理后台
 
 浏览器打开 `http://127.0.0.1:8787/admin`，使用 `ADMIN_PASSWORD` 登录（未设置时退回 `GATEWAY_API_KEY`；两者都为空则后台禁用）。
 
-功能：服务状态与用量统计、key 池管理（添加/启用/禁用/删除/排序，key 仅显示掩码）、最近请求日志、真实联通性测试。
+功能：服务状态与用量统计、key 池管理（添加/启用/禁用/删除/排序，key 仅显示掩码）、自动禁用策略（开关 + 连续失败阈值，改完即时生效并持久化）、最近请求日志、真实联通性测试。
 
 ## 示例
 

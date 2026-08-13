@@ -2,6 +2,8 @@ import type { StateStore } from "./types.js";
 
 const MAX_MODE_DEFAULT_SETTING = "cursorMaxModeDefault";
 const FAST_DEFAULT_SETTING = "cursorFastDefault";
+const AUTO_DISABLE_KEYS_SETTING = "autoDisableKeys";
+const AUTO_DISABLE_THRESHOLD_SETTING = "autoDisableThreshold";
 
 /**
  * 读取管理后台持久化的“默认开启”状态：
@@ -33,4 +35,24 @@ export function loadCursorFastDefault(store: StateStore, fallback: boolean | und
 
 export function saveCursorFastDefault(store: StateStore, enabled: boolean): Promise<void> {
   return saveDefault(store, FAST_DEFAULT_SETTING, enabled);
+}
+
+/** 自动禁用开关：与 Max Mode 不同，off 是明确的"永不自动禁用"，不是"交回默认"。 */
+export async function loadAutoDisableKeys(store: StateStore, fallback: boolean): Promise<boolean> {
+  const stored = await store.getSetting(AUTO_DISABLE_KEYS_SETTING);
+  if (stored === undefined) return fallback;
+  return stored === "on";
+}
+
+export function saveAutoDisableKeys(store: StateStore, enabled: boolean): Promise<void> {
+  return saveDefault(store, AUTO_DISABLE_KEYS_SETTING, enabled);
+}
+
+export async function loadAutoDisableThreshold(store: StateStore, fallback: number): Promise<number> {
+  const stored = Number.parseInt((await store.getSetting(AUTO_DISABLE_THRESHOLD_SETTING)) ?? "", 10);
+  return Number.isFinite(stored) && stored >= 1 ? stored : fallback;
+}
+
+export function saveAutoDisableThreshold(store: StateStore, threshold: number): Promise<void> {
+  return store.setSetting(AUTO_DISABLE_THRESHOLD_SETTING, String(threshold));
 }

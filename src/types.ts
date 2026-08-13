@@ -23,8 +23,12 @@ export interface GatewayConfig {
   cursorSdkUseHttp1ForAgent: boolean;
   /** 单次请求轮换 key 的最大尝试数（env: MAX_KEY_ATTEMPTS）。 */
   maxKeyAttempts: number;
-  /** 单次请求 transient 软失败的最大重试数（env: MAX_TRANSIENT_KEY_ATTEMPTS）。 */
+  /** 单次请求软失败（换 key 但不禁用）的最大重试数（env: MAX_TRANSIENT_KEY_ATTEMPTS）。 */
   maxTransientAttempts: number;
+  /** 额度/认证类错误是否自动禁用 key（env: AUTO_DISABLE_KEYS，后台可改）。关闭后只轮换、不禁用。 */
+  autoDisableKeys: boolean;
+  /** 自动禁用前允许的连续失败次数（env: AUTO_DISABLE_THRESHOLD，后台可改）。 */
+  autoDisableThreshold: number;
   /** 客户端未显式指定时的默认思考强度/推理强度（env: CURSOR_REASONING_EFFORT），如 low/medium/high/max。 */
   cursorReasoningEffort?: string;
   /** 客户端未显式指定时是否默认开启 Max Mode / 大上下文（env: CURSOR_MAX_MODE）。 */
@@ -181,6 +185,8 @@ export interface CursorKeyRecord {
   lastUsedAt?: string;
   lastError?: string;
   requestCount: number;
+  /** 连续失败次数（成功或人工启用即归零），达到自动禁用阈值才会被禁用。 */
+  failureCount: number;
   createdAt: string;
 }
 
@@ -192,7 +198,9 @@ export interface CursorKeyPatch {
   disabledAt?: string | null;
   lastUsedAt?: string;
   lastError?: string | null;
+  failureCount?: number;
   incrementRequestCount?: boolean;
+  incrementFailureCount?: boolean;
 }
 
 export interface RequestLogRecord {

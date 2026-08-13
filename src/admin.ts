@@ -2,7 +2,12 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
-import { saveCursorFastDefault, saveCursorMaxModeDefault } from "./gateway-settings.js";
+import {
+  saveAutoDisableKeys,
+  saveAutoDisableThreshold,
+  saveCursorFastDefault,
+  saveCursorMaxModeDefault
+} from "./gateway-settings.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel } from "./models.js";
 import {
@@ -43,6 +48,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         cursorSdkUseHttp1ForAgent,
         cursorMaxMode: deps.config.cursorMaxMode === true,
         cursorFast: deps.config.cursorFast === true,
+        autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
+        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
         gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey)
       },
       keys: {
@@ -90,6 +97,33 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       touched = true;
     }
 
+    // 自动禁用策略：关掉后失效/额度错误只轮换不禁用，阈值决定连续失败多少次才禁。
+    if (body.autoDisableKeys !== undefined) {
+      if (typeof body.autoDisableKeys !== "boolean") {
+        throw new ApiError("autoDisableKeys must be a boolean.", 400, "invalid_request_error", "autoDisableKeys");
+      }
+      deps.config.autoDisableKeys = body.autoDisableKeys;
+      deps.keyPool.setAutoDisablePolicy({ enabled: body.autoDisableKeys });
+      await saveAutoDisableKeys(deps.store, body.autoDisableKeys);
+      touched = true;
+    }
+
+    if (body.autoDisableThreshold !== undefined) {
+      const threshold = typeof body.autoDisableThreshold === "number" ? body.autoDisableThreshold : Number.NaN;
+      if (!Number.isInteger(threshold) || threshold < 1 || threshold > 50) {
+        throw new ApiError(
+          "autoDisableThreshold must be an integer between 1 and 50.",
+          400,
+          "invalid_request_error",
+          "autoDisableThreshold"
+        );
+      }
+      deps.config.autoDisableThreshold = threshold;
+      deps.keyPool.setAutoDisablePolicy({ threshold });
+      await saveAutoDisableThreshold(deps.store, threshold);
+      touched = true;
+    }
+
     if (!touched) throw new ApiError("No settings provided.", 400, "invalid_request_error");
 
     return {
@@ -97,7 +131,9 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       config: {
         cursorSdkUseHttp1ForAgent: deps.config.cursorSdkUseHttp1ForAgent,
         cursorMaxMode: deps.config.cursorMaxMode === true,
-        cursorFast: deps.config.cursorFast === true
+        cursorFast: deps.config.cursorFast === true,
+        autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
+        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold
       }
     };
   });
@@ -195,6 +231,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     try {
       // 与 abort 竞速：上游完全无视 signal 挂死时，联通性测试也必须在超时后返回而非悬挂。
       const output = await raceWithAbort(deps.runner.run(run, controller.signal), controller.signal);
+      // 指定 key 的测试绕过了密钥池，成功也要回写健康状态，否则后台会一直挂着早已恢复的失败计数与红字。
+      if (keyId) await deps.keyPool.recordSuccess(keyId);
       logTest(deps, startedAt, run.model, keyUsageRef, 200);
       return {
         ok: true,
@@ -204,6 +242,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       };
     } catch (error) {
       const normalized = normalizeError(error);
+      // 人工点的诊断按 transient 记：只留错误痕迹，不计入自动禁用（否则一顿测试就能把 key 测没）。
+      if (keyId) await deps.keyPool.reportFailure(keyId, "transient", errorMessage(error));
       logTest(deps, startedAt, run.model, keyUsageRef, normalized.statusCode, errorMessage(error));
       return {
         ok: false,
@@ -240,6 +280,7 @@ function publicKey(record: CursorKeyRecord): Record<string, unknown> {
     lastUsedAt: record.lastUsedAt ?? null,
     lastError: record.lastError ?? null,
     requestCount: record.requestCount,
+    failureCount: record.failureCount,
     createdAt: record.createdAt
   };
 }

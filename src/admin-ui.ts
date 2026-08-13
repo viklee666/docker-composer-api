@@ -125,6 +125,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         <span class="chip" id="chip-uptime">运行 -</span>
         <span class="chip" id="chip-direct">直传 key：-</span>
         <span class="chip" id="chip-http1">HTTP：-</span>
+        <span class="chip" id="chip-autodisable">自动禁用：-</span>
       </div>
     </div>
     <div class="spacer"></div>
@@ -159,9 +160,20 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           强制 Cursor local agent 使用 HTTP/1.1 + SSE
         </label>
       </div>
+      <div class="row" style="margin-bottom:10px">
+        <label class="toggle" style="font-size:13px;color:var(--text)">
+          <input type="checkbox" id="auto-disable-toggle">
+          额度不足 / key 失效时自动禁用 key
+        </label>
+        <label class="toggle" style="font-size:13px;color:var(--text)">
+          连续失败
+          <input type="number" id="auto-disable-threshold" min="1" max="50" step="1" style="width:66px;padding:6px 8px">
+          次后才禁用
+        </label>
+      </div>
       <div class="row">
         <button id="btn-save-settings">保存设置</button>
-        <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 用于代理不兼容 HTTP/2 的排查。</span>
+        <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 用于代理不兼容 HTTP/2 的排查。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。</span>
       </div>
     </div>
   </div>
@@ -169,7 +181,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   <div class="panel">
     <div class="head">
       <h2>Cursor Key 池</h2>
-      <span class="hint">按下表顺序取第一个可用 key（↑↓ 可调整）；额度不足/失效自动禁用并切换下一个，上游临时报错则自动换下一个但不禁用，恢复后请手动启用；全部禁用时 API 统一返回无有效 key</span>
+      <span class="hint">按下表顺序取第一个可用 key（↑↓ 可调整）；额度不足/失效连续达到上方阈值才自动禁用并切换下一个，上游临时报错只换下一个不禁用；被禁用的 key 需手动启用，全部禁用时 API 统一返回无有效 key</span>
     </div>
     <div class="body">
       <div class="row" style="margin-bottom:14px">
@@ -316,6 +328,11 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('sdk-http1-toggle').checked = !!data.config.cursorSdkUseHttp1ForAgent;
     $('max-mode-toggle').checked = !!data.config.cursorMaxMode;
     $('fast-toggle').checked = !!data.config.cursorFast;
+    autoDisableThreshold = data.config.autoDisableThreshold || 1;
+    $('auto-disable-toggle').checked = !!data.config.autoDisableKeys;
+    $('auto-disable-threshold').value = autoDisableThreshold;
+    $('chip-autodisable').textContent = '自动禁用：'
+      + (data.config.autoDisableKeys ? '连续失败 ' + autoDisableThreshold + ' 次' : '已关闭');
     $('st-keys').textContent = data.keys.active + ' / ' + data.keys.total;
     $('st-keys-d').textContent = '已禁用 ' + data.keys.disabled + ' 个';
     $('st-total').textContent = data.requests.total;
@@ -336,6 +353,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   }
 
   var lastKeys = [];
+  var autoDisableThreshold = 1;
 
   function renderKeys(keys){
     lastKeys = keys;
@@ -347,6 +365,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       if (key.status === 'disabled' && key.disabledReason) {
         reason = '<span class="badge disabled">' + esc(key.disabledReason) + '</span>';
         if (key.disabledAt) reason += ' <span class="muted small">' + fmtTime(key.disabledAt) + '</span>';
+      }
+      if (key.status === 'active' && key.failureCount > 0) {
+        reason += '<span class="muted small">连续失败 ' + key.failureCount + ' / ' + autoDisableThreshold + ' 次</span>';
       }
       if (key.lastError) reason += '<div class="err-text">' + esc(key.lastError) + '</div>';
       var order = '<div class="actions" style="flex-wrap:nowrap;align-items:center">'
@@ -475,10 +496,14 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   });
 
   $('btn-save-settings').addEventListener('click', function(){
+    var threshold = parseInt($('auto-disable-threshold').value, 10);
+    if (!(threshold >= 1 && threshold <= 50)) { toast('连续失败次数需为 1-50 的整数', true); return; }
     var body = {
       cursorSdkUseHttp1ForAgent: $('sdk-http1-toggle').checked,
       cursorMaxMode: $('max-mode-toggle').checked,
-      cursorFast: $('fast-toggle').checked
+      cursorFast: $('fast-toggle').checked,
+      autoDisableKeys: $('auto-disable-toggle').checked,
+      autoDisableThreshold: threshold
     };
     var button = $('btn-save-settings');
     button.disabled = true;
@@ -488,6 +513,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       $('chip-http1').textContent = 'HTTP：' + (data.config.cursorSdkUseHttp1ForAgent ? '1.1' : '默认');
       $('max-mode-toggle').checked = !!data.config.cursorMaxMode;
       $('fast-toggle').checked = !!data.config.cursorFast;
+      autoDisableThreshold = data.config.autoDisableThreshold || 1;
+      $('auto-disable-toggle').checked = !!data.config.autoDisableKeys;
+      $('auto-disable-threshold').value = autoDisableThreshold;
+      loadAll();
     }).catch(function(err){
       toast('保存设置失败：' + err.message, true);
       loadAll();

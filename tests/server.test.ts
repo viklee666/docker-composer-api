@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { createEphemeralAgentStore } from "../src/agent-store.js";
 import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError, openAiErrorType, openAiStatus } from "../src/errors.js";
 import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
-import { CursorKeyPool, classifyKeyFailure } from "../src/key-pool.js";
+import { CursorKeyPool, classifyKeyFailure, type AutoDisablePolicy } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
 import type { ModelLister } from "../src/models.js";
@@ -32,7 +32,9 @@ const baseConfig: GatewayConfig = {
   cursorSdkUseHttp1ForAgent: false,
   cursorAllowBuiltinTools: false,
   maxKeyAttempts: 10,
-  maxTransientAttempts: 3
+  maxTransientAttempts: 3,
+  autoDisableKeys: true,
+  autoDisableThreshold: 2
 };
 
 test("health and models are available", async () => {
@@ -112,7 +114,7 @@ test("chat completions supports direct Cursor key auth and SSE", async () => {
 test("gateway requests rotate to next key on quota error and disable the failed key", async () => {
   const runner = new FakeRunner({ text: "served by key-b" });
   runner.failFor.set("key-a", "You have hit your usage limit. Payment required.");
-  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"] });
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 1 } });
 
   const response = await app.inject({
     method: "POST",
@@ -206,6 +208,12 @@ test("sqlite store migrates legacy cursor_keys table and supports reorder", asyn
   const migrated = await store.listCursorKeys();
   assert.deepEqual(migrated.map((key) => key.id), ["id-a", "id-b"]);
   assert.ok(migrated.every((key) => key.sortOrder > 0), "sort_order backfilled from rowid");
+  assert.ok(migrated.every((key) => key.failureCount === 0), "failure_count 补列后从 0 起算");
+
+  await store.updateCursorKey("id-a", { incrementFailureCount: true });
+  assert.equal((await store.listCursorKeys()).find((key) => key.id === "id-a")?.failureCount, 1);
+  await store.updateCursorKey("id-a", { failureCount: 0 });
+  assert.equal((await store.listCursorKeys()).find((key) => key.id === "id-a")?.failureCount, 0);
 
   await store.reorderCursorKeys(["id-b"]);
   const reordered = await store.listCursorKeys();
@@ -222,7 +230,7 @@ test("returns 429 insufficient_quota when every key is exhausted", async () => {
   const runner = new FakeRunner({});
   runner.failFor.set("key-a", "quota exceeded");
   runner.failFor.set("key-b", "Insufficient credits remaining");
-  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"] });
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 1 } });
 
   const response = await app.inject({
     method: "POST",
@@ -334,7 +342,7 @@ test("upstreamRunError decouples run-error detail into codes so real bad keys ge
 test("gateway rotates and disables a key on auth failure", async () => {
   const runner = new FakeRunner({ text: "served by key-b" });
   runner.failFor.set("key-a", "Invalid API key provided");
-  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"] });
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 1 } });
 
   const response = await app.inject({
     method: "POST",
@@ -350,9 +358,170 @@ test("gateway rotates and disables a key on auth failure", async () => {
   const keyA = keys.find((key) => key.apiKey === "key-a");
   const keyB = keys.find((key) => key.apiKey === "key-b");
   assert.equal(keyA?.status, "disabled");
-  assert.equal(keyA?.disabledReason, "key 无效");
+  assert.equal(keyA?.disabledReason, "key 无效/未授权");
   assert.match(keyA?.lastError ?? "", /invalid api key/i);
   assert.equal(keyB?.status, "active");
+});
+
+test("a single quota error only rotates; the key is disabled once the streak reaches the threshold", async () => {
+  const runner = new FakeRunner({ text: "served by key-b" });
+  runner.failFor.set("key-a", "You have hit your usage limit.");
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 2 } });
+  const chat = () => app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  assert.equal((await chat()).statusCode, 200);
+  const afterFirst = (await keyPool.list()).find((key) => key.apiKey === "key-a");
+  assert.equal(afterFirst?.status, "active", "一次失败不该废掉 key");
+  assert.equal(afterFirst?.failureCount, 1);
+  assert.match(afterFirst?.lastError ?? "", /usage limit/i);
+
+  assert.equal((await chat()).statusCode, 200);
+  const afterSecond = (await keyPool.list()).find((key) => key.apiKey === "key-a");
+  assert.equal(afterSecond?.status, "disabled");
+  assert.equal(afterSecond?.disabledReason, "额度不足");
+});
+
+test("a success between failures clears the streak so a flaky key is never disabled", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 2 } });
+  const chat = () => app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  runner.failFor.set("key-a", "Invalid API key provided");
+  await chat();
+  assert.equal((await keyPool.list()).find((key) => key.apiKey === "key-a")?.failureCount, 1);
+
+  runner.failFor.delete("key-a");
+  await chat();
+  const recovered = (await keyPool.list()).find((key) => key.apiKey === "key-a");
+  assert.equal(recovered?.status, "active");
+  assert.equal(recovered?.failureCount, 0);
+  assert.equal(recovered?.lastError, undefined, "成功后不该继续挂着旧错误");
+
+  runner.failFor.set("key-a", "Invalid API key provided");
+  await chat();
+  assert.equal((await keyPool.list()).find((key) => key.apiKey === "key-a")?.status, "active");
+});
+
+test("auto disable can be turned off so keys are only skipped, never disabled", async () => {
+  const runner = new FakeRunner({});
+  runner.failFor.set("key-a", "Invalid API key provided");
+  runner.failFor.set("key-b", "You have hit your usage limit.");
+  const { app, keyPool } = await createTestApp({
+    runner,
+    keys: ["key-a", "key-b"],
+    autoDisable: { enabled: false }
+  });
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization: "Bearer gateway-key" },
+      payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+    });
+    // 全部 key 软失败：透出真实上游错误，而不是误报"所有 key 都已被自动禁用"。
+    assert.equal(response.statusCode, 500);
+    assert.match(response.json().error.message, /usage limit/i);
+  }
+  const keys = await keyPool.list();
+  assert.ok(keys.every((key) => key.status === "active"), "关闭自动禁用后不该有 key 被停用");
+  assert.ok(keys.every((key) => key.lastError), "仍然记录最近错误供排查");
+});
+
+test("manual enable clears the failure streak so the key is not re-disabled by the next error", async () => {
+  const runner = new FakeRunner({ text: "served by key-b" });
+  runner.failFor.set("key-a", "You have hit your usage limit.");
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 2 } });
+  const chat = () => app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  await chat();
+  await chat();
+  const keyA = (await keyPool.list()).find((key) => key.apiKey === "key-a")!;
+  assert.equal(keyA.status, "disabled");
+
+  const enabled = await app.inject({
+    method: "POST",
+    url: `/admin/api/keys/${keyA.id}/enable`,
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(enabled.statusCode, 200);
+  const reenabled = (await keyPool.list()).find((key) => key.apiKey === "key-a");
+  assert.equal(reenabled?.failureCount, 0);
+  assert.equal(reenabled?.lastError, undefined);
+
+  await chat();
+  assert.equal((await keyPool.list()).find((key) => key.apiKey === "key-a")?.status, "active", "启用后一次失败不该立刻又被禁");
+});
+
+test("admin settings change the auto disable policy at runtime", async () => {
+  const { app, keyPool } = await createTestApp();
+  const adminHeaders = { authorization: "Bearer gateway-key" };
+
+  const saved = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { autoDisableKeys: false, autoDisableThreshold: 5 }
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(saved.json().config.autoDisableKeys, false);
+  assert.deepEqual(saved.json().config.autoDisableThreshold, 5);
+  assert.deepEqual(keyPool.autoDisablePolicy, { enabled: false, threshold: 5 });
+
+  const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
+  assert.equal(overview.json().config.autoDisableKeys, false);
+  assert.equal(overview.json().config.autoDisableThreshold, 5);
+
+  const invalid = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { autoDisableThreshold: 0 }
+  });
+  assert.equal(invalid.statusCode, 400);
+});
+
+test("Cursor session auth hiccups rotate keys instead of marking a working key invalid", async () => {
+  // Cursor 上游会原样吐出 IDE 那句"退出重新登录"，它不代表 key 失效（同一个 key 之前之后都能跑通）。
+  const hiccup = "Authentication error If you are logged in, try logging out and back in";
+  assert.equal(classifyKeyFailure(new Error(hiccup)), "transient");
+  assert.equal(classifyKeyFailure(Object.assign(new Error(hiccup), { status: 401 })), "transient");
+  const wrapped = upstreamRunError("claude-opus-5", `${hiccup}; ERROR: ${hiccup}.`);
+  assert.equal(wrapped.statusCode, 502);
+  assert.equal(wrapped.code, "upstream_run_failed");
+  assert.equal(classifyKeyFailure(wrapped), "transient");
+
+  const runner = new FakeRunner({ text: "served by key-b" });
+  runner.failFor.set("key-a", hiccup);
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 1 } });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization: "Bearer gateway-key" },
+      payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().choices[0].message.content, "served by key-b");
+  }
+  const keyA = (await keyPool.list()).find((key) => key.apiKey === "key-a");
+  assert.equal(keyA?.status, "active", "会话态认证抖动不该禁用 key，哪怕阈值是 1 次");
+  assert.equal(keyA?.failureCount, 0, "transient 不计入自动禁用");
 });
 
 test("key rotation stops at maxKeyAttempts instead of trying the whole pool", async () => {
@@ -902,7 +1071,8 @@ test("gateway disables a key when the SDK stream only exposes auth failure in st
   const sdkRunner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
   const { app, keyPool } = await createTestApp({
     runner: sdkRunner as unknown as FakeRunner,
-    keys: ["key-a", "key-b"]
+    keys: ["key-a", "key-b"],
+    autoDisable: { threshold: 1 }
   });
 
   const response = await app.inject({
@@ -917,7 +1087,7 @@ test("gateway disables a key when the SDK stream only exposes auth failure in st
   const keys = await keyPool.list();
   const keyA = keys.find((key) => key.apiKey === "key-a");
   assert.equal(keyA?.status, "disabled");
-  assert.equal(keyA?.disabledReason, "key 无效");
+  assert.equal(keyA?.disabledReason, "key 无效/未授权");
   assert.match(keyA?.lastError ?? "", /Invalid API Key/i);
 });
 
@@ -2691,10 +2861,11 @@ async function createTestApp(options: {
   keys?: string[];
   config?: Partial<GatewayConfig>;
   runnerOptions?: KeyRotatingOptions;
+  autoDisable?: Partial<AutoDisablePolicy>;
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
 } = {}): Promise<{ app: ReturnType<typeof createApp>; store: MemoryStateStore; keyPool: CursorKeyPool }> {
   const store = options.store ?? new MemoryStateStore();
-  const keyPool = new CursorKeyPool(store);
+  const keyPool = new CursorKeyPool(store, options.autoDisable);
   await keyPool.seedFromEnv(options.keys ?? ["server-cursor-key"]);
   const inner = options.runner ?? new FakeRunner();
   const runner = new KeyRotatingRunner(inner, keyPool, options.runnerOptions);
