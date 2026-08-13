@@ -16,14 +16,35 @@ export interface PreparedRequest {
   images: GatewayImage[];
   tools: GatewayTool[];
   stream: boolean;
+  /** 客户端是否用 `stream_options.include_usage` 显式要求流式 usage（未要求时不得发 usage 块）。 */
+  includeUsage: boolean;
   maxTokens?: number;
   temperature?: number;
   topP?: number;
   stop?: string[];
   inputItems: unknown[];
   metadata: Record<string, unknown>;
+  /** Responses `store`：false 时本次响应不落库（默认 true）。 */
+  store: boolean;
   /** 从请求体 + 模型 id 后缀解析出的模型运行意图（思考强度 / Max Mode / fast / 显式 params / mode）。 */
   intent: ModelIntent;
+  /** Responses 快照需要原样回显的请求字段（仅 /v1/responses 填充）。 */
+  responsesEcho?: ResponsesEcho;
+  /** 是否向客户端输出 thinking 块（仅 /v1/messages 填充）。 */
+  emitThinking?: boolean;
+}
+
+/** `/v1/responses` 的 Response 对象要求回显请求参数，这里保留解析时会被归一化掉的原始值。 */
+export interface ResponsesEcho {
+  instructions: string | null;
+  reasoning: unknown;
+  text: unknown;
+  truncation: unknown;
+  user: unknown;
+  parallelToolCalls: boolean;
+  toolChoice: unknown;
+  tools: unknown[];
+  background: boolean;
 }
 
 export function prepareOpenAiChat(body: unknown): PreparedRequest {
@@ -53,11 +74,12 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
 export function prepareOpenAiResponses(body: unknown, previous?: { response?: Record<string, unknown>; inputItems?: unknown[] }): PreparedRequest {
   const record = objectBody(body);
   rejectCommonUnsupported(record);
-  const tools = parseOpenAiTools(record.tools, record.tool_choice);
+  const tools = parseResponsesTools(record.tools, record.tool_choice);
   const images: GatewayImage[] = [];
   const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
-  const instructions = typeof record.instructions === "string" ? record.instructions.trim() : "";
+  const rawInstructions = typeof record.instructions === "string" ? record.instructions : null;
+  const instructions = rawInstructions?.trim() ?? "";
   if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
   if (previous?.response) {
     transcript.push("", `PREVIOUS_RESPONSE:\n${JSON.stringify(previous.response)}`);
@@ -66,13 +88,30 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   const inputItems = normalizedResponseInput(record.input);
   transcript.push(responseInputToTextAndImages(record.input, images));
   appendToolReminder(transcript, tools);
-  return basePrepared(record, transcript.join("\n"), images, tools, inputItems);
+  const prepared = basePrepared(record, transcript.join("\n"), images, tools, inputItems);
+  prepared.responsesEcho = {
+    // 回显请求原值（prompt 用的是 trim 后的版本，回显不能替客户端改内容）。
+    instructions: rawInstructions,
+    reasoning: responsesReasoningEcho(record.reasoning),
+    text: asOptionalRecord(record.text) ?? null,
+    truncation: record.truncation ?? "disabled",
+    user: record.user ?? null,
+    parallelToolCalls: record.parallel_tool_calls !== false,
+    toolChoice: record.tool_choice ?? "auto",
+    tools: responsesToolEcho(record.tools),
+    background: record.background === true
+  };
+  return prepared;
 }
 
 export function prepareAnthropicMessages(body: unknown): PreparedRequest {
   const record = objectBody(body);
   // Anthropic 的 thinking 不再拒绝：映射为 Cursor 的思考强度（reasoning/effort/thinking 参数）透传给 SDK。
   if (record.mcp_servers !== undefined) throw new ApiError("Anthropic server tools are not supported; pass client tools in tools instead.", 400, "unsupported_parameter", "mcp_servers");
+  // 官方 max_tokens 必填，但它在本网关上本来也不生效：宽松客户端只记一次日志，不拒绝请求。
+  if (record.max_tokens === undefined) {
+    logOnce("anthropic-missing-max-tokens", "[anthropic] request omitted the required max_tokens field; accepted anyway (the parameter has no effect on the Cursor upstream).");
+  }
   const messages = arrayField(record, "messages");
   const tools = parseAnthropicTools(record.tools, record.tool_choice);
   const images: GatewayImage[] = [];
@@ -87,7 +126,9 @@ export function prepareAnthropicMessages(body: unknown): PreparedRequest {
     transcript.push(`${role.toUpperCase()}: ${anthropicContentToTextAndImages(item.content, images) || "[empty]"}`);
   }
   appendToolReminder(transcript, tools);
-  return basePrepared(record, transcript.join("\n"), images, tools, messages);
+  const prepared = basePrepared(record, transcript.join("\n"), images, tools, messages);
+  prepared.emitThinking = shouldEmitThinking(record, prepared.intent);
+  return prepared;
 }
 
 export function toRunRequest(input: {
@@ -129,6 +170,7 @@ export function toRunRequest(input: {
 export function chatCompletionObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult }): Record<string, unknown> {
   const toolCalls = input.output.toolCalls.map(openAiToolCall);
   const completionChars = input.output.text.length + JSON.stringify(toolCalls).length;
+  const reasoning = input.output.reasoningText ?? "";
   return {
     id: input.id,
     object: "chat.completion",
@@ -140,6 +182,8 @@ export function chatCompletionObject(input: { id: string; created: number; prepa
         message: {
           role: "assistant",
           content: toolCalls.length && !input.output.text ? null : input.output.text,
+          // DeepSeek 惯例的非流式推理字段，与流式 delta.reasoning_content 对称；不识别的客户端忽略。
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
           ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
           refusal: null,
           annotations: []
@@ -154,43 +198,104 @@ export function chatCompletionObject(input: { id: string; created: number; prepa
   };
 }
 
-export function responseObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult; previousResponseId?: string }): Record<string, unknown> {
-  const toolItems = input.output.toolCalls.map((toolCall) => responseToolCallItem(toolCall));
-  const output: Record<string, unknown>[] = [];
-  if (!toolItems.length || input.output.text) {
-    output.push({
-      id: `msg_${input.id.slice(5)}`,
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: input.output.text, annotations: [] }]
-    });
-  }
-  output.push(...toolItems);
+/**
+ * 官方 Response 对象的统一构造点：流式的 `response.created` / `response.in_progress` / `response.completed`
+ * 与非流式响应体共用，避免两处字段漂移。无法从上游取得的行为参数一律回显请求值或 null。
+ */
+export function responseSnapshot(input: {
+  id: string;
+  created: number;
+  prepared: PreparedRequest;
+  status: "in_progress" | "completed";
+  output?: Record<string, unknown>[];
+  usage?: Record<string, unknown>;
+  previousResponseId?: string;
+  agentId?: string;
+  runId?: string;
+}): Record<string, unknown> {
+  const echo = input.prepared.responsesEcho;
+  const completed = input.status === "completed";
   return {
     id: input.id,
     object: "response",
     created_at: input.created,
-    status: "completed",
-    completed_at: Math.floor(Date.now() / 1000),
+    status: input.status,
+    completed_at: completed ? Math.floor(Date.now() / 1000) : null,
     error: null,
     incomplete_details: null,
+    instructions: echo?.instructions ?? null,
+    max_output_tokens: input.prepared.maxTokens ?? null,
     model: input.prepared.model,
-    output,
-    parallel_tool_calls: true,
+    output: input.output ?? [],
+    parallel_tool_calls: echo?.parallelToolCalls ?? true,
     previous_response_id: input.previousResponseId ?? null,
-    store: input.prepared.metadata.store ?? true,
-    tool_choice: "auto",
-    tools: input.prepared.tools.map(responseToolMetadata),
-    usage: responsesUsage(input.prepared.prompt.length, input.output.text.length + JSON.stringify(toolItems).length),
+    reasoning: echo?.reasoning ?? null,
+    background: echo?.background ?? false,
+    store: input.prepared.store,
+    temperature: input.prepared.temperature ?? null,
+    // text 在官方 schema 里是对象（非 nullable），缺省是 {format:{type:"text"}}；发 null 会让严格解码器失败。
+    text: echo?.text ?? { format: { type: "text" } },
+    tool_choice: echo?.toolChoice ?? "auto",
+    tools: echo?.tools ?? [],
+    top_p: input.prepared.topP ?? null,
+    truncation: echo?.truncation ?? "disabled",
+    usage: input.usage ?? null,
+    user: echo?.user ?? null,
     metadata: input.prepared.metadata,
-    cursor_agent_id: input.output.agentId ?? null,
-    cursor_run_id: input.output.runId ?? null
+    cursor_agent_id: input.agentId ?? null,
+    cursor_run_id: input.runId ?? null
   };
+}
+
+export function responseObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult; previousResponseId?: string }): Record<string, unknown> {
+  const items = responseOutputItems(input.id, input.output);
+  return responseSnapshot({
+    id: input.id,
+    created: input.created,
+    prepared: input.prepared,
+    status: "completed",
+    output: items,
+    usage: responsesUsage(
+      input.prepared.prompt.length,
+      input.output.text.length + JSON.stringify(input.output.toolCalls.map((toolCall) => responseToolCallItem(toolCall))).length,
+      (input.output.reasoningText ?? "").length
+    ),
+    previousResponseId: input.previousResponseId,
+    agentId: input.output.agentId,
+    runId: input.output.runId
+  });
+}
+
+/** 非流式 Response 的 output[]：reasoning → message → function_call，与流式生成器的产出顺序一致。 */
+export function responseOutputItems(id: string, output: CursorRunResult): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  const suffix = id.replace(/^resp_/, "");
+  if (output.reasoningText) items.push(responseReasoningItem(`rs_${suffix}`, output.reasoningText));
+  const toolItems = output.toolCalls.map((toolCall) => responseToolCallItem(toolCall));
+  if (!toolItems.length || output.text) items.push(responseMessageItem(`msg_${suffix}`, output.text));
+  items.push(...toolItems);
+  return items;
+}
+
+export function responseMessageItem(itemId: string, text: string): Record<string, unknown> {
+  return { id: itemId, type: "message", status: "completed", role: "assistant", content: [responseTextPart(text)] };
+}
+
+/** `output_text` content part：官方 schema 现含 logprobs 字段。 */
+export function responseTextPart(text: string): Record<string, unknown> {
+  return { type: "output_text", text, annotations: [], logprobs: [] };
+}
+
+export function responseReasoningItem(itemId: string, text: string): Record<string, unknown> {
+  return { id: itemId, type: "reasoning", summary: [{ type: "summary_text", text }] };
 }
 
 export function anthropicMessageObject(input: { id: string; prepared: PreparedRequest; output: CursorRunResult }): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
+  const reasoning = input.output.reasoningText ?? "";
+  if (reasoning && thinkingRequested(input.prepared)) {
+    content.push({ type: "thinking", thinking: reasoning, signature: GATEWAY_THINKING_SIGNATURE });
+  }
   if (input.output.text || !input.output.toolCalls.length) content.push({ type: "text", text: input.output.text });
   for (const toolCall of input.output.toolCalls) content.push(anthropicToolUse(toolCall));
   return {
@@ -205,6 +310,27 @@ export function anthropicMessageObject(input: { id: string; prepared: PreparedRe
   };
 }
 
+/** 网关自产 thinking 块的占位签名（Anthropic 协议要求非空 signature；本网关不校验回传签名）。 */
+export const GATEWAY_THINKING_SIGNATURE = Buffer.from("docker-composer-api:opaque-thinking-signature").toString("base64");
+
+/** 关闭思考的强度取值：命中即视为客户端明确不要 thinking 块。 */
+const THINKING_DISABLED = new Set(["none", "off", "false", "disabled", "disable", "no", "0"]);
+
+/** 客户端是否希望在响应里看到 thinking 块（解析期算好，见 `prepareAnthropicMessages`）。 */
+export function thinkingRequested(prepared: PreparedRequest): boolean {
+  return prepared.emitThinking === true;
+}
+
+/**
+ * 是否输出 thinking 块：只看请求体 / 模型 id 后缀解析出的意图，
+ * 网关默认值与请求头不算——未主动要求思考的客户端不该收到 thinking 块。
+ */
+function shouldEmitThinking(record: Record<string, unknown>, intent: ModelIntent): boolean {
+  if (suppressesThinkingOutput(record)) return false;
+  const effort = intent.reasoningEffort;
+  return typeof effort === "string" && effort.trim() !== "" && !THINKING_DISABLED.has(effort.trim().toLowerCase());
+}
+
 export function openAiToolCall(toolCall: GatewayToolCall): Record<string, unknown> {
   return {
     id: toolCall.id,
@@ -216,14 +342,42 @@ export function openAiToolCall(toolCall: GatewayToolCall): Record<string, unknow
   };
 }
 
-export function responseToolCallItem(toolCall: GatewayToolCall): Record<string, unknown> {
+/**
+ * function_call item 的两个 id 是不同命名空间：item `id` 用 `fc_` 前缀，`call_id` 用 `call_` 前缀
+ * （客户端回传 function_call_output 时引用的是 call_id）。上游 id 已带 `call_` 时不再重复加前缀。
+ */
+export function responseCallIds(toolCall: GatewayToolCall): { itemId: string; callId: string } {
+  // 上游 id 由单一生成器产出（`call_<uuid>` 或 `tool_<uuid>`），同一响应内不混用前缀，
+  // 所以补前缀不会把两个不同调用撞成同一个 call_id。
+  const suffix = toolCall.id.trim().replace(/^call_/, "") || degenerateCallSuffix(toolCall);
+  return { itemId: `fc_${suffix}`, callId: `call_${suffix}` };
+}
+
+/** 退化 id（空或只有 `call_` 前缀）的替身后缀。 */
+const degenerateCallSuffixes = new WeakMap<GatewayToolCall, string>();
+
+/**
+ * 同一个工具调用的 added / arguments.delta / arguments.done / output_item.done 四个事件会各自求一次 id，
+ * 所以替身必须按调用对象记忆：直接随机会让四个事件对不上，用固定常量又会让两个退化调用撞成同一个 call_id。
+ */
+function degenerateCallSuffix(toolCall: GatewayToolCall): string {
+  const existing = degenerateCallSuffixes.get(toolCall);
+  if (existing) return existing;
+  const suffix = randomUUID().replaceAll("-", "");
+  degenerateCallSuffixes.set(toolCall, suffix);
+  return suffix;
+}
+
+export function responseToolCallItem(toolCall: GatewayToolCall, status: "in_progress" | "completed" = "completed"): Record<string, unknown> {
+  const { itemId, callId } = responseCallIds(toolCall);
   return {
-    id: toolCall.id,
+    id: itemId,
     type: "function_call",
-    status: "completed",
-    call_id: toolCall.id,
+    status,
+    call_id: callId,
     name: toolCall.name,
-    arguments: JSON.stringify(toolCall.arguments)
+    // added 事件按官方形状先给空 arguments，完整参数由 function_call_arguments.delta/done 下发。
+    arguments: status === "in_progress" ? "" : JSON.stringify(toolCall.arguments)
   };
 }
 
@@ -246,14 +400,16 @@ export function openAiUsage(promptChars: number, completionChars: number): Recor
   };
 }
 
-export function responsesUsage(promptChars: number, outputChars: number): Record<string, unknown> {
+/** 官方语义里 output_tokens 含 reasoning_tokens，这里同样把思考字符计入输出侧，避免 detail 大于总量。 */
+export function responsesUsage(promptChars: number, outputChars: number, reasoningChars = 0): Record<string, unknown> {
   const inputTokens = estimateTokens(promptChars);
-  const outputTokens = estimateTokens(outputChars);
+  const reasoningTokens = estimateTokens(reasoningChars);
+  const outputTokens = estimateTokens(outputChars) + reasoningTokens;
   return {
     input_tokens: inputTokens,
     input_tokens_details: { cached_tokens: 0 },
     output_tokens: outputTokens,
-    output_tokens_details: { reasoning_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: reasoningTokens },
     total_tokens: inputTokens + outputTokens
   };
 }
@@ -261,6 +417,9 @@ export function responsesUsage(promptChars: number, outputChars: number): Record
 export function anthropicUsage(inputChars: number, outputChars: number): Record<string, unknown> {
   return {
     input_tokens: estimateTokens(inputChars),
+    // 常见客户端（含 Claude Code）会直接读这两个字段做统计；网关无缓存机制，恒 0。
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
     output_tokens: estimateTokens(outputChars)
   };
 }
@@ -332,15 +491,15 @@ function basePrepared(record: Record<string, unknown>, prompt: string, images: G
     images,
     tools,
     stream: record.stream === true,
-    maxTokens: integerOrUndefined(record.max_tokens ?? record.max_output_tokens),
+    includeUsage: asOptionalRecord(record.stream_options)?.include_usage === true,
+    maxTokens: firstInteger(record.max_tokens, record.max_completion_tokens, record.max_output_tokens),
     temperature: numberOrUndefined(record.temperature),
     topP: numberOrUndefined(record.top_p),
     stop,
     inputItems,
-    metadata: {
-      ...(asOptionalRecord(record.metadata) ?? {}),
-      ...(record.store !== undefined ? { store: record.store !== false } : {})
-    },
+    // 顶层 store 是数据保留契约，不再混进 metadata（客户端自己的 metadata.store 键原样保留）。
+    metadata: asOptionalRecord(record.metadata) ?? {},
+    store: record.store !== false,
     intent
   };
 }
@@ -396,6 +555,22 @@ function reasoningEffortValue(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
+/**
+ * 客户端是否明确不要看到 thinking 块。两种表达：
+ * - 关闭思考（`thinking:false` / `{type:"disabled"}` / `enabled:false`）；
+ * - `thinking.display:"omitted"`：仍然思考，但明确要求不要把思考内容回传。
+ * 只影响对外是否输出 thinking 块，不改变发给上游的思考强度。
+ */
+function suppressesThinkingOutput(record: Record<string, unknown>): boolean {
+  const thinking = record.thinking;
+  if (thinking === false) return true;
+  const thinkingRecord = asOptionalRecord(thinking);
+  if (!thinkingRecord) return false;
+  const type = typeof thinkingRecord.type === "string" ? thinkingRecord.type.trim().toLowerCase() : "";
+  if (type === "disabled" || type === "disable" || type === "none" || type === "off" || thinkingRecord.enabled === false) return true;
+  return typeof thinkingRecord.display === "string" && thinkingRecord.display.trim().toLowerCase() === "omitted";
+}
+
 function booleanField(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
@@ -416,7 +591,8 @@ function objectBody(body: unknown): Record<string, unknown> {
 
 function rejectCommonUnsupported(record: Record<string, unknown>): void {
   if (record.n !== undefined && record.n !== 1) throw new ApiError("n greater than 1 is not supported.", 400, "unsupported_parameter", "n");
-  if (record.logprobs !== undefined || record.top_logprobs !== undefined) throw new ApiError("logprobs are not supported.", 400, "unsupported_parameter", "logprobs");
+  // logprobs:false / top_logprobs 只是"不要 logprobs"或 Responses 的合法参数，不该 400；只有显式要 logprobs 才拒绝。
+  if (record.logprobs === true) throw new ApiError("logprobs are not supported.", 400, "unsupported_parameter", "logprobs");
   if (record.audio !== undefined) throw new ApiError("audio output is not supported.", 400, "unsupported_parameter", "audio");
 }
 
@@ -464,6 +640,81 @@ function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   });
 }
 
+/**
+ * Responses 的工具定义是扁平的（`{type:"function", name, description, parameters, strict}`），
+ * 不是 Chat 的嵌套 `{type:"function", function:{...}}`。嵌套写法作为宽容兜底接受（记一次日志），
+ * 内置工具（web_search 等）与未知类型不静默丢弃，同样记日志。
+ */
+function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[] {
+  if (toolChoice === "none") return [];
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = asOptionalRecord(item);
+    if (!record) return [];
+    // 先按 type 分流：内置工具（web_search 等）即使带 function 字段也不能当成客户端函数工具。
+    if (record.type !== undefined && record.type !== "function") {
+      logOnce("responses-unsupported-tool", `[responses] tool type ${describeValue(record.type)} is not supported by this Cursor-backed gateway and was ignored.`);
+      return [];
+    }
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (name) {
+      return [{ name, description: typeof record.description === "string" ? record.description : undefined, inputSchema: record.parameters }];
+    }
+    const nested = asOptionalRecord(record.function);
+    const nestedName = typeof nested?.name === "string" ? nested.name.trim() : "";
+    if (nestedName) {
+      logOnce("responses-nested-tool", `[responses] tool "${nestedName}" uses the Chat nested {function:{...}} shape; the Responses API expects the flat shape. Accepted for compatibility.`);
+      return [{ name: nestedName, description: typeof nested?.description === "string" ? nested.description : undefined, inputSchema: nested?.parameters }];
+    }
+    logOnce("responses-unnamed-tool", "[responses] a function tool without a usable name was ignored.");
+    return [];
+  });
+}
+
+/**
+ * 回显给客户端的 tools 必须是官方扁平形状：兼容接受的嵌套写法要先摊平，
+ * 否则 Response 快照本身就违反 schema，严格 SDK 解码会失败。
+ */
+function responsesToolEcho(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const record = asOptionalRecord(item);
+    const nested = asOptionalRecord(record?.function);
+    if (!record || record.type !== "function" || typeof record.name === "string" || !nested) return item;
+    // 摊平时保留 function 对象里的全部字段（含 strict 等），只是提到顶层。
+    const { function: _nested, ...rest } = record;
+    return { ...rest, ...nested, type: "function" };
+  });
+}
+
+/** `reasoning` 在官方 schema 里是对象；本网关额外容忍字符串写法，回显时要归一化。 */
+function responsesReasoningEcho(value: unknown): unknown {
+  if (typeof value === "string" && value.trim()) return { effort: value.trim() };
+  return asOptionalRecord(value) ?? null;
+}
+
+const loggedNotices = new Set<string>();
+
+/**
+ * 安全渲染请求里的任意值用于日志：`String(value)` 对 `{"toString":null,"valueOf":null}` 这类
+ * 构造出来的对象会抛 TypeError，把一次日志变成 500。同时截断，避免超长值撑爆日志。
+ */
+function describeValue(value: unknown): string {
+  if (typeof value === "string") return `"${value.slice(0, 60)}"`;
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
+  return `<${Array.isArray(value) ? "array" : typeof value}>`;
+}
+
+/**
+ * 同一类协议偏差只记一次，避免高频请求刷屏。
+ * key 必须是固定分类（不能拼入请求侧可控的工具名等），否则集合会被构造请求撑大且退化成每次都打。
+ */
+function logOnce(key: string, message: string): void {
+  if (loggedNotices.has(key)) return;
+  loggedNotices.add(key);
+  console.warn(message);
+}
+
 function parseAnthropicTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (asOptionalRecord(toolChoice)?.type === "none") return [];
   if (!Array.isArray(value)) return [];
@@ -509,7 +760,9 @@ function responseInputToTextAndImages(value: unknown, images: GatewayImage[]): s
       if (data) images.push({ type: "image", source: "base64", data, mediaType: typeof record.media_type === "string" ? record.media_type : undefined });
       parts.push("[image:attached]");
     } else if (record.type === "function_call_output" || record.type === "tool_result") {
-      parts.push(`TOOL RESULT (${stringField(record, "call_id", "unknown")}): ${JSON.stringify(record.output ?? record.content ?? "")}`);
+      // output 已是字符串时直接用：再 JSON.stringify 一次会把工具结果变成带转义的引号串。
+      const raw = record.output ?? record.content ?? "";
+      parts.push(`TOOL RESULT (${stringField(record, "call_id", "unknown")}): ${typeof raw === "string" ? raw : JSON.stringify(raw)}`);
     } else parts.push(JSON.stringify(record));
   }
   return parts.join("\n");
@@ -567,7 +820,12 @@ function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[])
     } else if (record.type === "tool_result") {
       parts.push(`TOOL RESULT (${stringField(record, "tool_use_id", "unknown")}): ${JSON.stringify(record.content ?? "")}`);
     } else if (record.type === "document") {
-      throw new ApiError("Anthropic document/PDF blocks are not supported by this Cursor-backed adapter.", 400, "unsupported_parameter", "content");
+      throw new ApiError(
+        "Gateway limitation: document/PDF content blocks are not supported by this Cursor-backed gateway (the Cursor upstream accepts text and images only). Extract the text client-side and send it as a text block.",
+        400,
+        "unsupported_parameter",
+        "content"
+      );
     } else {
       parts.push(JSON.stringify(record));
     }
@@ -581,15 +839,6 @@ function imageFromUrl(url: string): GatewayImage {
     if (match) return { type: "image", source: "base64", mediaType: match[1], data: match[2] };
   }
   return { type: "image", source: "url", data: url };
-}
-
-function responseToolMetadata(tool: GatewayTool): Record<string, unknown> {
-  return {
-    type: "function",
-    name: tool.name,
-    description: tool.description ?? "",
-    parameters: tool.inputSchema ?? { type: "object", properties: {} }
-  };
 }
 
 function estimateTokens(chars: number): number {
@@ -620,6 +869,15 @@ function numberOrUndefined(value: unknown): number | undefined {
 
 function integerOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/** max_tokens / max_completion_tokens / max_output_tokens 同义：取第一个**有效**值，非法值不遮蔽后面的合法别名。 */
+function firstInteger(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed = integerOrUndefined(value);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {

@@ -2,7 +2,16 @@ import { Readable } from "node:stream";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { registerAdminRoutes } from "./admin.js";
 import { authenticate, extractToken, sessionAffinity } from "./auth.js";
-import { anthropicError, ApiError, normalizeError, openAiError } from "./errors.js";
+import {
+  anthropicError,
+  anthropicErrorType,
+  ApiError,
+  newRequestId,
+  normalizeError,
+  openAiError,
+  openAiErrorPayload,
+  openAiStatus
+} from "./errors.js";
 import type { CursorKeyPool } from "./key-pool.js";
 import { errorMessage } from "./key-pool.js";
 import { mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-params.js";
@@ -12,15 +21,22 @@ import {
   anthropicToolUse,
   anthropicUsage,
   chatCompletionObject,
+  GATEWAY_THINKING_SIGNATURE,
   openAiToolCall,
   openAiUsage,
   prepareAnthropicMessages,
   prepareOpenAiChat,
   prepareOpenAiResponses,
+  responseCallIds,
   responseListObject,
+  responseMessageItem,
   responseObject,
+  responseReasoningItem,
+  responseSnapshot,
+  responseTextPart,
   responseToolCallItem,
   responsesUsage,
+  thinkingRequested,
   toRunRequest,
   type PreparedRequest
 } from "./protocol.js";
@@ -68,6 +84,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
       .header("access-control-allow-methods", "GET,POST,DELETE,OPTIONS")
       .header("access-control-allow-headers", "authorization,x-api-key,content-type,anthropic-version,anthropic-beta,x-session-affinity,x-opencode-session-id,x-opencode-session,anthropic-session-id,x-cursor-reasoning-effort,x-cursor-max-mode,x-cursor-fast,x-cursor-mode,x-cursor-model-params")
       .header("access-control-max-age", "86400");
+    // Anthropic 在所有响应（含成功与流式）上都带 request-id；错误体里复用同一个值。
+    if (request.url.startsWith("/v1/messages")) {
+      reply.header("request-id", anthropicRequestId(request));
+    }
     if (request.method === "OPTIONS") {
       reply.status(204).send();
     }
@@ -75,8 +95,13 @@ export function createApp(deps: AppDeps): FastifyInstance {
 
   app.setErrorHandler((error, request, reply) => {
     const normalized = normalizeError(error);
-    const body = request.url.startsWith("/v1/messages") ? anthropicError(normalized) : openAiError(normalized);
-    reply.status(normalized.statusCode).send(body);
+    if (request.url.startsWith("/v1/messages")) {
+      // Anthropic 客户端从 request-id 头/字段拿排查用的请求标识。
+      const requestId = anthropicRequestId(request);
+      reply.header("request-id", requestId).status(normalized.statusCode).send(anthropicError(normalized, requestId));
+      return;
+    }
+    reply.status(openAiStatus(normalized.statusCode)).send(openAiError(normalized));
   });
 
   app.get("/health", async () => ({
@@ -117,7 +142,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, run, deps, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, run, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return chatCompletionObject({ id, created, prepared, output });
@@ -144,11 +169,12 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, run, deps, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, run, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     const response = responseObject({ id, created, prepared, output, previousResponseId });
-    await saveResponse(deps, auth, id, response, prepared.inputItems);
+    // store:false 是数据保留契约：不落库，后续 GET/DELETE 自然 404。
+    if (prepared.store) await saveResponse(deps, auth, id, response, prepared.inputItems);
     return response;
   });
 
@@ -192,7 +218,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, run, deps, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, run, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return anthropicMessageObject({ id, prepared, output });
@@ -288,9 +314,17 @@ async function* withStreamLog(deps: AppDeps, log: RequestLog, chunks: AsyncItera
 
 async function runWithTimeout(deps: AppDeps, run: Parameters<CursorRunner["run"]>[0]): Promise<CursorRunResult> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), deps.config.requestTimeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, deps.config.requestTimeoutMs);
   try {
     return await deps.runner.run(run, controller.signal);
+  } catch (error) {
+    // 内部 abort 用 499 表达，但非流式请求的客户端还连着：对外必须是 504,而不是一个不存在的 HTTP 语义。
+    if (timedOut) throw new ApiError(`Upstream run timed out after ${deps.config.requestTimeoutMs}ms.`, 504, "timeout_error");
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -312,15 +346,25 @@ function sendSse(reply: FastifyReply, chunks: AsyncIterable<string>): FastifyRep
  */
 function streamAbort(request: FastifyRequest, idleTimeoutMs: number): { signal: AbortSignal; touch: () => void; done: () => void } {
   const controller = new AbortController();
-  let timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  // 空闲超时与客户端断连共用一个 signal，但语义不同：超时时客户端还连着，要收到规范的 504 超时错误事件；
+  // 断连则谁也收不到，只按 499 记日志。用 abort reason 区分两者。
+  const abortIdle = (): void => controller.abort(new ApiError(`Upstream produced no output for ${idleTimeoutMs}ms.`, 504, "timeout_error"));
+  let timer = setTimeout(abortIdle, idleTimeoutMs);
   const socket = request.raw.socket;
-  const onClose = () => controller.abort();
+  const onClose = () => {
+    clearTimeout(timer);
+    socket?.removeListener?.("close", onClose);
+    controller.abort();
+  };
   socket?.once?.("close", onClose);
+  // 连接可能在注册监听前就断了（例如前置的 previous_response_id 查库期间）；否则会被空闲超时误判成 504。
+  if (request.raw.destroyed || socket?.destroyed) onClose();
   return {
     signal: controller.signal,
     touch: () => {
+      if (controller.signal.aborted) return;
       clearTimeout(timer);
-      timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+      timer = setTimeout(abortIdle, idleTimeoutMs);
     },
     done: () => {
       clearTimeout(timer);
@@ -347,66 +391,76 @@ async function* chatStream(input: {
   auth: AuthContext;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  log: RequestLog;
   signal?: AbortSignal;
 }): AsyncIterable<string> {
-  yield sse({
+  const includeUsage = input.prepared.includeUsage;
+  const chunk = (delta: Record<string, unknown>, finishReason: string | null): string => sse({
     id: input.id,
     object: "chat.completion.chunk",
     created: input.created,
     model: input.prepared.model,
-    choices: [{ index: 0, delta: { role: "assistant" }, logprobs: null, finish_reason: null }]
+    choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }],
+    // 官方语义：请求了 include_usage 时普通块携带 usage:null，未请求时连字段都不出现。
+    ...(includeUsage ? { usage: null } : {})
   });
-  let final: CursorRunResult = { text: "", toolCalls: [] };
-  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
-    if (event.type === "thinking" && event.text) {
-      // DeepSeek 惯例的 reasoning_content 增量，兼容多数 OpenAI 客户端；不识别的客户端会忽略该字段。
-      yield sse({
-        id: input.id,
-        object: "chat.completion.chunk",
-        created: input.created,
-        model: input.prepared.model,
-        choices: [{ index: 0, delta: { reasoning_content: event.text }, logprobs: null, finish_reason: null }]
-      });
-    } else if (event.type === "text" && event.text) {
-      final.text += event.text;
-      yield sse({
-        id: input.id,
-        object: "chat.completion.chunk",
-        created: input.created,
-        model: input.prepared.model,
-        choices: [{ index: 0, delta: { content: event.text }, logprobs: null, finish_reason: null }]
-      });
-    } else if (event.type === "tool_call") {
-      final.toolCalls.push(event.toolCall);
-      yield sse({
-        id: input.id,
-        object: "chat.completion.chunk",
-        created: input.created,
-        model: input.prepared.model,
-        choices: [{ index: 0, delta: { tool_calls: [{ index: final.toolCalls.length - 1, ...openAiToolCall(event.toolCall) }] }, logprobs: null, finish_reason: null }]
-      });
-    } else if (event.type === "done") {
-      final = event.result;
+  try {
+    yield chunk({ role: "assistant" }, null);
+    let final: CursorRunResult = { text: "", toolCalls: [] };
+    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+      if (event.type === "thinking" && event.text) {
+        // DeepSeek 惯例的 reasoning_content 增量，兼容多数 OpenAI 客户端；不识别的客户端会忽略该字段。
+        yield chunk({ reasoning_content: event.text }, null);
+      } else if (event.type === "text" && event.text) {
+        final.text += event.text;
+        yield chunk({ content: event.text }, null);
+      } else if (event.type === "tool_call") {
+        final.toolCalls.push(event.toolCall);
+        yield chunk({ tool_calls: [{ index: final.toolCalls.length - 1, ...openAiToolCall(event.toolCall) }] }, null);
+      } else if (event.type === "done") {
+        final = event.result;
+      }
     }
+    yield chunk({}, final.toolCalls.length ? "tool_calls" : "stop");
+    // 未请求 usage 时不得追加 choices:[] 的块：大量客户端无脑取 choices[0] 会崩。
+    if (includeUsage) {
+      yield sse({
+        id: input.id,
+        object: "chat.completion.chunk",
+        created: input.created,
+        model: input.prepared.model,
+        choices: [],
+        usage: openAiUsage(input.prepared.prompt.length, final.text.length + JSON.stringify(final.toolCalls).length)
+      });
+    }
+    yield sseDone();
+  } catch (error) {
+    // 流已开始，只能用流内错误事件收场；[DONE] 不再发出，客户端据此判定本次响应失败。
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    if (apiError) yield sse({ error: openAiErrorPayload(apiError) });
   }
-  yield sse({
-    id: input.id,
-    object: "chat.completion.chunk",
-    created: input.created,
-    model: input.prepared.model,
-    choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: final.toolCalls.length ? "tool_calls" : "stop" }]
-  });
-  yield sse({
-    id: input.id,
-    object: "chat.completion.chunk",
-    created: input.created,
-    model: input.prepared.model,
-    choices: [],
-    usage: openAiUsage(input.prepared.prompt.length, final.text.length + JSON.stringify(final.toolCalls).length)
-  });
-  yield sseDone();
 }
 
+/**
+ * 流中途失败：错误已通过流内事件送达客户端，这里把真实状态写进请求日志。
+ * finishLog 幂等，`withStreamLog` 随后的 200 不会覆盖它。
+ * runner 把任何 abort 都表达成内部 499，这里按 abort reason 还原成对客户端有意义的语义（空闲超时 → 504）。
+ */
+function reportStreamError(deps: AppDeps, log: RequestLog, error: unknown, signal?: AbortSignal): ApiError | undefined {
+  const normalized = normalizeError(error);
+  const aborted = normalized.statusCode === 499 && signal?.aborted === true;
+  // 空闲超时用 ApiError 作为 abort reason；纯断连没有 reason。
+  const resolved = aborted && signal?.reason instanceof ApiError ? signal.reason : normalized;
+  finishLog(deps, log, resolved.statusCode, resolved === normalized ? errorMessage(error) : resolved.message);
+  // 客户端已断连：没人再读这条流，不必也不该再写错误事件。
+  return aborted && resolved.statusCode === 499 ? undefined : resolved;
+}
+
+/**
+ * `/v1/responses` 的官方事件状态机：所有事件带全局递增的 sequence_number，
+ * output item（reasoning / message / function_call）按产出顺序分配连续的 output_index，
+ * 每个 item 都有完整的 added → 增量 → done 生命周期；成功以 response.completed 收尾，失败发 `event: error`，两种情况都不发 [DONE]。
+ */
 async function* responsesStream(input: {
   id: string;
   created: number;
@@ -415,61 +469,126 @@ async function* responsesStream(input: {
   auth: AuthContext;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  log: RequestLog;
   signal?: AbortSignal;
 }): AsyncIterable<string> {
-  const base = {
-    id: input.id,
-    object: "response",
-    created_at: input.created,
-    status: "in_progress",
-    model: input.prepared.model,
-    output: [],
-    previous_response_id: input.previousResponseId ?? null,
-    usage: null
-  };
-  yield sse({ type: "response.created", response: base }, "response.created");
-  yield sse({ type: "response.in_progress", response: base }, "response.in_progress");
+  let sequence = 1;
+  const emit = (payload: Record<string, unknown>): string => sse({ ...payload, sequence_number: sequence++ }, String(payload.type));
+  const snapshot = (status: "in_progress" | "completed", output?: Record<string, unknown>[], usage?: Record<string, unknown>, result?: CursorRunResult): Record<string, unknown> =>
+    responseSnapshot({
+      id: input.id,
+      created: input.created,
+      prepared: input.prepared,
+      status,
+      output,
+      usage,
+      previousResponseId: input.previousResponseId,
+      agentId: result?.agentId,
+      runId: result?.runId
+    });
 
-  let textStarted = false;
-  let final: CursorRunResult = { text: "", toolCalls: [] };
-  const messageId = `msg_${input.id.slice(5)}`;
-  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
-    if (event.type === "thinking" && event.text) {
-      // Responses 协议没有轻量的思考增量事件；发 SSE 注释行保活（重置空闲超时、防反代断连），客户端解析器会忽略注释。
-      yield ": thinking\n\n";
-    } else if (event.type === "text" && event.text) {
-      if (!textStarted) {
-        textStarted = true;
-        yield sse({ type: "response.output_item.added", output_index: 0, item: { id: messageId, type: "message", status: "in_progress", role: "assistant", content: [] } }, "response.output_item.added");
-        yield sse({ type: "response.content_part.added", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, "response.content_part.added");
+  try {
+    yield emit({ type: "response.created", response: snapshot("in_progress") });
+    yield emit({ type: "response.in_progress", response: snapshot("in_progress") });
+
+    const suffix = input.id.replace(/^resp_/, "");
+    const items: Record<string, unknown>[] = [];
+    let nextOutputIndex = 0;
+    let itemCounter = 0;
+    let text = "";
+    let reasoning = "";
+    let openKind: "message" | "reasoning" | null = null;
+    let openIndex = -1;
+    let openItemId = "";
+    let openText = "";
+    let final: CursorRunResult = { text: "", toolCalls: [] };
+
+    const closeOpenItem = (): string[] => {
+      if (openKind === null) return [];
+      const chunks: string[] = [];
+      if (openKind === "message") {
+        const item = responseMessageItem(openItemId, openText);
+        chunks.push(emit({ type: "response.output_text.done", item_id: openItemId, output_index: openIndex, content_index: 0, text: openText, logprobs: [] }));
+        chunks.push(emit({ type: "response.content_part.done", item_id: openItemId, output_index: openIndex, content_index: 0, part: responseTextPart(openText) }));
+        chunks.push(emit({ type: "response.output_item.done", output_index: openIndex, item }));
+        items.push(item);
+      } else {
+        const item = responseReasoningItem(openItemId, openText);
+        chunks.push(emit({ type: "response.reasoning_summary_text.done", item_id: openItemId, output_index: openIndex, summary_index: 0, text: openText }));
+        chunks.push(emit({ type: "response.reasoning_summary_part.done", item_id: openItemId, output_index: openIndex, summary_index: 0, part: { type: "summary_text", text: openText } }));
+        chunks.push(emit({ type: "response.output_item.done", output_index: openIndex, item }));
+        items.push(item);
       }
-      final.text += event.text;
-      yield sse({ type: "response.output_text.delta", item_id: messageId, output_index: 0, content_index: 0, delta: event.text }, "response.output_text.delta");
-    } else if (event.type === "tool_call") {
-      final.toolCalls.push(event.toolCall);
-      const item = responseToolCallItem(event.toolCall);
-      const outputIndex = (textStarted ? 1 : 0) + final.toolCalls.length - 1;
-      yield sse({ type: "response.output_item.added", output_index: outputIndex, item }, "response.output_item.added");
-      yield sse({ type: "response.output_item.done", output_index: outputIndex, item }, "response.output_item.done");
-    } else if (event.type === "done") {
-      final = event.result;
+      openKind = null;
+      return chunks;
+    };
+
+    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+      if (event.type === "thinking" && event.text) {
+        if (openKind !== "reasoning") {
+          yield* closeOpenItem();
+          openKind = "reasoning";
+          openIndex = nextOutputIndex++;
+          openItemId = `rs_${suffix}_${itemCounter++}`;
+          openText = "";
+          yield emit({ type: "response.output_item.added", output_index: openIndex, item: { id: openItemId, type: "reasoning", summary: [] } });
+          yield emit({ type: "response.reasoning_summary_part.added", item_id: openItemId, output_index: openIndex, summary_index: 0, part: { type: "summary_text", text: "" } });
+        }
+        openText += event.text;
+        reasoning += event.text;
+        yield emit({ type: "response.reasoning_summary_text.delta", item_id: openItemId, output_index: openIndex, summary_index: 0, delta: event.text });
+      } else if (event.type === "text" && event.text) {
+        if (openKind !== "message") {
+          yield* closeOpenItem();
+          openKind = "message";
+          openIndex = nextOutputIndex++;
+          openItemId = `msg_${suffix}_${itemCounter++}`;
+          openText = "";
+          yield emit({ type: "response.output_item.added", output_index: openIndex, item: { id: openItemId, type: "message", status: "in_progress", role: "assistant", content: [] } });
+          yield emit({ type: "response.content_part.added", item_id: openItemId, output_index: openIndex, content_index: 0, part: responseTextPart("") });
+        }
+        openText += event.text;
+        text += event.text;
+        yield emit({ type: "response.output_text.delta", item_id: openItemId, output_index: openIndex, content_index: 0, delta: event.text, logprobs: [] });
+      } else if (event.type === "tool_call") {
+        yield* closeOpenItem();
+        const outputIndex = nextOutputIndex++;
+        const { itemId } = responseCallIds(event.toolCall);
+        const args = JSON.stringify(event.toolCall.arguments);
+        const item = responseToolCallItem(event.toolCall);
+        yield emit({ type: "response.output_item.added", output_index: outputIndex, item: responseToolCallItem(event.toolCall, "in_progress") });
+        // 上游一次性给出完整参数，按合法的最粗粒度发一个 delta 再 done。
+        yield emit({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: outputIndex, delta: args });
+        // 官方 schema 的 function_call_arguments.done 带 name。
+        yield emit({ type: "response.function_call_arguments.done", item_id: itemId, output_index: outputIndex, name: event.toolCall.name, arguments: args });
+        yield emit({ type: "response.output_item.done", output_index: outputIndex, item });
+        items.push(item);
+      } else if (event.type === "done") {
+        final = event.result;
+      }
+    }
+    yield* closeOpenItem();
+
+    const usage = responsesUsage(input.prepared.prompt.length, text.length + JSON.stringify(items.filter(isFunctionCallItem)).length, reasoning.length);
+    const response = snapshot("completed", items, usage, final);
+    if (input.prepared.store) await saveResponse(input.deps, input.auth, input.id, response, input.prepared.inputItems);
+    yield emit({ type: "response.completed", response });
+  } catch (error) {
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    if (apiError) {
+      yield sse({
+        type: "error",
+        code: openAiErrorPayload(apiError).code,
+        message: apiError.message,
+        param: apiError.param ?? null,
+        sequence_number: sequence++
+      }, "error");
     }
   }
+}
 
-  // 文本 item 的规范收尾事件（严格客户端靠这些结束状态机）。
-  if (textStarted) {
-    yield sse({ type: "response.output_text.done", item_id: messageId, output_index: 0, content_index: 0, text: final.text }, "response.output_text.done");
-    yield sse({ type: "response.content_part.done", item_id: messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: final.text, annotations: [] } }, "response.content_part.done");
-    yield sse({
-      type: "response.output_item.done",
-      output_index: 0,
-      item: { id: messageId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: final.text, annotations: [] }] }
-    }, "response.output_item.done");
-  }
-
-  const response = responseObject({ id: input.id, created: input.created, prepared: input.prepared, output: final, previousResponseId: input.previousResponseId });
-  await saveResponse(input.deps, input.auth, input.id, response, input.prepared.inputItems);
-  yield sse({ type: "response.completed", response }, "response.completed");
+function isFunctionCallItem(item: Record<string, unknown>): boolean {
+  return item.type === "function_call";
 }
 
 async function* anthropicStream(input: {
@@ -477,86 +596,99 @@ async function* anthropicStream(input: {
   prepared: PreparedRequest;
   run: Parameters<CursorRunner["run"]>[0];
   deps: AppDeps;
+  log: RequestLog;
   signal?: AbortSignal;
 }): AsyncIterable<string> {
-  yield sse({
-    type: "message_start",
-    message: {
-      id: input.id,
-      type: "message",
-      role: "assistant",
-      model: input.prepared.model,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: Math.ceil(input.prepared.prompt.length / 4), output_tokens: 0 }
-    }
-  }, "message_start");
-  let nextIndex = 0;
-  let openIndex = -1;
-  let openType: "text" | "thinking" | null = null;
-  let text = "";
-  let thinkingChars = 0;
-  const toolCalls: CursorRunResult["toolCalls"] = [];
-  const closeOpenBlock = (): string[] => {
-    if (openType === null) return [];
-    const chunks: string[] = [];
-    // Anthropic 协议要求 thinking 块在 stop 前有 signature_delta；网关无真实签名，发一个不透明占位签名
-    // 保证严格客户端（Claude Code）能正常收块。历史消息里的 thinking 块本网关按纯文本处理，不校验签名。
-    if (openType === "thinking") {
-      chunks.push(sse({ type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: GATEWAY_THINKING_SIGNATURE } }, "content_block_delta"));
-    }
-    chunks.push(sse({ type: "content_block_stop", index: openIndex }, "content_block_stop"));
-    openType = null;
-    return chunks;
-  };
-  for await (const event of input.deps.runner.stream(input.run, input.signal)) {
-    if (event.type === "thinking" && event.text) {
-      if (openType !== "thinking") {
-        yield* closeOpenBlock();
-        openIndex = nextIndex;
-        nextIndex += 1;
-        openType = "thinking";
-        yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "" } }, "content_block_start");
+  // 客户端没请求思考时不产出 thinking 块：未申明 thinking 的客户端收到该块会解码失败或误显示。
+  const wantsThinking = thinkingRequested(input.prepared);
+  try {
+    yield sse({
+      type: "message_start",
+      message: {
+        id: input.id,
+        type: "message",
+        role: "assistant",
+        model: input.prepared.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: anthropicUsage(input.prepared.prompt.length, 0)
       }
-      thinkingChars += event.text.length;
-      yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: event.text } }, "content_block_delta");
-    } else if (event.type === "text" && event.text) {
-      if (openType !== "text") {
-        yield* closeOpenBlock();
-        openIndex = nextIndex;
-        nextIndex += 1;
-        openType = "text";
-        yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "text", text: "" } }, "content_block_start");
+    }, "message_start");
+    let nextIndex = 0;
+    let openIndex = -1;
+    let openType: "text" | "thinking" | null = null;
+    let text = "";
+    let thinkingChars = 0;
+    const toolCalls: CursorRunResult["toolCalls"] = [];
+    const closeOpenBlock = (): string[] => {
+      if (openType === null) return [];
+      const chunks: string[] = [];
+      // Anthropic 协议要求 thinking 块在 stop 前有 signature_delta；网关无真实签名，发一个不透明占位签名
+      // 保证严格客户端（Claude Code）能正常收块。历史消息里的 thinking 块本网关按纯文本处理，不校验签名。
+      if (openType === "thinking") {
+        chunks.push(sse({ type: "content_block_delta", index: openIndex, delta: { type: "signature_delta", signature: GATEWAY_THINKING_SIGNATURE } }, "content_block_delta"));
       }
-      text += event.text;
-      yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "text_delta", text: event.text } }, "content_block_delta");
-    } else if (event.type === "tool_call") {
-      yield* closeOpenBlock();
-      toolCalls.push(event.toolCall);
-      const index = nextIndex;
-      nextIndex += 1;
-      // Anthropic 官方语义：tool_use 的 content_block_start.input 恒为 {}，
-      // 完整参数只通过 input_json_delta 下发——按规范实现的客户端（含 Claude Code）靠累积 partial_json 得到 input。
-      yield sse({ type: "content_block_start", index, content_block: { ...anthropicToolUse(event.toolCall), input: {} } }, "content_block_start");
-      yield sse({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(event.toolCall.arguments ?? {}) } }, "content_block_delta");
-      yield sse({ type: "content_block_stop", index }, "content_block_stop");
-    } else if (event.type === "done") {
-      text = event.result.text || text;
-      toolCalls.splice(0, toolCalls.length, ...event.result.toolCalls);
+      chunks.push(sse({ type: "content_block_stop", index: openIndex }, "content_block_stop"));
+      openType = null;
+      return chunks;
+    };
+    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+      if (event.type === "thinking" && event.text) {
+        if (!wantsThinking) continue;
+        if (openType !== "thinking") {
+          yield* closeOpenBlock();
+          openIndex = nextIndex;
+          nextIndex += 1;
+          openType = "thinking";
+          // 严格 union 解码器要求 thinking 块起手就带 signature 字段（真值由结尾的 signature_delta 补齐）。
+          yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "", signature: "" } }, "content_block_start");
+        }
+        thinkingChars += event.text.length;
+        yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: event.text } }, "content_block_delta");
+      } else if (event.type === "text" && event.text) {
+        if (openType !== "text") {
+          yield* closeOpenBlock();
+          openIndex = nextIndex;
+          nextIndex += 1;
+          openType = "text";
+          yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "text", text: "" } }, "content_block_start");
+        }
+        text += event.text;
+        yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "text_delta", text: event.text } }, "content_block_delta");
+      } else if (event.type === "tool_call") {
+        yield* closeOpenBlock();
+        toolCalls.push(event.toolCall);
+        const index = nextIndex;
+        nextIndex += 1;
+        // Anthropic 官方语义：tool_use 的 content_block_start.input 恒为 {}，
+        // 完整参数只通过 input_json_delta 下发——按规范实现的客户端（含 Claude Code）靠累积 partial_json 得到 input。
+        yield sse({ type: "content_block_start", index, content_block: { ...anthropicToolUse(event.toolCall), input: {} } }, "content_block_start");
+        yield sse({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(event.toolCall.arguments ?? {}) } }, "content_block_delta");
+        yield sse({ type: "content_block_stop", index }, "content_block_stop");
+      } else if (event.type === "done") {
+        text = event.result.text || text;
+        toolCalls.splice(0, toolCalls.length, ...event.result.toolCalls);
+      }
+    }
+    yield* closeOpenBlock();
+    yield sse({
+      type: "message_delta",
+      delta: { stop_reason: toolCalls.length ? "tool_use" : "end_turn", stop_sequence: null },
+      usage: anthropicUsage(input.prepared.prompt.length, text.length + thinkingChars + JSON.stringify(toolCalls).length)
+    }, "message_delta");
+    yield sse({ type: "message_stop" }, "message_stop");
+  } catch (error) {
+    // 规范的流内错误：发 error 事件后结束，不再补 message_stop（那会让客户端把失败当成正常收尾）。
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    if (apiError) {
+      yield sse({
+        type: "error",
+        error: { type: anthropicErrorType(apiError.statusCode), message: apiError.message }
+      }, "error");
     }
   }
-  yield* closeOpenBlock();
-  yield sse({
-    type: "message_delta",
-    delta: { stop_reason: toolCalls.length ? "tool_use" : "end_turn", stop_sequence: null },
-    usage: anthropicUsage(input.prepared.prompt.length, text.length + thinkingChars + JSON.stringify(toolCalls).length)
-  }, "message_delta");
-  yield sse({ type: "message_stop" }, "message_stop");
 }
-
-/** 网关自产 thinking 块的占位签名（Anthropic 协议要求非空 signature_delta；本网关不校验回传签名）。 */
-const GATEWAY_THINKING_SIGNATURE = Buffer.from("docker-composer-api:opaque-thinking-signature").toString("base64");
 
 async function saveResponse(deps: AppDeps, auth: AuthContext, id: string, response: Record<string, unknown>, inputItems: unknown[]): Promise<void> {
   const now = new Date().toISOString();
@@ -611,6 +743,13 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 function booleanHeader(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
   return !["0", "false", "no", "off"].includes(value.toLowerCase());
+}
+
+/** 每个 /v1/messages 请求一个稳定的 request id：响应头与错误体里必须是同一个值。 */
+function anthropicRequestId(request: FastifyRequest): string {
+  const holder = request as FastifyRequest & { anthropicRequestId?: string };
+  holder.anthropicRequestId ??= newRequestId();
+  return holder.anthropicRequestId;
 }
 
 function routeParam(params: unknown, key: string): string {

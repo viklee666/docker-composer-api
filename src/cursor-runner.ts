@@ -62,13 +62,17 @@ export class CursorSdkRunner implements CursorRunner {
     const events = this.stream(input, signal);
     let result: CursorRunResult | undefined;
     let text = "";
+    let reasoningText = "";
     const toolCalls: GatewayToolCall[] = [];
     for await (const event of events) {
       if (event.type === "text") text += event.text;
+      // 非流式下 thinking 没有别的出口，聚合起来供 reasoning_content / reasoning item / thinking 块使用。
+      if (event.type === "thinking") reasoningText += event.text;
       if (event.type === "tool_call") toolCalls.push(event.toolCall);
       if (event.type === "done") result = event.result;
     }
-    return result ?? { text, toolCalls };
+    // done 的 result 是权威结果（与 text/toolCalls 同理）；本地累积只在缺 done 事件时兜底。
+    return result ?? { text, toolCalls, ...(reasoningText ? { reasoningText } : {}) };
   }
 
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
@@ -198,6 +202,10 @@ export class CursorSdkRunner implements CursorRunner {
       })();
 
       const textParts: string[] = [];
+      // 思考文本随 result 一起返回：非流式聚合器换 key 重试时，只有本次成功尝试的思考会被采用。
+      // 流式请求的思考已逐块发给客户端，result 里的副本无人消费，不再留存（长思考会白占内存）。
+      const keepThinking = !input.stream;
+      const thinkingParts: string[] = [];
       const toolCalls: GatewayToolCall[] = [];
       const streamErrorDetails: string[] = [];
       // 有客户端工具时用增量 marker 过滤器实现“乐观流式”：正文实时下发，只暂扣可能是 <tool_call> 前缀的尾部。
@@ -235,6 +243,7 @@ export class CursorSdkRunner implements CursorRunner {
             chunk = update.text;
           } else if (type === "thinking-delta" && typeof update?.text === "string" && update.text && thinkingSource !== "message") {
             thinkingSource = "delta";
+            if (keepThinking) thinkingParts.push(update.text);
             yield { type: "thinking", text: update.text };
           }
         } else if (item.kind === "event") {
@@ -242,6 +251,7 @@ export class CursorSdkRunner implements CursorRunner {
           const thinking = thinkingFromSdkEvent(event);
           if (thinking && thinkingSource !== "delta") {
             thinkingSource = "message";
+            if (keepThinking) thinkingParts.push(thinking);
             yield { type: "thinking", text: thinking };
           }
           const text = textFromSdkEvent(event);
@@ -386,6 +396,7 @@ export class CursorSdkRunner implements CursorRunner {
       const result: CursorRunResult = {
         text: textParts.join("").trim(),
         toolCalls: [...toolCalls],
+        ...(thinkingParts.length ? { reasoningText: thinkingParts.join("") } : {}),
         agentId: agent.agentId,
         runId: run.id
       };

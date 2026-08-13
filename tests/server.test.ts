@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { ApiError } from "../src/errors.js";
+import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError, openAiErrorType, openAiStatus } from "../src/errors.js";
 import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory } from "../src/cursor-runner.js";
 import { CursorKeyPool, classifyKeyFailure } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
@@ -456,6 +456,132 @@ test("responses stream emits OpenAI Responses events", async () => {
   assert.match(response.body, /event: response\.completed/);
 });
 
+/** Responses 的官方工具定义是扁平的：`{type:"function", name, parameters}`，不是 Chat 的嵌套 function 对象。 */
+const FLAT_WEATHER_TOOL = {
+  type: "function",
+  name: "get_weather",
+  description: "Get the weather.",
+  parameters: { type: "object", properties: { city: { type: "string" } } },
+  strict: true
+};
+
+test("responses parses official flat tool definitions and rejects nothing silently", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Weather in Paris?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(runner.lastInput?.tools, [{
+    name: "get_weather",
+    description: "Get the weather.",
+    inputSchema: { type: "object", properties: { city: { type: "string" } } }
+  }]);
+  // 工具原样回显在 Response 快照里（含 strict 等网关不消费的字段）。
+  assert.deepEqual(response.json().tools, [FLAT_WEATHER_TOOL]);
+});
+
+test("responses still accepts the nested chat tool shape for compatibility", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Weather in Paris?",
+      tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} } } }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(runner.lastInput?.tools?.map((tool) => tool.name), ["get_weather"]);
+});
+
+test("responses ignores builtin tool types even when they carry a function field", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Search the web",
+      tools: [
+        { type: "web_search", function: { name: "web_search", parameters: { type: "object", properties: {} } } },
+        FLAT_WEATHER_TOOL
+      ]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(runner.lastInput?.tools?.map((tool) => tool.name), ["get_weather"]);
+});
+
+test("a hostile tool type does not crash the request", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Hello",
+      // String(type) 对这种对象会抛 TypeError；日志渲染不能把请求变成 500。
+      tools: [{ type: { toString: null, valueOf: null } }, FLAT_WEATHER_TOOL]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual((response.json().tools as { name?: string }[]).map((tool) => tool.name), [undefined, "get_weather"]);
+});
+
+test("responses echoes tools and reasoning in the official schema shape", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Weather in Paris?",
+      // 网关容忍的宽松写法：嵌套工具 + 字符串 reasoning。回显必须归一化成官方形状。
+      reasoning: "high",
+      instructions: "  keep spacing  ",
+      tools: [{ type: "function", function: { name: "get_weather", description: "d", parameters: { type: "object", properties: {} } } }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+  assert.deepEqual(body.reasoning, { effort: "high" });
+  assert.deepEqual(body.tools, [{ type: "function", name: "get_weather", description: "d", parameters: { type: "object", properties: {} } }]);
+  // instructions 原样回显（prompt 里才用 trim 后的值）。
+  assert.equal(body.instructions, "  keep spacing  ");
+});
+
+test("responses function_call_output strings are not double encoded", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: [
+        { type: "message", role: "user", content: "Weather in Paris?" },
+        { type: "function_call_output", call_id: "call_weather", output: "{\"temp\":21}" }
+      ],
+      tools: [FLAT_WEATHER_TOOL]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(runner.lastInput?.prompt.includes('TOOL RESULT (call_weather): {"temp":21}'), runner.lastInput?.prompt);
+  assert.ok(!runner.lastInput?.prompt.includes('\\"temp\\"'), "string output must not be JSON.stringify'd twice");
+});
+
 test("responses stream indexes pure tool-call output from zero", async () => {
   const { app } = await createTestApp({
     runner: new FakeRunner({
@@ -467,25 +593,46 @@ test("responses stream indexes pure tool-call output from zero", async () => {
     method: "POST",
     url: "/v1/responses",
     headers: { authorization: "Bearer gateway-key" },
-    payload: {
-      model: "composer-2.5",
-      stream: true,
-      input: "Weather in Paris?",
-      tools: [{
-        type: "function",
-        function: {
-          name: "get_weather",
-          parameters: { type: "object", properties: { city: { type: "string" } } }
-        }
-      }]
-    }
+    payload: { model: "composer-2.5", stream: true, input: "Weather in Paris?", tools: [FLAT_WEATHER_TOOL] }
   });
   assert.equal(response.statusCode, 200);
-  const toolAdded = response.body
-    .split("\n\n")
-    .find((chunk) => chunk.includes("event: response.output_item.added") && chunk.includes('"type":"function_call"'));
-  assert.ok(toolAdded, "stream should include a function_call output item");
-  assert.match(toolAdded, /"output_index":0/);
+  assert.deepEqual(sseEvents(response.body), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.output_item.done",
+    "response.completed"
+  ]);
+  const frames = sseFrames(response.body);
+  assert.deepEqual(frames[2].data, {
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: "fc_weather", type: "function_call", status: "in_progress", call_id: "call_weather", name: "get_weather", arguments: "" },
+    sequence_number: 3
+  });
+  assert.deepEqual(frames[3].data, {
+    type: "response.function_call_arguments.delta",
+    item_id: "fc_weather",
+    output_index: 0,
+    delta: '{"city":"Paris"}',
+    sequence_number: 4
+  });
+  assert.deepEqual(frames[4].data, {
+    type: "response.function_call_arguments.done",
+    item_id: "fc_weather",
+    output_index: 0,
+    name: "get_weather",
+    arguments: '{"city":"Paris"}',
+    sequence_number: 5
+  });
+  assert.deepEqual(frames[5].data, {
+    type: "response.output_item.done",
+    output_index: 0,
+    item: { id: "fc_weather", type: "function_call", status: "completed", call_id: "call_weather", name: "get_weather", arguments: '{"city":"Paris"}' },
+    sequence_number: 6
+  });
 });
 
 test("responses stream indexes tool-call output after text when text is streamed", async () => {
@@ -500,25 +647,30 @@ test("responses stream indexes tool-call output after text when text is streamed
     method: "POST",
     url: "/v1/responses",
     headers: { authorization: "Bearer gateway-key" },
-    payload: {
-      model: "composer-2.5",
-      stream: true,
-      input: "Weather in Paris?",
-      tools: [{
-        type: "function",
-        function: {
-          name: "get_weather",
-          parameters: { type: "object", properties: { city: { type: "string" } } }
-        }
-      }]
-    }
+    payload: { model: "composer-2.5", stream: true, input: "Weather in Paris?", tools: [FLAT_WEATHER_TOOL] }
   });
   assert.equal(response.statusCode, 200);
-  const toolAdded = response.body
-    .split("\n\n")
-    .find((chunk) => chunk.includes("event: response.output_item.added") && chunk.includes('"type":"function_call"'));
-  assert.ok(toolAdded, "stream should include a function_call output item");
-  assert.match(toolAdded, /"output_index":1/);
+  assert.deepEqual(sseEvents(response.body), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.output_item.added",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.output_item.done",
+    "response.completed"
+  ]);
+  const frames = sseFrames(response.body);
+  // 文本 item 在工具调用开始前先收尾，工具 item 拿到下一个 output_index。
+  assert.equal((frames[7].data as { output_index: number }).output_index, 0);
+  assert.equal((frames[8].data as { output_index: number }).output_index, 1);
+  const completed = frames.at(-1)!.data as { response: { output: { type: string }[] } };
+  assert.deepEqual(completed.response.output.map((item) => item.type), ["message", "function_call"]);
 });
 
 test("anthropic messages supports text and tool_use responses", async () => {
@@ -1723,6 +1875,82 @@ test("CursorSdkRunner streams token-level text from onDelta and dedupes message-
   assert.deepEqual(texts, ["he", "llo"]);
   const done = events.find((event) => event.type === "done");
   assert.equal(done?.type === "done" ? done.result.text : "", "hello");
+  // 未标记 stream 的请求按非流式处理：思考全文随 done 返回，供聚合器使用。
+  assert.equal(done?.type === "done" ? done.result.reasoningText : undefined, "pondering");
+});
+
+test("streaming runs do not retain a second copy of the thinking transcript", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-delta",
+      send: async (_message, options) => {
+        const onDelta = options.onDelta as (args: { update: unknown }) => void;
+        return new FakeSdkRun({
+          streamEvents: async function* () {
+            onDelta({ update: { type: "thinking-delta", text: "pondering" } });
+            onDelta({ update: { type: "text-delta", text: "answer" } });
+            yield { type: "assistant", message: { content: [{ type: "text", text: "answer" }] } };
+          },
+          waitResult: { status: "finished", result: "answer" }
+        });
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const events: CursorStreamEvent[] = [];
+  for await (const event of runner.stream({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    stream: true,
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  })) {
+    events.push(event);
+  }
+  // 思考已逐块发给客户端，done.result 不再留一份（长思考会白占内存）。
+  assert.equal(events.filter((event) => event.type === "thinking").length, 1);
+  const done = events.find((event) => event.type === "done");
+  assert.equal(done?.type === "done" ? done.result.reasoningText : "unset", undefined);
+});
+
+test("CursorSdkRunner.run aggregates thinking into reasoningText", async () => {
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-delta",
+      send: async (_message, options) => {
+        const onDelta = options.onDelta as (args: { update: unknown }) => void;
+        return new FakeSdkRun({
+          streamEvents: async function* () {
+            onDelta({ update: { type: "thinking-delta", text: "step one. " } });
+            onDelta({ update: { type: "thinking-delta", text: "step two." } });
+            onDelta({ update: { type: "text-delta", text: "answer" } });
+            yield { type: "assistant", message: { content: [{ type: "text", text: "answer" }] } };
+          },
+          waitResult: { status: "finished", result: "answer" }
+        });
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const result = await runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    stream: false,
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  });
+  assert.equal(result.text, "answer");
+  assert.equal(result.reasoningText, "step one. step two.");
 });
 
 test("CursorSdkRunner does not forward agent-native tool calls the client never declared", async () => {
@@ -2148,8 +2376,8 @@ test("KeyRotatingRunner retries after thinking only for non-streaming requests",
   }
 });
 
-test("responses stream keeps alive during thinking and emits completion events", async () => {
-  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["pondering"], chunks: ["answer"] }) });
+test("responses stream expresses thinking as a reasoning item, not an SSE comment", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["pon", "dering"], chunks: ["answer"] }) });
   const response = await app.inject({
     method: "POST",
     url: "/v1/responses",
@@ -2157,11 +2385,45 @@ test("responses stream keeps alive during thinking and emits completion events",
     payload: { model: "composer-2.5", stream: true, input: "Say hello" }
   });
   assert.equal(response.statusCode, 200);
-  assert.match(response.body, /^: thinking$/m, "thinking should surface as SSE keepalive comments");
-  assert.match(response.body, /event: response\.output_text\.done/);
-  assert.match(response.body, /event: response\.content_part\.done/);
-  assert.match(response.body, /event: response\.output_item\.done/);
-  assert.match(response.body, /event: response\.completed/);
+  assert.ok(!response.body.includes(": thinking"), "the SSE keepalive comment is replaced by real reasoning events");
+  assert.deepEqual(sseEvents(response.body), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_summary_part.done",
+    "response.output_item.done",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed"
+  ]);
+
+  const frames = sseFrames(response.body);
+  const reasoningAdded = frames[2].data as { output_index: number; item: Record<string, unknown> };
+  assert.equal(reasoningAdded.output_index, 0);
+  assert.equal(reasoningAdded.item.type, "reasoning");
+  assert.deepEqual(reasoningAdded.item.summary, []);
+  assert.match(String(reasoningAdded.item.id), /^rs_/);
+
+  const summaryDone = frames[6].data as { text: string; summary_index: number };
+  assert.equal(summaryDone.text, "pondering");
+  assert.equal(summaryDone.summary_index, 0);
+
+  const reasoningDone = frames[8].data as { item: { summary: unknown[] } };
+  assert.deepEqual(reasoningDone.item.summary, [{ type: "summary_text", text: "pondering" }]);
+
+  // 文本 item 排在 reasoning item 之后，output_index 连续分配。
+  assert.equal((frames[9].data as { output_index: number }).output_index, 1);
+  const completed = frames.at(-1)!.data as { response: { output: { type: string }[]; usage: Record<string, unknown> } };
+  assert.deepEqual(completed.response.output.map((item) => item.type), ["reasoning", "message"]);
+  assert.deepEqual(completed.response.usage.output_tokens_details, { reasoning_tokens: 3 });
 });
 
 test("normalizeToolCallForClient removes redundant synonym source keys when the target is already set", () => {
@@ -2212,7 +2474,13 @@ test("anthropic stream emits thinking blocks with signature_delta before stop", 
     method: "POST",
     url: "/v1/messages",
     headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
-    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      stream: true,
+      thinking: { type: "enabled", budget_tokens: 2048 },
+      messages: [{ role: "user", content: "Hello" }]
+    }
   });
   assert.equal(response.statusCode, 200);
   const body = response.body;
@@ -2223,6 +2491,79 @@ test("anthropic stream emits thinking blocks with signature_delta before stop", 
   assert.ok(body.indexOf("signature_delta") < body.indexOf("content_block_stop"), "signature_delta must precede the thinking block stop");
   // thinking 块之后正文以独立 text 块（index 1）下发。
   assert.match(body, /"index":1.*"type":"text"|"type":"text".*"index":1/);
+
+  // 严格 union 解码器要求 thinking 块从 start 起就带 signature 字段。
+  const start = sseFrames(body).find((frame) => frame.event === "content_block_start")!.data as { content_block: Record<string, unknown> };
+  assert.deepEqual(start.content_block, { type: "thinking", thinking: "", signature: "" });
+});
+
+test("anthropic stream drops thinking when the client never requested it", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["internal"], chunks: ["answer"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(!response.body.includes("thinking_delta"), "thinking must not leak when it was not requested");
+  assert.ok(!response.body.includes("signature_delta"), "no thinking block means no signature delta");
+  assert.deepEqual(sseEvents(response.body), [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop"
+  ]);
+  // 正文块占 index 0：被丢弃的 thinking 不能占用块下标。
+  const start = sseFrames(response.body).find((frame) => frame.event === "content_block_start")!.data as { index: number; content_block: Record<string, unknown> };
+  assert.equal(start.index, 0);
+  assert.deepEqual(start.content_block, { type: "text", text: "" });
+});
+
+test("anthropic non-stream returns a thinking block only when thinking was requested", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["deep thought"], text: "answer" }) });
+  const withThinking = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      thinking: { type: "enabled", budget_tokens: 2048 },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(withThinking.statusCode, 200);
+  const blocks = withThinking.json().content as Record<string, unknown>[];
+  assert.deepEqual(blocks.map((block) => block.type), ["thinking", "text"]);
+  assert.equal(blocks[0].thinking, "deep thought");
+  assert.ok(typeof blocks[0].signature === "string" && blocks[0].signature, "thinking block needs a signature");
+
+  const withoutThinking = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.deepEqual((withoutThinking.json().content as { type: string }[]).map((block) => block.type), ["text"]);
+  // 无工具调用时终止原因是 end_turn，stop_sequence 恒为 null（上游拿不到停止序列）。
+  assert.equal(withoutThinking.json().stop_reason, "end_turn");
+  assert.equal(withoutThinking.json().stop_sequence, null);
+});
+
+test("anthropic stream message_delta reports end_turn with a null stop_sequence", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  const delta = sseFrames(response.body).find((frame) => frame.event === "message_delta")!.data as { delta: unknown; usage: Record<string, number> };
+  assert.deepEqual(delta.delta, { stop_reason: "end_turn", stop_sequence: null });
+  assert.ok(typeof delta.usage.output_tokens === "number");
 });
 
 test("openai chat stream forwards thinking as reasoning_content deltas", async () => {
@@ -2239,7 +2580,7 @@ test("openai chat stream forwards thinking as reasoning_content deltas", async (
 });
 
 async function createTestApp(options: {
-  runner?: FakeRunner;
+  runner?: CursorRunner;
   store?: MemoryStateStore;
   keys?: string[];
   config?: Partial<GatewayConfig>;
@@ -2267,6 +2608,39 @@ async function createTestApp(options: {
     applyCursorSdkNetworkConfig: options.applyCursorSdkNetworkConfig
   });
   return { app, store, keyPool };
+}
+
+interface SseFrame {
+  event?: string;
+  raw?: string;
+  data?: unknown;
+}
+
+/** 把 SSE 响应体拆成有序帧，用于断言精确的事件顺序与 JSON 形状。 */
+function sseFrames(body: string): SseFrame[] {
+  return body
+    .split("\n\n")
+    .filter((frame) => frame.trim())
+    .map((frame) => {
+      const event = /^event: (.+)$/m.exec(frame)?.[1];
+      const raw = /^data: ([\s\S]+?)$/m.exec(frame)?.[1];
+      let data: unknown;
+      if (raw !== undefined && raw !== "[DONE]") {
+        // 解析失败要立刻炸：否则只比事件名的顺序断言会在 data 变成非法 JSON 时照样通过。
+        data = JSON.parse(raw) as unknown;
+      }
+      return { event, raw, data };
+    });
+}
+
+/** 事件顺序：优先取 SSE `event:` 名，退回 data.type / [DONE]。 */
+function sseEvents(body: string): string[] {
+  return sseFrames(body).map((frame) => {
+    if (frame.event) return frame.event;
+    if (frame.raw === "[DONE]") return "[DONE]";
+    const type = (frame.data as { type?: unknown } | undefined)?.type;
+    return typeof type === "string" ? type : "chunk";
+  });
 }
 
 class FakeSdkRun {
@@ -2301,7 +2675,14 @@ class FakeRunner implements CursorRunner {
   readonly failFor = new Map<string, string>();
   readonly failWith = new Map<string, Error>();
 
-  constructor(private readonly output: Partial<CursorRunResult> & { chunks?: string[]; thinking?: string[] } = {}) {}
+  constructor(private readonly output: Partial<CursorRunResult> & {
+    chunks?: string[];
+    thinking?: string[];
+    /** 已经吐出内容之后再抛错，用于验证流内错误事件（而不是裸断连）。 */
+    failMidStream?: Error;
+    /** 一直挂到被 abort，用于验证超时映射。 */
+    hangUntilAborted?: boolean;
+  } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
     this.lastApiKey = input.apiKey;
@@ -2316,11 +2697,12 @@ class FakeRunner implements CursorRunner {
     };
   }
 
-  async *stream(input: CursorRunRequest): AsyncIterable<CursorStreamEvent> {
+  async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     this.lastApiKey = input.apiKey;
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    if (this.output.hangUntilAborted) await abortedPromise(signal);
     for (const thinking of this.output.thinking ?? []) {
       yield { type: "thinking", text: thinking };
     }
@@ -2330,14 +2712,17 @@ class FakeRunner implements CursorRunner {
       text += chunk;
       yield { type: "text", text: chunk };
     }
+    if (this.output.failMidStream) throw this.output.failMidStream;
     for (const toolCall of this.output.toolCalls ?? []) {
       yield { type: "tool_call", toolCall };
     }
+    const thinking = (this.output.thinking ?? []).join("");
     yield {
       type: "done",
       result: {
         text: this.output.text ?? text,
         toolCalls: this.output.toolCalls ?? [],
+        ...(thinking ? { reasoningText: thinking } : {}),
         agentId: "agent-test",
         runId: "run-test"
       }
@@ -2351,3 +2736,1002 @@ class FakeRunner implements CursorRunner {
     if (failure) throw new Error(failure);
   }
 }
+
+/** 模拟"上游挂住直到网关 abort"：与真实 runner 一样把 abort 表达成 499。 */
+function abortedPromise(signal?: AbortSignal): Promise<never> {
+  // 没有 signal 就立即失败：否则一旦 abort 传递链回归，这个 promise 会永远挂住整个测试套件。
+  if (!signal) return Promise.reject(new ApiError("hangUntilAborted requires an abort signal.", 500, "internal_error"));
+  return new Promise((_, reject) => {
+    const fail = (): void => reject(new ApiError("Request was aborted.", 499, "request_aborted"));
+    if (signal.aborted) return fail();
+    signal.addEventListener("abort", fail, { once: true });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// P0-1 stream_options.include_usage
+// ---------------------------------------------------------------------------
+
+test("chat stream omits the usage chunk unless stream_options.include_usage is set", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  const frames = sseFrames(response.body);
+  assert.equal(frames.at(-1)?.raw, "[DONE]");
+  const chunks = frames.slice(0, -1).map((frame) => frame.data as Record<string, unknown>);
+  // 每个块都必须有 choices[0]；无脑取 choices[0] 的客户端不能被 choices:[] 的 usage 块打崩。
+  assert.ok(chunks.every((chunk) => (chunk.choices as unknown[]).length === 1), "no choices:[] chunk may be emitted");
+  assert.ok(chunks.every((chunk) => !("usage" in chunk)), "usage field must be absent entirely");
+  assert.deepEqual(chunks.map((chunk) => (chunk.choices as { delta: unknown }[])[0].delta), [
+    { role: "assistant" },
+    { content: "hi" },
+    {}
+  ]);
+});
+
+test("chat stream sends usage:null plus a final usage chunk when include_usage is requested", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  const frames = sseFrames(response.body);
+  assert.equal(frames.at(-1)?.raw, "[DONE]");
+  const chunks = frames.slice(0, -1).map((frame) => frame.data as Record<string, unknown>);
+  const usageChunks = chunks.filter((chunk) => (chunk.choices as unknown[]).length === 0);
+  assert.equal(usageChunks.length, 1, "exactly one choices:[] usage chunk");
+  assert.equal(usageChunks[0], chunks.at(-1), "the usage chunk is the last one before [DONE]");
+  assert.ok(chunks.slice(0, -1).every((chunk) => chunk.usage === null), "normal chunks carry usage:null");
+  const usage = usageChunks[0].usage as Record<string, number>;
+  assert.deepEqual(Object.keys(usage).sort(), ["completion_tokens", "prompt_tokens", "total_tokens"]);
+  assert.equal(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+});
+
+// ---------------------------------------------------------------------------
+// P0-2 in-stream errors
+// ---------------------------------------------------------------------------
+
+test("chat stream reports a mid-stream failure as an error frame without [DONE]", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], failMidStream: new ApiError("upstream exploded", 502, "upstream_run_failed") })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(!response.body.includes("data: [DONE]"), "a failed chat stream must not be terminated with [DONE]");
+  const frames = sseFrames(response.body);
+  assert.deepEqual(frames.at(-1)?.data, {
+    error: { message: "upstream exploded", type: "server_error", param: null, code: "upstream_run_failed" }
+  });
+});
+
+test("responses stream reports a mid-stream failure as an error event with a continuing sequence", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], failMidStream: new ApiError("upstream exploded", 502, "upstream_run_failed") })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Hello" }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(!response.body.includes("data: [DONE]"), "responses never emits [DONE]");
+  assert.deepEqual(sseEvents(response.body), [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "error"
+  ]);
+  assert.deepEqual(sseFrames(response.body).at(-1)?.data, {
+    type: "error",
+    code: "upstream_run_failed",
+    message: "upstream exploded",
+    param: null,
+    sequence_number: 6
+  });
+});
+
+test("anthropic stream reports a mid-stream failure as an error event without message_stop", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], failMidStream: new ApiError("upstream exploded", 529, "overloaded") })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "direct-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(sseEvents(response.body), [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "error"
+  ]);
+  assert.deepEqual(sseFrames(response.body).at(-1)?.data, {
+    type: "error",
+    error: { type: "overloaded_error", message: "upstream exploded" }
+  });
+});
+
+test("a failed stream is logged with the real status instead of 200", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], failMidStream: new ApiError("upstream exploded", 502, "upstream_run_failed") })
+  });
+  const streamed = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(streamed.statusCode, 200);
+  const logs = await app.inject({ method: "GET", url: "/admin/api/logs", headers: { authorization: "Bearer gateway-key" } });
+  const entry = (logs.json().logs as { endpoint: string; status: number }[]).find((log) => log.endpoint === "/v1/chat/completions");
+  assert.equal(entry?.status, 502);
+});
+
+// ---------------------------------------------------------------------------
+// P0-6 Response snapshots
+// ---------------------------------------------------------------------------
+
+test("responses stream keeps output_index unique when a tool call precedes text", async () => {
+  // 旧实现用 `(textStarted ? 1 : 0) + toolCalls.length - 1`：工具先于文本时两者都会拿到 index 0。
+  const runner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (): AsyncIterable<CursorStreamEvent> {
+      yield { type: "tool_call", toolCall: { id: "call_weather", name: "get_weather", arguments: { city: "Paris" } } };
+      yield { type: "text", text: "checking" };
+      yield { type: "done", result: { text: "checking", toolCalls: [{ id: "call_weather", name: "get_weather", arguments: { city: "Paris" } }] } };
+    }
+  };
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Weather in Paris?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const frames = sseFrames(response.body);
+  const added = frames.filter((frame) => frame.event === "response.output_item.added").map((frame) => frame.data as { output_index: number; item: { type: string } });
+  assert.deepEqual(added.map((event) => [event.item.type, event.output_index]), [["function_call", 0], ["message", 1]]);
+  const completed = frames.at(-1)!.data as { response: { output: { type: string }[] } };
+  assert.deepEqual(completed.response.output.map((item) => item.type), ["function_call", "message"]);
+});
+
+test("response objects echo the official request parameters", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Say hello",
+      instructions: "Be terse.",
+      max_output_tokens: 256,
+      temperature: 0.3,
+      top_p: 0.9,
+      truncation: "auto",
+      user: "user-42",
+      parallel_tool_calls: false,
+      tool_choice: "required",
+      text: { format: { type: "text" } },
+      reasoning: { effort: "high" },
+      metadata: { trace: "abc" },
+      tools: [FLAT_WEATHER_TOOL]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+  assert.equal(body.object, "response");
+  assert.equal(body.status, "completed");
+  assert.equal(body.instructions, "Be terse.");
+  assert.equal(body.max_output_tokens, 256);
+  assert.equal(body.temperature, 0.3);
+  assert.equal(body.top_p, 0.9);
+  assert.equal(body.truncation, "auto");
+  assert.equal(body.user, "user-42");
+  assert.equal(body.parallel_tool_calls, false);
+  assert.equal(body.tool_choice, "required");
+  assert.deepEqual(body.text, { format: { type: "text" } });
+  assert.deepEqual(body.reasoning, { effort: "high" });
+  assert.equal(body.background, false);
+  assert.equal(body.store, true);
+  assert.equal(body.error, null);
+  assert.equal(body.incomplete_details, null);
+  // store 是顶层契约字段，不再污染客户端的 metadata。
+  assert.deepEqual(body.metadata, { trace: "abc" });
+  // 锁定完整字段集：漏掉任何一个官方字段（或多出未声明字段）都要让这条测试失败。
+  assert.deepEqual(Object.keys(body).sort(), [
+    "background",
+    "completed_at",
+    "created_at",
+    "cursor_agent_id",
+    "cursor_run_id",
+    "error",
+    "id",
+    "incomplete_details",
+    "instructions",
+    "max_output_tokens",
+    "metadata",
+    "model",
+    "object",
+    "output",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "reasoning",
+    "status",
+    "store",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "truncation",
+    "usage",
+    "user"
+  ]);
+  assert.deepEqual(body.usage.input_tokens_details, { cached_tokens: 0 });
+});
+
+test("responses stream snapshots use the same field set as the non-streaming object", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const streamed = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Say hello" }
+  });
+  const plain = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello" }
+  });
+  const frames = sseFrames(streamed.body);
+  const created = (frames[0].data as { response: Record<string, unknown> }).response;
+  const completed = (frames.at(-1)!.data as { response: Record<string, unknown> }).response;
+  const expected = Object.keys(plain.json()).sort();
+  assert.deepEqual(Object.keys(created).sort(), expected, "response.created must be a full snapshot");
+  assert.deepEqual(Object.keys(completed).sort(), expected, "response.completed must be a full snapshot");
+  // 每个事件的 SSE event 名必须与 data.type 一致。
+  for (const frame of frames) assert.equal(frame.event, (frame.data as { type: string }).type);
+});
+
+test("responses stream created/in_progress carry a full response snapshot", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Say hello", instructions: "Be terse.", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const frames = sseFrames(response.body);
+  const created = frames[0].data as { sequence_number: number; response: Record<string, unknown> };
+  assert.equal(created.sequence_number, 1);
+  assert.equal(created.response.status, "in_progress");
+  assert.deepEqual(created.response.output, []);
+  assert.equal(created.response.usage, null);
+  assert.equal(created.response.completed_at, null);
+  assert.equal(created.response.instructions, "Be terse.");
+  assert.deepEqual(created.response.tools, [FLAT_WEATHER_TOOL]);
+  const inProgress = frames[1].data as { sequence_number: number; response: Record<string, unknown> };
+  assert.equal(inProgress.sequence_number, 2);
+  // in_progress 必须是和 created 一样的完整快照，不能退化成精简对象。
+  assert.deepEqual(inProgress.response, created.response);
+
+  // sequence_number 在整条响应内从 1 起严格递增。
+  const sequences = frames.map((frame) => (frame.data as { sequence_number: number }).sequence_number);
+  assert.deepEqual(sequences, sequences.map((_, index) => index + 1));
+
+  const completed = frames.at(-1)!.data as { response: Record<string, unknown> };
+  assert.equal(completed.response.status, "completed");
+  assert.equal(typeof completed.response.completed_at, "number");
+  assert.ok(completed.response.usage, "completed snapshot carries usage");
+});
+
+test("responses stream text events carry logprobs and item ids consistent with the snapshot", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["he", "llo"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Say hello" }
+  });
+  const frames = sseFrames(response.body);
+  const added = frames[2].data as { item: { id: string } };
+  const partAdded = frames[3].data as Record<string, unknown>;
+  assert.deepEqual(partAdded.part, { type: "output_text", text: "", annotations: [], logprobs: [] });
+  const delta = frames[4].data as Record<string, unknown>;
+  assert.equal(delta.item_id, added.item.id);
+  assert.deepEqual(delta.logprobs, []);
+  assert.equal(delta.delta, "he");
+  const textDone = frames[6].data as Record<string, unknown>;
+  assert.equal(textDone.text, "hello", "output_text.done must equal the concatenated deltas");
+  const itemDone = frames[8].data as { item: { content: unknown[] } };
+  assert.deepEqual(itemDone.item.content, [{ type: "output_text", text: "hello", annotations: [], logprobs: [] }]);
+});
+
+// ---------------------------------------------------------------------------
+// P0-7 store semantics
+// ---------------------------------------------------------------------------
+
+test("store:false responses are not persisted", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello", store: false }
+  });
+  assert.equal(created.statusCode, 200);
+  assert.equal(created.json().store, false);
+  const loaded = await app.inject({
+    method: "GET",
+    url: `/v1/responses/${created.json().id}`,
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(loaded.statusCode, 404);
+
+  const stored = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello" }
+  });
+  assert.equal(stored.json().store, true);
+  const reloaded = await app.inject({
+    method: "GET",
+    url: `/v1/responses/${stored.json().id}`,
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(reloaded.statusCode, 200);
+});
+
+test("store:false streamed responses are not persisted", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, store: false, input: "Say hello" }
+  });
+  assert.equal(response.statusCode, 200);
+  const completed = sseFrames(response.body).at(-1)!.data as { response: { id: string; store: boolean } };
+  assert.equal(completed.response.store, false);
+  const loaded = await app.inject({
+    method: "GET",
+    url: `/v1/responses/${completed.response.id}`,
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(loaded.statusCode, 404);
+});
+
+test("a client metadata key named store does not disable persistence", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello", metadata: { store: "false" } }
+  });
+  assert.equal(created.json().store, true);
+  assert.deepEqual(created.json().metadata, { store: "false" });
+  const loaded = await app.inject({
+    method: "GET",
+    url: `/v1/responses/${created.json().id}`,
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(loaded.statusCode, 200);
+});
+
+test("an explicit top-level store is never mirrored into metadata", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  for (const store of [true, false]) {
+    const created = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer gateway-key" },
+      payload: { model: "composer-2.5", input: "Say hello", store, metadata: { trace: "abc" } }
+    });
+    assert.equal(created.json().store, store);
+    // 顶层 store 是数据保留契约，绝不能被合成进客户端的 metadata。
+    assert.deepEqual(created.json().metadata, { trace: "abc" }, `store=${store}`);
+  }
+
+  const withoutMetadata = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello", store: false }
+  });
+  assert.deepEqual(withoutMetadata.json().metadata, {});
+});
+
+// ---------------------------------------------------------------------------
+// P1-3 request leniency
+// ---------------------------------------------------------------------------
+
+test("logprobs:false and top_logprobs are accepted while logprobs:true stays rejected", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const lenient = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", logprobs: false, top_logprobs: 3, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(lenient.statusCode, 200);
+
+  const responsesTopLogprobs = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", top_logprobs: 2, input: "Hello" }
+  });
+  assert.equal(responsesTopLogprobs.statusCode, 200);
+
+  const rejected = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", logprobs: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(rejected.statusCode, 400);
+  assert.equal(rejected.json().error.type, "invalid_request_error");
+});
+
+test("explicitly disabled thinking suppresses the block without changing upstream intent", async () => {
+  const runner = new FakeRunner({ thinking: ["should not appear"], chunks: ["answer"] });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      stream: true,
+      // Claude Code 会同时带这两个字段；显式关闭必须压过 effort 提示（仅就"是否回传思考"而言）。
+      thinking: { type: "disabled" },
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.ok(!response.body.includes("thinking_delta"), "explicitly disabled thinking must not emit thinking blocks");
+  // 输出侧的门控不能改写发给 Cursor 上游的思考强度（对外格式修复不触碰内部转换）。
+  assert.equal(runner.lastInput?.reasoningEffort, "high");
+});
+
+test("thinking display:omitted keeps the reasoning out of the response", async () => {
+  const runner = new FakeRunner({ thinking: ["private reasoning"], chunks: ["answer"] });
+  const { app } = await createTestApp({ runner });
+  const streamed = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      stream: true,
+      thinking: { type: "enabled", budget_tokens: 2048, display: "omitted" },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(streamed.statusCode, 200);
+  assert.ok(!streamed.body.includes("private reasoning"), "omitted thinking must not be streamed back");
+  assert.ok(!streamed.body.includes("thinking_delta"));
+  // 思考本身仍然请求上游执行（budget 2048 → low），只是不回传。
+  assert.equal(runner.lastInput?.reasoningEffort, "low");
+
+  const plain = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      thinking: { type: "enabled", budget_tokens: 2048, display: "omitted" },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.deepEqual((plain.json().content as { type: string }[]).map((block) => block.type), ["text"]);
+});
+
+test("responses text defaults to the official object rather than null", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello" }
+  });
+  // text 是官方 schema 里的非 nullable 对象；null 会让严格解码器失败。
+  assert.deepEqual(response.json().text, { format: { type: "text" } });
+});
+
+test("function_call_arguments.done carries the tool name", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ text: "", toolCalls: [{ id: "call_weather", name: "get_weather", arguments: { city: "Paris" } }] })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Weather?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  const done = sseFrames(response.body).find((frame) => frame.event === "response.function_call_arguments.done")!.data as Record<string, unknown>;
+  assert.equal(done.name, "get_weather");
+  assert.equal(done.arguments, '{"city":"Paris"}');
+});
+
+test("an invalid token limit does not mask a valid alias", async () => {
+  const runner = new FakeRunner({ text: "hi" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Hello", max_tokens: 0, max_output_tokens: 512 }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(runner.lastInput?.maxTokens, 512);
+  assert.equal(response.json().max_output_tokens, 512);
+});
+
+test("degenerate upstream tool call ids stay stable across the whole streaming lifecycle", async () => {
+  const toolCall = { id: "call_", name: "get_weather", arguments: { city: "Paris" } };
+  const runner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (): AsyncIterable<CursorStreamEvent> {
+      yield { type: "tool_call", toolCall };
+      yield { type: "done", result: { text: "", toolCalls: [toolCall] } };
+    }
+  };
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Weather?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const frames = sseFrames(response.body);
+  const added = frames[2].data as { item: { id: string; call_id: string } };
+  assert.match(added.item.id, /^fc_.+/);
+  assert.match(added.item.call_id, /^call_.+/);
+  assert.notEqual(added.item.call_id, "call_");
+  // 四个生命周期事件必须引用同一个 item id，否则客户端无法把参数拼回同一个调用。
+  assert.equal((frames[3].data as { item_id: string }).item_id, added.item.id);
+  assert.equal((frames[4].data as { item_id: string }).item_id, added.item.id);
+  assert.equal((frames[5].data as { item: { id: string } }).item.id, added.item.id);
+  const completed = frames.at(-1)!.data as { response: { output: { id: string; call_id: string }[] } };
+  assert.equal(completed.response.output[0].id, added.item.id);
+  assert.equal(completed.response.output[0].call_id, added.item.call_id);
+});
+
+test("two degenerate tool call ids do not collide with each other", async () => {
+  const first = { id: "", name: "get_weather", arguments: { city: "Paris" } };
+  const second = { id: "call_", name: "get_weather", arguments: { city: "Berlin" } };
+  const runner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (): AsyncIterable<CursorStreamEvent> {
+      yield { type: "tool_call", toolCall: first };
+      yield { type: "tool_call", toolCall: second };
+      yield { type: "done", result: { text: "", toolCalls: [first, second] } };
+    }
+  };
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Weather?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const completed = sseFrames(response.body).at(-1)!.data as { response: { output: { id: string; call_id: string }[] } };
+  const [a, b] = completed.response.output;
+  assert.notEqual(a.call_id, b.call_id, "distinct tool calls must not share a call_id");
+  assert.notEqual(a.id, b.id, "distinct tool calls must not share an item id");
+  // 替身 id 也要在四个生命周期事件之间保持一致。
+  const added = sseFrames(response.body).filter((frame) => frame.event === "response.output_item.added").map((frame) => (frame.data as { item: { id: string } }).item.id);
+  assert.deepEqual(added, [a.id, b.id]);
+});
+
+test("nested tool echo preserves fields like strict", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      input: "Weather?",
+      tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} }, strict: true } }]
+    }
+  });
+  assert.deepEqual(response.json().tools, [
+    { type: "function", name: "get_weather", parameters: { type: "object", properties: {} }, strict: true }
+  ]);
+});
+
+test("tool call ids stay consistent across every streamed lifecycle event", async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ text: "", toolCalls: [{ id: "tool_abc123", name: "get_weather", arguments: { city: "Paris" } }] })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Weather?", tools: [FLAT_WEATHER_TOOL] }
+  });
+  const frames = sseFrames(response.body);
+  const added = frames[2].data as { item: { id: string; call_id: string } };
+  // 上游未带 call_ 前缀时补上，item id 用 fc_ 前缀。
+  assert.equal(added.item.id, "fc_tool_abc123");
+  assert.equal(added.item.call_id, "call_tool_abc123");
+  assert.equal((frames[3].data as { item_id: string }).item_id, "fc_tool_abc123");
+  assert.equal((frames[4].data as { item_id: string }).item_id, "fc_tool_abc123");
+});
+
+test("max_completion_tokens is parsed as a max_tokens synonym", async () => {
+  const runner = new FakeRunner({ text: "hi" });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", max_completion_tokens: 128, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(runner.lastInput?.maxTokens, 128);
+});
+
+// ---------------------------------------------------------------------------
+// P1-10 / P1-12 error envelope and status mapping
+// ---------------------------------------------------------------------------
+
+test("openai errors use the official type taxonomy and keep specifics in code", async () => {
+  const { app } = await createTestApp();
+  const unauthorized = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(unauthorized.statusCode, 401);
+  assert.deepEqual(unauthorized.json(), {
+    error: { message: "Missing or invalid API key.", type: "authentication_error", param: null, code: "unauthorized" }
+  });
+
+  const badParam = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", n: 3, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(badParam.statusCode, 400);
+  assert.deepEqual(badParam.json().error, {
+    message: "n greater than 1 is not supported.",
+    type: "invalid_request_error",
+    param: "n",
+    code: "unsupported_parameter"
+  });
+});
+
+test("anthropic errors carry the official type plus a request id", async () => {
+  const { app } = await createTestApp();
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", data: "x" } }] }]
+    }
+  });
+  assert.equal(response.statusCode, 400);
+  const body = response.json();
+  assert.equal(body.type, "error");
+  assert.equal(body.error.type, "invalid_request_error");
+  assert.match(body.error.message, /Gateway limitation/);
+  assert.match(body.request_id, /^req_/);
+  assert.equal(response.headers["request-id"], body.request_id);
+
+  const missingKey = await app.inject({ method: "POST", url: "/v1/messages", payload: { model: "composer-2.5", max_tokens: 8, messages: [] } });
+  assert.equal(missingKey.statusCode, 401);
+  assert.equal(missingKey.json().error.type, "authentication_error");
+});
+
+test("upstream 402 becomes 429 insufficient_quota on OpenAI endpoints and stays billing_error on Anthropic", async () => {
+  const runner = new FakeRunner({ text: "hi" });
+  runner.failWith.set("direct-cursor-key", new ApiError("You have run out of credits.", 402, "billing_error"));
+  const { app } = await createTestApp({ runner });
+
+  const chat = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(chat.statusCode, 429);
+  assert.deepEqual(chat.json().error, {
+    message: "You have run out of credits.",
+    type: "rate_limit_error",
+    param: null,
+    code: "insufficient_quota"
+  });
+
+  const messages = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "direct-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(messages.statusCode, 402);
+  assert.equal(messages.json().error.type, "billing_error");
+});
+
+test("fastify body errors keep their own status instead of becoming 500", async () => {
+  const { app } = await createTestApp();
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key", "content-type": "application/json" },
+    payload: "{\"model\": broken"
+  });
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().error.type, "invalid_request_error");
+});
+
+test("error taxonomy maps every status class for both protocols", () => {
+  const openAi: [number, string][] = [
+    [400, "invalid_request_error"],
+    [401, "authentication_error"],
+    [403, "permission_error"],
+    [404, "invalid_request_error"],
+    [413, "invalid_request_error"],
+    [429, "rate_limit_error"],
+    [499, "server_error"],
+    [500, "server_error"],
+    [502, "server_error"],
+    [504, "server_error"]
+  ];
+  for (const [status, type] of openAi) {
+    assert.equal(openAiErrorType(status), type, `openai ${status}`);
+  }
+  // 402 在 OpenAI 侧不存在：状态改 429，code 换成 insufficient_quota。
+  assert.equal(openAiStatus(402), 429);
+  assert.equal(openAiStatus(503), 503);
+  assert.deepEqual(openAiError(new ApiError("out of credits", 402, "billing_error")), {
+    error: { message: "out of credits", type: "rate_limit_error", param: null, code: "insufficient_quota" }
+  });
+
+  const anthropic: [number, string][] = [
+    [400, "invalid_request_error"],
+    [401, "authentication_error"],
+    [402, "billing_error"],
+    [403, "permission_error"],
+    [404, "not_found_error"],
+    [413, "request_too_large"],
+    [429, "rate_limit_error"],
+    [499, "api_error"],
+    [500, "api_error"],
+    [504, "timeout_error"],
+    [529, "overloaded_error"]
+  ];
+  for (const [status, type] of anthropic) {
+    assert.equal(anthropicErrorType(status), type, `anthropic ${status}`);
+  }
+
+  const first = newRequestId();
+  const second = newRequestId();
+  assert.match(first, /^req_[0-9a-f]{32}$/);
+  assert.notEqual(first, second);
+  assert.equal(anthropicError(new ApiError("nope", 429, "rate_limit_exceeded"), "req_fixed").request_id, "req_fixed");
+});
+
+test("anthropic responses always carry a request-id header", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hi" }) });
+  const ok = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(ok.statusCode, 200);
+  assert.match(ok.headers["request-id"] as string, /^req_[0-9a-f]{32}$/);
+  // 成功响应体不带 request_id（只有错误体带）。
+  assert.ok(!("request_id" in ok.json()), "success bodies must not carry request_id");
+
+  const streamed = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.match(streamed.headers["request-id"] as string, /^req_[0-9a-f]{32}$/);
+  assert.notEqual(streamed.headers["request-id"], ok.headers["request-id"]);
+});
+
+test("stream idle timeouts surface as a 504 timeout error event, not an abort", { timeout: 5000 }, async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ hangUntilAborted: true }),
+    config: { requestTimeoutMs: 20 }
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  const last = sseFrames(response.body).at(-1)?.data as { type: string; error: { type: string } };
+  assert.equal(last.type, "error");
+  assert.equal(last.error.type, "timeout_error");
+
+  const chat = await createTestApp({
+    runner: new FakeRunner({ hangUntilAborted: true }),
+    config: { requestTimeoutMs: 20 }
+  });
+  const chatResponse = await chat.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  const chatLast = sseFrames(chatResponse.body).at(-1)?.data as { error: { type: string; code: string } };
+  assert.equal(chatLast.error.code, "timeout_error");
+  assert.equal(chatLast.error.type, "server_error");
+});
+
+test("raw upstream errors carrying a status do not leak it to the client", async () => {
+  const runner = new FakeRunner({ text: "hi" });
+  // 上游 SDK 错误常带 status；透传出去会让客户端以为是自己的 key/URL 有问题。
+  runner.failWith.set("direct-cursor-key", Object.assign(new Error("upstream said no"), { status: 404 }));
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 500);
+  assert.equal(response.json().error.type, "server_error");
+  assert.equal(response.json().error.code, "internal_error");
+});
+
+test("non-streaming upstream timeouts surface as 504 timeout_error", { timeout: 5000 }, async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ hangUntilAborted: true }),
+    config: { requestTimeoutMs: 20 }
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 504);
+  assert.equal(response.json().error.type, "server_error");
+  assert.equal(response.json().error.code, "timeout_error");
+});
+
+test("anthropic message_start usage exposes the cache token counters", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hi"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  const start = sseFrames(response.body)[0].data as { message: { usage: Record<string, number> } };
+  assert.deepEqual(Object.keys(start.message.usage).sort(), [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens",
+    "output_tokens"
+  ]);
+  assert.equal(start.message.usage.cache_creation_input_tokens, 0);
+  assert.equal(start.message.usage.cache_read_input_tokens, 0);
+  assert.equal(start.message.usage.output_tokens, 0);
+});
+
+// ---------------------------------------------------------------------------
+// P2-4 non-streaming reasoning
+// ---------------------------------------------------------------------------
+
+test("non-streaming chat returns aggregated thinking as reasoning_content", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["step one. ", "step two."], text: "answer" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  const message = response.json().choices[0].message;
+  assert.equal(message.content, "answer");
+  assert.equal(message.reasoning_content, "step one. step two.");
+
+  const withoutThinking = await createTestApp({ runner: new FakeRunner({ text: "answer" }) });
+  const plain = await withoutThinking.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.ok(!("reasoning_content" in plain.json().choices[0].message), "no reasoning field without thinking");
+});
+
+test("key rotation does not splice thinking from a failed attempt into the answer", async () => {
+  // 非流式请求允许"吐过 thinking 后换 key 重试"；聚合出的思考只能来自最终成功的那次尝试。
+  const inner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (input: CursorRunRequest): AsyncIterable<CursorStreamEvent> {
+      if (input.apiKey === "key-a") {
+        yield { type: "thinking", text: "discarded attempt" };
+        throw new ApiError("Cursor upstream run ended in error", 502, "upstream_run_failed");
+      }
+      yield { type: "thinking", text: "kept attempt" };
+      yield { type: "text", text: "ok" };
+      yield { type: "done", result: { text: "ok", toolCalls: [], reasoningText: "kept attempt" } };
+    }
+  };
+  const store = new MemoryStateStore();
+  const keyPool = new CursorKeyPool(store);
+  await keyPool.seedFromEnv(["key-a", "key-b"]);
+  const result = await new KeyRotatingRunner(inner, keyPool).run({
+    protocol: "openai-chat",
+    apiKey: "",
+    useKeyPool: true,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    stream: false,
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  });
+  assert.equal(result.text, "ok");
+  assert.equal(result.reasoningText, "kept attempt");
+});
+
+test("non-streaming responses include a reasoning item and reasoning token details", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ thinking: ["pondering"], text: "answer" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Say hello" }
+  });
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+  assert.deepEqual(body.output.map((item: { type: string }) => item.type), ["reasoning", "message"]);
+  assert.deepEqual(body.output[0].summary, [{ type: "summary_text", text: "pondering" }]);
+  assert.match(body.output[0].id, /^rs_/);
+  assert.equal(body.usage.output_tokens_details.reasoning_tokens, 3);
+  assert.ok(body.usage.output_tokens >= body.usage.output_tokens_details.reasoning_tokens);
+});

@@ -137,6 +137,8 @@ export interface CursorRunRequest {
 export interface CursorRunResult {
   text: string;
   toolCalls: GatewayToolCall[];
+  /** 非流式聚合出的思考全文（流式下思考已逐块发出，这里只服务 run()）。 */
+  reasoningText?: string;
   agentId?: string;
   runId?: string;
 }

@@ -46,13 +46,16 @@ export class KeyRotatingRunner implements CursorRunner {
   async run(input: CursorRunRequest, signal?: AbortSignal): Promise<CursorRunResult> {
     let result: CursorRunResult | undefined;
     let text = "";
+    let reasoningText = "";
     const toolCalls: GatewayToolCall[] = [];
     for await (const event of this.stream(input, signal)) {
       if (event.type === "text") text += event.text;
+      if (event.type === "thinking") reasoningText += event.text;
       if (event.type === "tool_call") toolCalls.push(event.toolCall);
       if (event.type === "done") result = event.result;
     }
-    return result ?? { text, toolCalls };
+    // 只信 done 的 result：换 key 重试时本地累积会把失败尝试的 thinking 拼进成功尝试的响应。
+    return result ?? { text, toolCalls, ...(reasoningText ? { reasoningText } : {}) };
   }
 
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
