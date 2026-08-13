@@ -48,11 +48,15 @@ Web 管理后台 key 池示例：
 
 ### 2. 启动 Docker 服务
 
-`docker-compose.yml` 默认加入外部网络 `shared_proxy`，首次部署先创建一次：
+```bash
+docker compose up --build -d
+```
+
+compose 只用项目自带的默认网络，不需要预先创建任何 docker network。若要把网关挂到宿主机上已有的共享反代网络，叠加 `docker-compose.shared-proxy.yml`（网络名默认 `shared_proxy`，可用 `PROXY_NETWORK` 覆盖）：
 
 ```bash
-docker network create shared_proxy
-docker compose up --build -d
+docker network create shared_proxy   # 仅首次，已存在则跳过
+docker compose -f docker-compose.yml -f docker-compose.shared-proxy.yml up --build -d
 ```
 
 本机验证：
@@ -124,13 +128,12 @@ http://127.0.0.1:8787/admin
 
 ## 运行
 
-compose 使用外部共享网络 `shared_proxy`（用于挂接反向代理），首次部署需先创建：
-
 ```bash
-docker network create shared_proxy
 cp .env.example .env
 docker compose up --build -d
 ```
+
+默认只用 compose 自建的项目网络，无需预先创建 docker network。需要挂接已有的共享反代网络时，见上文的 `docker-compose.shared-proxy.yml` 叠加用法。
 
 服务默认监听：
 

@@ -1,0 +1,19 @@
+# 可选叠加：把网关挂到宿主机上一个已存在的外部 docker 网络（通常是共享的 nginx/caddy 反代网络）。
+# 基础 docker-compose.yml 不依赖任何外部网络，开箱即用；只有需要接反代时才叠加本文件。
+#
+# 用法（网络名默认 shared_proxy，可用 PROXY_NETWORK 覆盖）：
+#   docker network create shared_proxy   # 仅首次，若网络已存在则跳过
+#   docker compose -f docker-compose.yml -f docker-compose.shared-proxy.yml up --build -d
+#
+# 也可以在 .env 里写一行 COMPOSE_FILE=docker-compose.yml:docker-compose.shared-proxy.yml，
+# 之后照常 `docker compose up -d` 即可自动带上本文件（Windows 下分隔符为 `;`）。
+services:
+  composer-api:
+    networks:
+      - default
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-shared_proxy}

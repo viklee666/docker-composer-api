@@ -2,9 +2,9 @@ services:
   composer-api:
     build:
       context: .
-    # 仅绑定本机回环用于调试；外部流量一律经 shared_proxy 网络上的 nginx 反代
-    # （nginx 直接 proxy_pass http://composer-api:8787，不依赖此端口映射）。
-    # 如需彻底不暴露宿主机端口，删除下面两行即可。
+    # 仅绑定本机回环用于调试。外部流量建议经反向代理接入，反代与网关在同一 docker 网络时
+    # 直接 proxy_pass http://composer-api:8787 即可，不依赖此端口映射。
+    # 如需彻底不暴露宿主机端口，删除下面两行；如需从内网其他机器直连，改成 "${PORT:-8787}:8787"。
     ports:
       - "127.0.0.1:${PORT:-8787}:8787"
     env_file:
@@ -18,15 +18,10 @@ services:
     volumes:
       - composer-api-data:/data
       - composer-api-workspace:/workspace
-    networks:
-      - proxy
     restart: unless-stopped
+    # 不声明 networks：Compose 会自动创建并接入项目默认网络，开箱即用、无需预建任何 docker network。
+    # 要挂接宿主机上已有的共享反代网络，叠加 docker-compose.shared-proxy.yml（见该文件顶部说明）。
 
 volumes:
   composer-api-data:
   composer-api-workspace:
-
-networks:
-  proxy:
-    external: true
-    name: shared_proxy
