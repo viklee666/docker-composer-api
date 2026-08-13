@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { ApiError, raceWithAbort } from "./errors.js";
-import { classifyErrorText, classifyKeyFailure, errorMessage, isRateLimitError } from "./key-pool.js";
+import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { parseToolCallJson, parseToolMarkers } from "./protocol.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
@@ -10,6 +10,7 @@ import type {
   CursorRunResult,
   CursorRunner,
   CursorStreamEvent,
+  ExecutorLeaseManager,
   GatewayToolCall,
   ModelParameterValue,
   StateStore
@@ -59,6 +60,11 @@ export class CursorSdkRunner implements CursorRunner {
       localAgentStore?: object;
       /** 用于按模型发现目录（Cursor.models.list() 的参数定义 + variants），把思考强度/Max Mode 等语义意图解析成合法 model.params。 */
       getModelCatalog?: (modelId: string, apiKey?: string) => Promise<ModelCatalog | undefined>;
+      /**
+       * SDK 共享本地执行器的预热租约管理。上游鉴权失败会被执行器的鉴权闭包永久缓存，
+       * 必须释放租约让引用计数归零、SDK dispose 掉它，否则这把 key 之后的每个请求都会秒失败到进程重启。
+       */
+      executorLeases?: ExecutorLeaseManager;
     },
     private readonly agentFactory?: AgentFactory
   ) {}
@@ -83,13 +89,35 @@ export class CursorSdkRunner implements CursorRunner {
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     if (signal?.aborted) throw new ApiError("Request was aborted.", 499, "request_aborted");
     const id = sessionId(input);
-    // stateless 模式（默认）下每请求都是独立 fresh agent，没有共享会话状态需要保护；
-    // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
-    if (this.input.disableSessionResume) {
-      yield* this.streamLocked(input, signal, id);
-      return;
+    try {
+      // stateless 模式（默认）下每请求都是独立 fresh agent，没有共享会话状态需要保护；
+      // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
+      if (this.input.disableSessionResume) {
+        yield* this.streamLocked(input, signal, id);
+        return;
+      }
+      yield* this.withSessionLock(id, () => this.streamLocked(input, signal, id));
+    } catch (error) {
+      await this.recycleExecutorOnAuthFailure(input, error);
+      throw error;
     }
-    yield* this.withSessionLock(id, () => this.streamLocked(input, signal, id));
+  }
+
+  /**
+   * 上游鉴权失败会被 SDK 共享执行器的鉴权闭包永久缓存（无 TTL、无重置路径），
+   * 此后该执行器上的每个请求都立刻重抛同一个错误。释放预热租约让引用计数能归零，
+   * SDK 才会 dispose 掉它，下一个请求拿到全新执行器与全新鉴权闭包。
+   */
+  private async recycleExecutorOnAuthFailure(input: CursorRunRequest, error: unknown): Promise<void> {
+    const leases = this.input.executorLeases;
+    if (!leases || !input.apiKey || !indicatesUpstreamAuthFailure(error)) return;
+    const workingDirectory = input.workingDirectory || this.input.defaultWorkingDirectory;
+    // 唯一能证明回收真的触发过的信号：不打日志的话，线上只能看到 502 消失，无从判断是修复生效还是故障没复现。
+    console.error(
+      `[executor] recycling shared Cursor executor after an upstream auth failure ` +
+      `key=${maskKey(input.apiKey)} cwd=${workingDirectory} model="${input.model}": ${errorMessage(error).slice(0, 200)}`
+    );
+    await leases.recycle(input.apiKey, workingDirectory).catch(() => undefined);
   }
 
   private async *streamLocked(input: CursorRunRequest, signal: AbortSignal | undefined, id: string): AsyncIterable<CursorStreamEvent> {

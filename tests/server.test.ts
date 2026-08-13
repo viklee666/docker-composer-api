@@ -7,7 +7,8 @@ import { test } from "node:test";
 import { createEphemeralAgentStore } from "../src/agent-store.js";
 import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError, openAiErrorType, openAiStatus } from "../src/errors.js";
 import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
-import { CursorKeyPool, classifyKeyFailure, type AutoDisablePolicy } from "../src/key-pool.js";
+import { ExecutorWarmPool } from "../src/executor-warmup.js";
+import { CursorKeyPool, classifyKeyFailure, indicatesUpstreamAuthFailure, type AutoDisablePolicy } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
 import type { ModelLister } from "../src/models.js";
@@ -311,6 +312,166 @@ test("classifyKeyFailure distinguishes quota, auth, and transient errors", () =>
     classifyKeyFailure(new ApiError("Cursor upstream run ended in error: quota/credit exhausted", 502, "upstream_run_failed")),
     "transient"
   );
+});
+
+test("indicatesUpstreamAuthFailure covers exactly the failures the SDK auth closure caches forever", () => {
+  assert.equal(indicatesUpstreamAuthFailure(new Error("Invalid API key provided")), true);
+  assert.equal(indicatesUpstreamAuthFailure(Object.assign(new Error("nope"), { status: 401 })), true);
+  assert.equal(
+    indicatesUpstreamAuthFailure(new Error("Authentication error. If you are logged in, try logging out and back in.")),
+    true
+  );
+  // SDK 自己的 key 兑换失败文案：正是被永久缓存进鉴权闭包的那个错误。
+  assert.equal(
+    indicatesUpstreamAuthFailure(new Error("API key exchange succeeded but returned no access token.")),
+    true
+  );
+  // 额度/限流/网络错误不会被鉴权闭包缓存，回收执行器无济于事，也不该白丢预热。
+  assert.equal(indicatesUpstreamAuthFailure(new Error("You have hit your usage limit")), false);
+  assert.equal(indicatesUpstreamAuthFailure(new Error("Rate limit exceeded, retry later")), false);
+  assert.equal(indicatesUpstreamAuthFailure(new Error("connect ETIMEDOUT")), false);
+});
+
+test("ExecutorWarmPool releases the prewarm lease on recycle and cools down before warming again", async () => {
+  let prewarmCount = 0;
+  let releaseCount = 0;
+  let now = 1_000;
+  const pool = new ExecutorWarmPool({
+    loadPlatform: async () => ({
+      prewarmLocalWorkspace: async () => {
+        prewarmCount += 1;
+        return async () => {
+          releaseCount += 1;
+        };
+      }
+    }),
+    cooldownMs: 60_000,
+    now: () => now
+  });
+
+  await pool.warm("key-a", "/workspace");
+  assert.equal(prewarmCount, 1);
+  // 已持有租约时重复预热不能再抓一次引用，否则引用计数永远回不到 0。
+  await pool.warm("key-a", "/workspace");
+  assert.equal(prewarmCount, 1);
+  assert.equal(pool.size, 1);
+
+  await pool.recycle("key-a", "/workspace");
+  assert.equal(releaseCount, 1, "回收必须真的释放租约，SDK 才可能 dispose 掉坏执行器");
+  assert.equal(pool.size, 0);
+
+  // 冷却窗口内不重新预热：要留时间让在途请求收尾、引用计数归零。
+  await pool.warm("key-a", "/workspace");
+  assert.equal(prewarmCount, 1);
+  assert.equal(pool.size, 0);
+
+  now += 60_001;
+  await pool.warm("key-a", "/workspace");
+  assert.equal(prewarmCount, 2);
+
+  await pool.releaseAll();
+  assert.equal(releaseCount, 2);
+  assert.equal(pool.size, 0);
+});
+
+test("ExecutorWarmPool releases a prewarm lease that lands after recycle", async () => {
+  let releaseCount = 0;
+  let startPrewarm!: () => void;
+  const prewarmGate = new Promise<void>((resolve) => {
+    startPrewarm = resolve;
+  });
+  const pool = new ExecutorWarmPool({
+    loadPlatform: async () => ({
+      prewarmLocalWorkspace: async () => {
+        await prewarmGate;
+        return async () => {
+          releaseCount += 1;
+        };
+      }
+    })
+  });
+
+  const warming = pool.warm("key-a", "/workspace");
+  // 预热尚未落地就回收：晚到的租约必须立刻自行释放，否则它会变成谁也解不掉的引用。
+  const recycling = pool.recycle("key-a", "/workspace");
+  startPrewarm();
+  await Promise.all([warming, recycling]);
+
+  assert.equal(releaseCount, 1);
+  assert.equal(pool.size, 0);
+});
+
+test("upstream auth failures recycle the shared SDK executor so a poisoned auth closure cannot wedge the key", async () => {
+  const recycled: string[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      throw Object.assign(new Error("Invalid API Key"), { status: 401, code: "unauthenticated" });
+    }
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), {
+    defaultWorkingDirectory: "/workspace",
+    sdkClientVersion: "test",
+    executorLeases: {
+      warm: async () => undefined,
+      recycle: async (apiKey, cwd) => {
+        recycled.push(`${apiKey}@${cwd}`);
+      }
+    }
+  }, factory);
+
+  await assert.rejects(
+    () => runner.run({
+      protocol: "openai-chat",
+      apiKey: "cursor-key",
+      useKeyPool: false,
+      model: "composer-2.5",
+      prompt: "hello",
+      sessionKey: "session",
+      workingDirectory: "/workspace",
+      images: [],
+      tools: []
+    }),
+    (error) => error instanceof ApiError && error.statusCode === 401
+  );
+  assert.deepEqual(recycled, ["cursor-key@/workspace"]);
+});
+
+test("quota failures keep the prewarmed executor instead of throwing away the warm start", async () => {
+  const recycled: string[] = [];
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-quota",
+      send: async () => new FakeSdkRun({
+        waitResult: { status: "error", error: { message: "You have hit your usage limit." } }
+      })
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), {
+    defaultWorkingDirectory: "/workspace",
+    sdkClientVersion: "test",
+    executorLeases: {
+      warm: async () => undefined,
+      recycle: async (apiKey, cwd) => {
+        recycled.push(`${apiKey}@${cwd}`);
+      }
+    }
+  }, factory);
+
+  await assert.rejects(
+    () => runner.run({
+      protocol: "openai-chat",
+      apiKey: "cursor-key",
+      useKeyPool: false,
+      model: "composer-2.5",
+      prompt: "hello",
+      sessionKey: "session",
+      workingDirectory: "/workspace",
+      images: [],
+      tools: []
+    }),
+    (error) => error instanceof ApiError && error.statusCode === 402
+  );
+  assert.deepEqual(recycled, []);
 });
 
 test("upstreamRunError decouples run-error detail into codes so real bad keys get disabled", () => {

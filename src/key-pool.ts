@@ -209,6 +209,23 @@ export function classifyErrorText(text: string): "quota" | "auth" | undefined {
   return undefined;
 }
 
+/**
+ * 错误是否属于「上游鉴权失败」。用于判断要不要回收 SDK 的共享本地执行器：
+ * 执行器的鉴权拦截器把「API key → access token 兑换」的失败**永久**缓存在闭包里，
+ * 命中之后该执行器上的每个请求都立刻重抛同一个错误，没有 TTL 也没有自愈路径，
+ * 只有执行器被 dispose 才能恢复。
+ * 覆盖三类：明确的 401/无效 key、Cursor 会话态认证抖动、SDK 自己的 key 兑换失败文案。
+ * 额度类失败不在此列——它不会被闭包缓存，回收执行器解决不了问题。
+ */
+export function indicatesUpstreamAuthFailure(error: unknown): boolean {
+  const { statuses, text } = collectErrorInfo(error);
+  if (statuses.includes(429) || /rate[ _-]?limit/i.test(text)) return false;
+  if (SESSION_AUTH_HICCUP.test(text)) return true;
+  if (/api key exchange|no access token|unauthenticated/i.test(text)) return true;
+  if (statuses.includes(401)) return true;
+  return classifyErrorText(text) === "auth";
+}
+
 /** 上游临时性 429 / rate limit：不该轮换 key，也不该按 500 透出，应映射成 429 让客户端退避重试。 */
 export function isRateLimitError(error: unknown): boolean {
   const { statuses, text } = collectErrorInfo(error);

@@ -156,6 +156,16 @@ export type CursorStreamEvent =
   | { type: "tool_call"; toolCall: GatewayToolCall }
   | { type: "done"; result: CursorRunResult };
 
+/**
+ * Cursor SDK 共享本地执行器的预热租约管理。
+ * warm 让执行器留在 SDK 的进程内缓存里省掉冷启动；recycle 释放租约并冷却，
+ * 让引用计数能归零、SDK 得以 dispose 掉鉴权闭包已被污染的执行器。
+ */
+export interface ExecutorLeaseManager {
+  warm(apiKey: string, workingDirectory: string): Promise<void>;
+  recycle(apiKey: string, workingDirectory: string): Promise<void>;
+}
+
 export interface CursorRunner {
   run(input: CursorRunRequest, signal?: AbortSignal): Promise<CursorRunResult>;
   stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent>;

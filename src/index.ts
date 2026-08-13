@@ -1,6 +1,7 @@
 import { createEphemeralAgentStore } from "./agent-store.js";
 import { loadConfig } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
+import { ExecutorWarmPool, type WarmupPlatform } from "./executor-warmup.js";
 import {
   loadAutoDisableKeys,
   loadAutoDisableThreshold,
@@ -39,11 +40,25 @@ const keyPool = new CursorKeyPool(store, {
 });
 await keyPool.seedFromEnv(config.cursorApiKeys);
 
+// SDK 的本地执行器在进程内按 (工作目录, apiKey, settingSources …) 共享并引用计数，
+// 而它的鉴权拦截器会把「API key 兑换 access token」的失败永久缓存在闭包里（无 TTL、无重置路径），
+// 只有引用计数归零、执行器被 dispose 才能恢复。因此预热租约必须由网关保管：
+// 上游报鉴权错误时释放它，让坏执行器能被回收，而不是一直钉在缓存里让后续请求全部 502。
+const executorLeases = new ExecutorWarmPool({
+  loadPlatform: async () => {
+    const sdk = await import("@cursor/sdk") as {
+      createAgentPlatform?: () => Promise<WarmupPlatform>;
+    };
+    return sdk.createAgentPlatform ? sdk.createAgentPlatform() : undefined;
+  }
+});
+
 const sdkRunner = new CursorSdkRunner(store, {
   defaultWorkingDirectory: config.cursorWorkingDirectory,
   sdkClientVersion: config.sdkClientVersion,
   disableSessionResume: config.cursorSdkDisableSessionResume,
   allowBuiltinTools: config.cursorAllowBuiltinTools,
+  executorLeases,
   // stateless（默认）：agent 记录无需跨请求持久化，共享有界内存 store，
   // 规避 SDK 默认 SqliteLocalAgentStore 每 agent 泄漏内核句柄的问题。
   // 开启 session resume 时保留 SDK 默认持久化存储（恢复依赖跨请求/跨重启的记录）。
@@ -70,23 +85,29 @@ if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1
 
 // 启动即预热 SDK：默认路径下 SDK 是首个请求才懒加载的，冷加载 + 本地执行器初始化会拖慢首请求的首 token。
 // 预热失败不影响服务（首请求会再走懒加载）。
+// 预热拿到的租约必须交给 executorLeases 保管而不是丢弃：丢掉 release 等于给共享执行器永久加了一个引用，
+// 引用计数再也回不到 0，鉴权闭包一旦被污染就只能靠重启进程恢复。
 void (async () => {
   try {
-    const sdk = await import("@cursor/sdk") as {
-      createAgentPlatform?: () => Promise<{ prewarmLocalWorkspace?: (options: Record<string, unknown>) => Promise<() => Promise<void>> }>;
-    };
+    await import("@cursor/sdk");
     console.log("Cursor SDK preloaded");
     const poolKey = (await keyPool.list()).find((key) => key.status === "active");
-    if (!sdk.createAgentPlatform || !poolKey) return;
+    if (!poolKey) return;
     // 预扫描工作区（规则/忽略文件等），让首个 send() 少一段准备时间。
-    // 返回的 release 函数用于停止缓存维护；网关生命周期内持续复用工作区，不调用。
-    const platform = await sdk.createAgentPlatform();
-    await platform.prewarmLocalWorkspace?.({
-      apiKey: poolKey.apiKey,
-      local: { cwd: config.cursorWorkingDirectory, settingSources: [] }
-    });
+    await executorLeases.warm(poolKey.apiKey, config.cursorWorkingDirectory);
     console.log("Cursor workspace prewarmed");
   } catch (error) {
     console.error(`[prewarm] Cursor SDK preload failed (first request will lazy-load): ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
   }
 })();
+
+// 关停时释放全部预热租约，让 SDK 能 dispose 共享执行器，而不是把本地执行器的句柄留到进程被强杀。
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    void (async () => {
+      await executorLeases.releaseAll();
+      await app.close().catch(() => undefined);
+      process.exit(0);
+    })();
+  });
+}
