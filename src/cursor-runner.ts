@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
-import { ApiError } from "./errors.js";
-import { classifyErrorText, classifyKeyFailure, errorMessage } from "./key-pool.js";
+import { ApiError, raceWithAbort } from "./errors.js";
+import { classifyErrorText, classifyKeyFailure, errorMessage, isRateLimitError } from "./key-pool.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { parseToolCallJson, parseToolMarkers } from "./protocol.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
@@ -52,6 +52,11 @@ export class CursorSdkRunner implements CursorRunner {
       disableSessionResume?: boolean;
       /** 允许 agent 在网关容器内使用内置工具（默认 false：SDK >=1.0.27 下用 tools 限制为纯文本/仅 MCP）。 */
       allowBuiltinTools?: boolean;
+      /**
+       * 注入给每个 agent 的共享 LocalAgentStore。SDK 默认的 SqliteLocalAgentStore 按 agent 各开一份，
+       * 每次请求泄漏约 7~8 个内核句柄且 dispose 不回收；stateless 模式下传入网关的有界内存 store 规避。
+       */
+      localAgentStore?: object;
       /** 用于按模型发现目录（Cursor.models.list() 的参数定义 + variants），把思考强度/Max Mode 等语义意图解析成合法 model.params。 */
       getModelCatalog?: (modelId: string, apiKey?: string) => Promise<ModelCatalog | undefined>;
     },
@@ -89,12 +94,14 @@ export class CursorSdkRunner implements CursorRunner {
 
   private async *streamLocked(input: CursorRunRequest, signal: AbortSignal | undefined, id: string): AsyncIterable<CursorStreamEvent> {
     const factory = this.agentFactory ?? await this.loadAgentFactory();
-    const resolved = await this.resolveModelRun(input);
+    // 目录拉取 / agent 创建 / send 这些 SDK 调用可能既不 settle 也不感知 signal（上游传输挂死）。
+    // 全部与 abort 竞速：空闲超时或客户端断连时请求一定能收尾，而不是永久悬挂、随流量持续堆积句柄与内存。
+    const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
     const existingAgentId = this.input.disableSessionResume ? undefined : await this.store.getSession(id);
     let resumedAgent: AgentLike | undefined;
     if (existingAgentId && typeof factory.resume === "function") {
       try {
-        resumedAgent = await factory.resume(existingAgentId, this.agentOptions(input, resolved));
+        resumedAgent = await raceCreateAgent(factory.resume(existingAgentId, this.agentOptions(input, resolved)), signal);
       } catch (error) {
         const keyError = keySemanticApiError(input.model, error);
         if (keyError) throw keyError;
@@ -114,7 +121,7 @@ export class CursorSdkRunner implements CursorRunner {
       }
     }
 
-    const agent = await factory.create(this.agentOptions(input, resolved)).catch((error) => {
+    const agent = await raceCreateAgent(factory.create(this.agentOptions(input, resolved)), signal).catch((error) => {
       throw keySemanticApiError(input.model, error) ?? modelUnavailableError(error) ?? error;
     });
     yield* this.runWithAgent(agent, input, signal, id, resolved);
@@ -186,7 +193,7 @@ export class CursorSdkRunner implements CursorRunner {
       const onDelta = (args: { update: unknown }) => {
         queue.push({ kind: "delta", update: args?.update });
       };
-      const run = await this.sendWithOptionalCustomTools(agent, input, customTools, resolved, onDelta);
+      const run = await this.sendWithOptionalCustomTools(agent, input, customTools, resolved, onDelta, signal);
       activeRun = run;
       // abort 必须能唤醒空队列等待，否则超时/断连时上游无事件的 run 会永久挂住。
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -214,7 +221,8 @@ export class CursorSdkRunner implements CursorRunner {
       let textSource: "none" | "delta" | "message" = "none";
       let thinkingSource: "none" | "delta" | "message" = "none";
       let streamError: unknown;
-      const cancelRun = () => run.cancel?.().catch(() => undefined);
+      // cancel 也走坏传输时可能挂死：加时长上限，别让工具调用下发/abort 收尾被它堵住。
+      const cancelRun = () => withCleanupTimeout(run.cancel?.().catch(() => undefined));
       // 过滤 marker/事件里未被客户端声明的工具调用（转发只会让客户端报 unknown tool）。
       const keepDeclaredOnly = (calls: GatewayToolCall[]): GatewayToolCall[] => calls.filter((toolCall) => {
         if (input.tools.length && matchesClientTool(toolCall, input.tools)) return true;
@@ -406,8 +414,9 @@ export class CursorSdkRunner implements CursorRunner {
     } finally {
       signal?.removeEventListener("abort", onAbort);
       // 消费方提前终止（客户端断连触发生成器 return()）时兜底取消 run，避免上游继续跑。
-      if (!finishedNormally && activeRun) await activeRun.cancel?.().catch(() => undefined);
-      await disposeAgent(agent);
+      // cancel/dispose 都带时长上限：清理挂死不能反过来堵住生成器的 return()/throw() 路径。
+      if (!finishedNormally && activeRun) await withCleanupTimeout(activeRun.cancel?.().catch(() => undefined));
+      await withCleanupTimeout(disposeAgent(agent));
     }
   }
 
@@ -416,7 +425,8 @@ export class CursorSdkRunner implements CursorRunner {
     input: CursorRunRequest,
     customTools: Record<string, unknown> | undefined,
     resolved: ResolvedModelRun,
-    onDelta: (args: { update: unknown }) => void
+    onDelta: (args: { update: unknown }) => void,
+    signal: AbortSignal | undefined
   ): Promise<RunLike> {
     const options = () => ({
       model: resolved.model,
@@ -424,9 +434,10 @@ export class CursorSdkRunner implements CursorRunner {
       onDelta,
       ...(resolved.mode ? { mode: resolved.mode } : {})
     });
-    if (!customTools) return agent.send(this.sdkMessage(input), options());
+    const send = (opts: Record<string, unknown>) => raceSendRun(agent.send(this.sdkMessage(input), opts), signal);
+    if (!customTools) return send(options());
     try {
-      return await agent.send(this.sdkMessage(input), {
+      return await send({
         ...options(),
         local: { customTools }
       });
@@ -434,7 +445,7 @@ export class CursorSdkRunner implements CursorRunner {
       const keyError = keySemanticApiError(input.model, error);
       if (keyError) throw keyError;
       if (!isCustomToolsUnsupportedError(error)) throw error;
-      return agent.send(this.sdkMessage(input), options());
+      return send(options());
     }
   }
 
@@ -453,7 +464,11 @@ export class CursorSdkRunner implements CursorRunner {
       name: "Docker Composer API",
       // settingSources: [] 显式关闭环境规则加载，绝不把调用方机器/项目/团队的 Cursor 规则
       //（~/.cursor、.cursor/rules、AGENTS.md 等）注入到请求里，避免夹带额外提示词。
-      local: { cwd: input.workingDirectory || this.input.defaultWorkingDirectory, settingSources: [] },
+      local: {
+        cwd: input.workingDirectory || this.input.defaultWorkingDirectory,
+        settingSources: [],
+        ...(this.input.localAgentStore ? { store: this.input.localAgentStore } : {})
+      },
       clientVersion: this.input.sdkClientVersion,
       // SDK >=1.0.27 的内置工具限制：无客户端工具 → []（纯文本，agent 不能动网关容器的文件/命令）；
       // 有客户端工具 → 只留 "mcp" 元工具通道（send 时注入的 customTools 经 custom-user-tools MCP server 暴露）。
@@ -497,27 +512,50 @@ function logDeduped(key: string, message: string): void {
   console.error(message);
 }
 
-/** 让一个 promise 可被 AbortSignal 打断（abort → 499）；正常 settle 时清理监听器。 */
-function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) {
-    promise.catch(() => undefined);
-    return Promise.reject(new ApiError("Request was aborted.", 499, "request_aborted"));
-  }
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new ApiError("Request was aborted.", 499, "request_aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
+/** 清理型调用（cancel/dispose）的最长等待：坏传输上挂死的清理不应堵住请求收尾。 */
+const CLEANUP_TIMEOUT_MS = 5_000;
+
+/** 给清理型 promise 加时长上限，超时/失败都按放弃处理（残留资源交给进程级回收兜底）。 */
+function withCleanupTimeout(promise: Promise<unknown> | undefined, ms = CLEANUP_TIMEOUT_MS): Promise<void> {
+  if (!promise) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(), ms);
+    timer.unref?.();
     promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
+      () => {
+        clearTimeout(timer);
+        resolve();
       },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error instanceof Error ? error : new Error(String(error)));
+      () => {
+        clearTimeout(timer);
+        resolve();
       }
     );
   });
+}
+
+/** agent 创建/恢复与 abort 竞速：abort 赢时，晚到的 agent 也必须释放（本地执行器持有句柄与缓存）。 */
+async function raceCreateAgent(pending: Promise<AgentLike>, signal: AbortSignal | undefined): Promise<AgentLike> {
+  try {
+    return await raceWithAbort(pending, signal);
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "request_aborted") {
+      pending.then((agent) => void disposeAgent(agent)).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+/** send 与 abort 竞速：abort 赢时上游 run 可能已经启动，晚到后补一次 best-effort 取消。 */
+async function raceSendRun(pending: Promise<RunLike>, signal: AbortSignal | undefined): Promise<RunLike> {
+  try {
+    return await raceWithAbort(pending, signal);
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "request_aborted") {
+      pending.then((run) => void run.cancel?.().catch(() => undefined)).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 function logDroppedIntent(model: string, dropped: string[], usedFallback: boolean): void {
@@ -796,9 +834,18 @@ function modelUnavailableError(error: unknown): ApiError | undefined {
 
 function keySemanticApiError(model: string, error: unknown): ApiError | undefined {
   if (error instanceof ApiError) return error;
-  const failure = classifyKeyFailure(error);
   const message = errorMessage(error);
   const detail = message === "{}" ? "" : message;
+  // 上游按 key 限速（如 get_models 每分钟 30 次）：对客户端必须是 429（可退避重试），不是笼统 500。
+  if (isRateLimitError(error)) {
+    return new ApiError(
+      `Cursor upstream rate limited the request for model "${model}": ${detail || "rate limit exceeded"}. ` +
+      "Retry after a short backoff; concurrent bursts on a single key hit Cursor's per-key rate limits.",
+      429,
+      "rate_limit_exceeded"
+    );
+  }
+  const failure = classifyKeyFailure(error);
   if (failure === "quota") {
     return new ApiError(
       `Cursor upstream rejected the request for model "${model}": ${detail || "quota/credit exhausted"}. ` +

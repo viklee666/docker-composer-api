@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import { createEphemeralAgentStore } from "../src/agent-store.js";
 import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError, openAiErrorType, openAiStatus } from "../src/errors.js";
-import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory } from "../src/cursor-runner.js";
+import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
 import { CursorKeyPool, classifyKeyFailure } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
@@ -942,6 +943,111 @@ test("CursorSdkRunner maps SDK create auth errors to 401 instead of generic 500"
     }),
     (error) => error instanceof ApiError && error.statusCode === 401 && error.code === "unauthorized"
   );
+});
+
+test("CursorSdkRunner maps upstream per-key rate limits to 429 instead of generic 500", async () => {
+  // 真机复现：单 key 并发突发触发 Cursor "30 requests per minute for the get_models endpoint"。
+  const factory: AgentFactory = {
+    create: async () => {
+      throw new Error("You have exceeded the rate limit of 30 requests per minute for the get_models endpoint (request ID: req-x)");
+    }
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+
+  await assert.rejects(
+    () => runner.run({
+      protocol: "openai-chat",
+      apiKey: "cursor-key",
+      useKeyPool: false,
+      model: "composer-2.5",
+      prompt: "hello",
+      sessionKey: "session",
+      workingDirectory: "/workspace",
+      images: [],
+      tools: []
+    }),
+    (error) => error instanceof ApiError && error.statusCode === 429 && error.code === "rate_limit_exceeded"
+  );
+});
+
+test("CursorSdkRunner aborts hung agent creation and disposes the late-arriving agent", { timeout: 5000 }, async () => {
+  // SDK 传输层挂死时 Agent.create 既不 resolve 也不 reject：abort 必须能打断，
+  // 且晚到的 agent（本地执行器持有句柄/缓存）也要被释放，否则每个挂死请求都是一份泄漏。
+  let closeCount = 0;
+  let resolveCreate!: (agent: AgentLike) => void;
+  const factory: AgentFactory = {
+    create: () => new Promise<AgentLike>((resolve) => {
+      resolveCreate = resolve;
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const controller = new AbortController();
+  const pending = runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  }, controller.signal);
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(() => pending, (error) => error instanceof ApiError && error.statusCode === 499 && error.code === "request_aborted");
+
+  resolveCreate({
+    agentId: "agent-late",
+    send: async () => new FakeSdkRun(),
+    close: () => {
+      closeCount += 1;
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closeCount, 1, "late-arriving agent must still be disposed");
+});
+
+test("CursorSdkRunner aborts hung send calls, cancels the late run and disposes the agent", { timeout: 5000 }, async () => {
+  let closeCount = 0;
+  let cancelCount = 0;
+  let resolveSend!: (run: { id?: string; stream: () => AsyncIterable<unknown>; wait: () => Promise<unknown>; cancel: () => Promise<void> }) => void;
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-hung-send",
+      send: () => new Promise((resolve) => {
+        resolveSend = resolve;
+      }),
+      close: () => {
+        closeCount += 1;
+      }
+    })
+  };
+  const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
+  const controller = new AbortController();
+  const pending = runner.run({
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  }, controller.signal);
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(() => pending, (error) => error instanceof ApiError && error.statusCode === 499 && error.code === "request_aborted");
+  assert.equal(closeCount, 1, "agent must be disposed even when send never settled before abort");
+
+  resolveSend({
+    stream: async function* () { /* 无事件 */ },
+    wait: async () => ({ status: "cancelled" }),
+    cancel: async () => {
+      cancelCount += 1;
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(cancelCount, 1, "late-arriving run must be cancelled to stop the upstream");
 });
 
 test("CursorSdkRunner disposes SDK agents after successful runs", async () => {
@@ -2684,6 +2790,10 @@ class FakeRunner implements CursorRunner {
     hangUntilAborted?: boolean;
     /** 吐完 thinking/chunks 后再挂住，用于验证流中途的空闲超时（区别于首事件前超时）。 */
     hangAfterChunks?: boolean;
+    /** 完全无视 abort signal 的永久挂死（模拟 SDK 传输层卡死），验证请求级竞速兜底。 */
+    hangIgnoringAbort?: boolean;
+    /** 吐完 chunks 后无视 abort 永久挂死，验证流中途的竞速兜底。 */
+    hangAfterChunksIgnoringAbort?: boolean;
   } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
@@ -2691,6 +2801,7 @@ class FakeRunner implements CursorRunner {
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    if (this.output.hangIgnoringAbort) await new Promise(() => undefined);
     return {
       text: this.output.text ?? "ok",
       toolCalls: this.output.toolCalls ?? [],
@@ -2704,6 +2815,7 @@ class FakeRunner implements CursorRunner {
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    if (this.output.hangIgnoringAbort) await new Promise(() => undefined);
     if (this.output.hangUntilAborted) await abortedPromise(signal);
     for (const thinking of this.output.thinking ?? []) {
       yield { type: "thinking", text: thinking };
@@ -2715,6 +2827,7 @@ class FakeRunner implements CursorRunner {
       yield { type: "text", text: chunk };
     }
     if (this.output.failMidStream) throw this.output.failMidStream;
+    if (this.output.hangAfterChunksIgnoringAbort) await new Promise(() => undefined);
     if (this.output.hangAfterChunks) await abortedPromise(signal);
     for (const toolCall of this.output.toolCalls ?? []) {
       yield { type: "tool_call", toolCall };
@@ -3651,6 +3764,54 @@ test("mid-stream idle timeouts surface as a 504 timeout error event", { timeout:
   assert.equal(chatLast.error.type, "server_error");
 });
 
+test("requests still time out when the upstream ignores abort signals entirely", { timeout: 5000 }, async () => {
+  // 模拟 SDK 传输层挂死：既不产出事件、也永远不 settle、更不感知 abort signal。
+  // 这类挂死曾让请求永久悬挂堆积（表现为服务器"卡死"），请求级竞速必须兜底成 504。
+  const streaming = await createTestApp({
+    runner: new FakeRunner({ hangIgnoringAbort: true }),
+    config: { requestTimeoutMs: 20 }
+  });
+  const streamResponse = await streaming.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(streamResponse.statusCode, 504);
+  assert.equal(streamResponse.json().error.code, "timeout_error");
+
+  const blocking = await createTestApp({
+    runner: new FakeRunner({ hangIgnoringAbort: true }),
+    config: { requestTimeoutMs: 20 }
+  });
+  const blockingResponse = await blocking.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(blockingResponse.statusCode, 504);
+  assert.equal(blockingResponse.json().error.code, "timeout_error");
+});
+
+test("mid-stream hangs that ignore abort still end with an in-stream 504 error event", { timeout: 5000 }, async () => {
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], hangAfterChunksIgnoringAbort: true }),
+    config: { requestTimeoutMs: 30 }
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /"content":"partial"/);
+  const last = sseFrames(response.body).at(-1)?.data as { error: { type: string; code: string } };
+  assert.equal(last.error.code, "timeout_error");
+  assert.equal(last.error.type, "server_error");
+});
+
 test("upstream failure before the first event returns a plain HTTP error on all stream endpoints", async () => {
   for (const [url, headers, payload] of [
     ["/v1/chat/completions", { authorization: "Bearer direct-cursor-key" }, { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hi" }] }],
@@ -3883,4 +4044,33 @@ test("non-streaming responses include a reasoning item and reasoning token detai
   assert.match(body.output[0].id, /^rs_/);
   assert.equal(body.usage.output_tokens_details.reasoning_tokens, 3);
   assert.ok(body.usage.output_tokens >= body.usage.output_tokens_details.reasoning_tokens);
+});
+
+test("ephemeral agent store round-trips records, pages run events and stays bounded", async () => {
+  const store = createEphemeralAgentStore();
+  await store.agents.create({ agent: { agentId: "a1", cwd: "/w", status: "running", createdAt: 1, updatedAt: 1 } });
+  await store.runs.create({ run: { runId: "r1", agentId: "a1", turnNumber: 1, status: "running", createdAt: 1, updatedAt: 1 } });
+  await store.checkpoints.create({ agentId: "a1", blobId: "b1", data: new Uint8Array([1, 2, 3]) });
+  assert.deepEqual(await store.checkpoints.get({ agentId: "a1", blobId: "b1" }), new Uint8Array([1, 2, 3]));
+  assert.equal((await store.runs.get({ agentId: "a1", runId: "r1" }))?.runId, "r1");
+
+  // 事件流：append 顺序 + afterOffset 精确续读（SDK 的 run.stream 依赖该语义）。
+  await store.runEvents.append({ runId: "r1", eventType: "first", payload: { n: 1 } });
+  await store.runEvents.append({ runId: "r1", eventType: "second", payload: { n: 2 } });
+  const firstPage = await store.runEvents.list({ runId: "r1", limit: 1 });
+  assert.equal(firstPage.items.length, 1);
+  assert.equal(firstPage.items[0].eventType, "first");
+  assert.ok(firstPage.nextOffset);
+  const secondPage = await store.runEvents.list({ runId: "r1", afterOffset: firstPage.nextOffset });
+  assert.deepEqual(secondPage.items.map((event) => event.eventType), ["second"]);
+
+  // 有界性：超过上限后最旧的 agent 连同 runs/blobs/events 一起被回收，不随请求数无限增长。
+  for (let i = 0; i < 300; i += 1) {
+    await store.agents.create({ agent: { agentId: `bulk-${i}`, cwd: "/w", status: "idle", createdAt: i, updatedAt: i } });
+  }
+  assert.equal(await store.agents.get({ agentId: "a1" }), null);
+  assert.equal(await store.checkpoints.get({ agentId: "a1", blobId: "b1" }), null);
+  assert.equal((await store.runEvents.list({ runId: "r1" })).items.length, 0);
+  const listed = await store.agents.list({ filter: { limit: 1000 } });
+  assert.ok(listed.items.length <= 256, `agent buckets must stay bounded, saw ${listed.items.length}`);
 });

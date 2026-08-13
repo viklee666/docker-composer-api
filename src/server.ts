@@ -10,7 +10,8 @@ import {
   normalizeError,
   openAiError,
   openAiErrorPayload,
-  openAiStatus
+  openAiStatus,
+  raceWithAbort
 } from "./errors.js";
 import type { CursorKeyPool } from "./key-pool.js";
 import { errorMessage } from "./key-pool.js";
@@ -323,7 +324,9 @@ async function runWithTimeout(deps: AppDeps, run: Parameters<CursorRunner["run"]
     controller.abort();
   }, deps.config.requestTimeoutMs);
   try {
-    return await deps.runner.run(run, controller.signal);
+    // 双保险：runner 内部已对 SDK 调用做 abort 竞速，这里再对整个 run 竞速一次，
+    // 即使上游出现完全不感知 signal 的挂死，客户端也一定能等到 504 而不是请求永久悬挂。
+    return await raceWithAbort(deps.runner.run(run, controller.signal), controller.signal);
   } catch (error) {
     // 内部 abort 用 499 表达，但非流式请求的客户端还连着：对外必须是 504,而不是一个不存在的 HTTP 语义。
     if (timedOut) throw new ApiError(`Upstream run timed out after ${deps.config.requestTimeoutMs}ms.`, 504, "timeout_error");
@@ -401,7 +404,8 @@ async function openRunnerStream(
   const iterator = deps.runner.stream(run, abort.signal)[Symbol.asyncIterator]();
   let first: IteratorResult<CursorStreamEvent>;
   try {
-    first = await iterator.next();
+    // 与 abort 竞速：上游完全无视 signal 挂死时，空闲超时/断连仍能把请求收尾。
+    first = await raceWithAbort(iterator.next(), abort.signal);
   } catch (error) {
     abort.done();
     const normalized = normalizeError(error);
@@ -421,7 +425,9 @@ async function openRunnerStream(
             deliveredFirst = true;
             return Promise.resolve(first);
           }
-          return iterator.next();
+          // 流中途同样竞速：读事件被无视 signal 的上游挂住时，abort 会以 499 打断，
+          // 由 SSE 生成器的 catch 按语义转成流内 504/断连收尾。
+          return raceWithAbort(iterator.next(), abort.signal);
         },
         return(value?: unknown): Promise<IteratorResult<CursorStreamEvent>> {
           deliveredFirst = true;

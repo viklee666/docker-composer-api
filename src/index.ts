@@ -1,3 +1,4 @@
+import { createEphemeralAgentStore } from "./agent-store.js";
 import { loadConfig } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
 import { loadCursorFastDefault, loadCursorMaxModeDefault } from "./gateway-settings.js";
@@ -32,6 +33,10 @@ const sdkRunner = new CursorSdkRunner(store, {
   sdkClientVersion: config.sdkClientVersion,
   disableSessionResume: config.cursorSdkDisableSessionResume,
   allowBuiltinTools: config.cursorAllowBuiltinTools,
+  // stateless（默认）：agent 记录无需跨请求持久化，共享有界内存 store，
+  // 规避 SDK 默认 SqliteLocalAgentStore 每 agent 泄漏内核句柄的问题。
+  // 开启 session resume 时保留 SDK 默认持久化存储（恢复依赖跨请求/跨重启的记录）。
+  ...(config.cursorSdkDisableSessionResume ? { localAgentStore: createEphemeralAgentStore() } : {}),
   getModelCatalog: getModelCatalogEntry
 });
 const runner = new KeyRotatingRunner(sdkRunner, keyPool, {

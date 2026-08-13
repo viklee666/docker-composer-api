@@ -37,7 +37,7 @@ ALLOW_DIRECT_CURSOR_KEYS=true
 - `GATEWAY_API_KEY` 是客户端调用本项目 API 时使用的网关 key。
 - `ADMIN_PASSWORD` 是 `/admin` 后台密码；留空时会退回使用 `GATEWAY_API_KEY`。
 - `ALLOW_DIRECT_CURSOR_KEYS=true` 时，也允许客户端直接把 Cursor key 当作 API key 传入。
-- `CURSOR_SDK_DISABLE_SESSION_RESUME=true`（默认）时，每次 API 请求都创建 fresh Cursor SDK agent，不恢复旧 agent。OpenAI/Anthropic 客户端本身会把上下文放在请求里，这个模式能避免服务运行一段时间后旧 SDK 会话/远端 agent 状态污染，导致所有请求持续 502。该模式下并发请求不加会话锁，可以真正并行。
+- `CURSOR_SDK_DISABLE_SESSION_RESUME=true`（默认）时，每次 API 请求都创建 fresh Cursor SDK agent，不恢复旧 agent。OpenAI/Anthropic 客户端本身会把上下文放在请求里，这个模式能避免服务运行一段时间后旧 SDK 会话/远端 agent 状态污染，导致所有请求持续 502。该模式下并发请求不加会话锁，可以真正并行；同时网关会给每个 agent 注入共享的有界内存 agent store（自动按闲置时间 + LRU 回收），规避 SDK 默认按 agent 各开一份 SQLite 存储导致的句柄随请求数线性泄漏、长期运行后拖垮进程的问题。
 - `CURSOR_SDK_USE_HTTP1_FOR_AGENT=true` 时，强制 Cursor local agent backend streams 使用 HTTP/1.1 + SSE，可用于代理/网络环境不兼容 HTTP/2 的排查。
 - `CURSOR_ALLOW_BUILTIN_TOOLS=false`（默认）时，通过 SDK 的 `tools` 限制禁止 Cursor agent 在网关容器内使用内置工具（shell/edit/grep 等）：无客户端工具的请求为纯文本模式，有客户端工具的请求只保留 MCP 元工具通道。
 - SSE 响应带 `x-accel-buffering: no`；用 Nginx 反代时仍建议显式配置 `proxy_buffering off`，否则流式会被反代攒成大块。
@@ -193,7 +193,8 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 
 - 映射基于 `Cursor.models.list()` 返回的该模型参数定义与默认 variant（补全默认参数组合，避免只发部分参数时其余参数掉到首个允许值）；目录发现失败或目录条目缺参数定义时按模型家族已知惯例兜底映射，命中不了的意图会记入服务日志（`[model-params]`）而不是静默丢弃；实际下发的参数也会打 `[model-params] sending params` 日志（同组合 10 分钟内一条）。
 - 模型目录缓存 10 分钟；请求了缓存里没有的模型会立刻强刷一次目录（30 秒限频），新上线的模型无需等缓存过期。
-- 上游 run 失败时透传 SDK（>=1.0.23）的结构化错误详情；命中区域限制（如 "This model provider is not supported in your region"，Claude 系模型在部分出口区域不可用）时返回 403 `model_unavailable` 并附原文，而不是笼统的 502。
+- 上游 run 失败时透传 SDK（>=1.0.23）的结构化错误详情；命中区域限制（如 "This model provider is not supported in your region"，Claude 系模型在部分出口区域不可用）时返回 403 `model_unavailable` 并附原文，而不是笼统的 502。命中上游按 key 限速（如 get_models 每分钟 30 次，单 key 并发突发时常见）时返回 429 `rate_limit_exceeded`，客户端可按标准语义退避重试。
+- 所有对上游 SDK 的调用（agent 创建、发送、目录拉取、结果等待）都与请求级超时/断连信号竞速：即使上游传输层完全挂死（不返回也不报错），请求也会在 `REQUEST_TIMEOUT_MS`（空闲超时）内以 504 收尾并释放资源，不会永久悬挂堆积拖垮服务器；取消/释放等清理调用另有 5 秒上限，清理挂死不会阻塞请求收尾。
 - `GET /v1/models` 会在每个模型上返回 `cursor_parameters`（参数定义）与 `cursor_variants`（预设组合），可用来确认某模型支持哪些参数与取值。
 
 ## 能力边界

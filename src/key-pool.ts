@@ -144,6 +144,12 @@ export function classifyErrorText(text: string): "quota" | "auth" | undefined {
   return undefined;
 }
 
+/** 上游临时性 429 / rate limit：不该轮换 key，也不该按 500 透出，应映射成 429 让客户端退避重试。 */
+export function isRateLimitError(error: unknown): boolean {
+  const { statuses, text } = collectErrorInfo(error);
+  return statuses.includes(429) || /rate[ _-]?limit/i.test(text);
+}
+
 export function classifyKeyFailure(error: unknown): KeyFailureKind | undefined {
   const { statuses, text } = collectErrorInfo(error);
   if (statuses.includes(429) || /rate[ _-]?limit/i.test(text)) return undefined;

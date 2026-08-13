@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
-import { ApiError, normalizeError } from "./errors.js";
+import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { saveCursorFastDefault, saveCursorMaxModeDefault } from "./gateway-settings.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel } from "./models.js";
@@ -193,7 +193,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.config.requestTimeoutMs);
     try {
-      const output = await deps.runner.run(run, controller.signal);
+      // 与 abort 竞速：上游完全无视 signal 挂死时，联通性测试也必须在超时后返回而非悬挂。
+      const output = await raceWithAbort(deps.runner.run(run, controller.signal), controller.signal);
       logTest(deps, startedAt, run.model, keyUsageRef, 200);
       return {
         ok: true,

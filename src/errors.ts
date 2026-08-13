@@ -61,6 +61,37 @@ export function newRequestId(): string {
   return `req_${randomUUID().replaceAll("-", "")}`;
 }
 
+/**
+ * 让一个 promise 可被 AbortSignal 打断（abort → 499 request_aborted）。
+ * 上游 SDK 的个别调用可能既不 settle 也不感知 signal（传输层挂死），
+ * 竞速保证请求级超时/断连始终能收尾，请求不会永久悬挂堆积。
+ * 输掉竞速的 promise 会附加空 catch，防止其迟到的 rejection 变成 unhandledRejection。
+ */
+export function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => undefined);
+    return Promise.reject(new ApiError("Request was aborted.", 499, "request_aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      promise.catch(() => undefined);
+      reject(new ApiError("Request was aborted.", 499, "request_aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
 export function anthropicErrorType(statusCode: number): string {
   if (statusCode === 401) return "authentication_error";
   if (statusCode === 402) return "billing_error";
