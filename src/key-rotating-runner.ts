@@ -99,13 +99,22 @@ export class KeyRotatingRunner implements CursorRunner {
       await this.pool.recordUse(key.id);
 
       let emitted = false;
+      // 非流式：整段缓冲到本次尝试成功结束后再放行——失败尝试的任何事件（含 thinking）都不会
+      // 泄漏给聚合器，从根上杜绝换 key 重试时跨尝试拼接内容；反正非流式消费方不需要增量。
+      const buffering = !input.stream;
+      const buffered: CursorStreamEvent[] = [];
       try {
         for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey }, signal)) {
-          // 非流式请求里 thinking 会被聚合器丢弃，不算“已交付产出”，失败后仍可安全换 key 重试；
-          // 流式请求的 thinking 已实际发给客户端，重试会把两个 run 的思考拼进同一响应，不再重试。
-          if (event.type !== "thinking" || input.stream) emitted = true;
+          if (buffering) {
+            buffered.push(event);
+            continue;
+          }
+          // 流式：thinking 只有真正会被端点转发给客户端时才算“已交付”
+          //（messages 端点在客户端未请求 thinking 时会把它丢弃，此时失败仍可安全换 key）。
+          if (event.type !== "thinking" || input.thinkingVisible !== false) emitted = true;
           yield event;
         }
+        if (buffering) yield* buffered;
         return;
       } catch (error) {
         const failure = classifyKeyFailure(error);

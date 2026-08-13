@@ -114,6 +114,8 @@ export interface CursorRunRequest {
   sessionKey: string;
   /** 客户端是否以流式消费本请求（影响 key 轮换重试策略：流式下已发出的 thinking 视为已交付）。 */
   stream?: boolean;
+  /** thinking 事件是否会被端点真正转发给客户端（messages 未请求 thinking 时为 false，此时不算已交付产出）。 */
+  thinkingVisible?: boolean;
   workingDirectory?: string;
   images: GatewayImage[];
   tools: GatewayTool[];

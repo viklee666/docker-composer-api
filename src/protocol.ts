@@ -30,13 +30,21 @@ export interface PreparedRequest {
   intent: ModelIntent;
   /** Responses 快照需要原样回显的请求字段（仅 /v1/responses 填充）。 */
   responsesEcho?: ResponsesEcho;
-  /** 是否向客户端输出 thinking 块（仅 /v1/messages 填充）。 */
-  emitThinking?: boolean;
+  /**
+   * thinking 块对客户端的可见性（仅 /v1/messages 填充）：
+   * - "off"：不输出 thinking 块（未启用思考，或客户端明确关闭）；
+   * - "full"：输出完整 thinking 内容；
+   * - "omitted"：官方 display:"omitted" 语义——仍输出空 thinking 块（含 signature），但省略思考文本。
+   */
+  thinkingVisibility?: ThinkingVisibility;
 }
+
+export type ThinkingVisibility = "off" | "full" | "omitted";
 
 /** `/v1/responses` 的 Response 对象要求回显请求参数，这里保留解析时会被归一化掉的原始值。 */
 export interface ResponsesEcho {
-  instructions: string | null;
+  /** 官方允许 string；个别客户端发数组，回显必须原样（prompt 侧另行提取文本）。 */
+  instructions: unknown;
   reasoning: unknown;
   text: unknown;
   truncation: unknown;
@@ -78,8 +86,8 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   const images: GatewayImage[] = [];
   const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
-  const rawInstructions = typeof record.instructions === "string" ? record.instructions : null;
-  const instructions = rawInstructions?.trim() ?? "";
+  const rawInstructions = record.instructions === undefined ? null : record.instructions;
+  const instructions = instructionsText(record.instructions).trim();
   if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
   if (previous?.response) {
     transcript.push("", `PREVIOUS_RESPONSE:\n${JSON.stringify(previous.response)}`);
@@ -127,8 +135,20 @@ export function prepareAnthropicMessages(body: unknown): PreparedRequest {
   }
   appendToolReminder(transcript, tools);
   const prepared = basePrepared(record, transcript.join("\n"), images, tools, messages);
-  prepared.emitThinking = shouldEmitThinking(record, prepared.intent);
+  prepared.thinkingVisibility = resolveThinkingVisibility(record, prepared.intent);
   return prepared;
+}
+
+/** 从 instructions（string 或数组）提取用于合成 prompt 的文本；回显始终用原值。 */
+function instructionsText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => {
+    if (typeof item === "string") return item;
+    const record = asOptionalRecord(item);
+    if (typeof record?.text === "string") return record.text;
+    return record ? JSON.stringify(record) : "";
+  }).filter(Boolean).join("\n");
 }
 
 export function toRunRequest(input: {
@@ -152,6 +172,8 @@ export function toRunRequest(input: {
     prompt: input.prepared.prompt,
     sessionKey: input.sessionKey,
     stream: input.prepared.stream,
+    // messages 端点在客户端未请求 thinking 时会丢弃 thinking 事件；chat/responses 恒转发（reasoning_content / reasoning item）。
+    thinkingVisible: input.protocol === "anthropic-messages" ? (input.prepared.thinkingVisibility ?? "off") !== "off" : true,
     workingDirectory: input.workingDirectory,
     images: input.prepared.images,
     tools: input.prepared.tools,
@@ -270,8 +292,9 @@ export function responseObject(input: { id: string; created: number; prepared: P
 export function responseOutputItems(id: string, output: CursorRunResult): Record<string, unknown>[] {
   const items: Record<string, unknown>[] = [];
   const suffix = id.replace(/^resp_/, "");
+  const usedCallSuffixes = new Set<string>();
   if (output.reasoningText) items.push(responseReasoningItem(`rs_${suffix}`, output.reasoningText));
-  const toolItems = output.toolCalls.map((toolCall) => responseToolCallItem(toolCall));
+  const toolItems = output.toolCalls.map((toolCall) => responseToolCallItem(toolCall, "completed", usedCallSuffixes));
   if (!toolItems.length || output.text) items.push(responseMessageItem(`msg_${suffix}`, output.text));
   items.push(...toolItems);
   return items;
@@ -293,8 +316,10 @@ export function responseReasoningItem(itemId: string, text: string): Record<stri
 export function anthropicMessageObject(input: { id: string; prepared: PreparedRequest; output: CursorRunResult }): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
   const reasoning = input.output.reasoningText ?? "";
-  if (reasoning && thinkingRequested(input.prepared)) {
-    content.push({ type: "thinking", thinking: reasoning, signature: GATEWAY_THINKING_SIGNATURE });
+  const visibility = input.prepared.thinkingVisibility ?? "off";
+  if (reasoning && visibility !== "off") {
+    // display:"omitted" 的官方语义：仍返回 thinking 块（含 signature），但省略思考文本。
+    content.push({ type: "thinking", thinking: visibility === "omitted" ? "" : reasoning, signature: GATEWAY_THINKING_SIGNATURE });
   }
   if (input.output.text || !input.output.toolCalls.length) content.push({ type: "text", text: input.output.text });
   for (const toolCall of input.output.toolCalls) content.push(anthropicToolUse(toolCall));
@@ -316,19 +341,16 @@ export const GATEWAY_THINKING_SIGNATURE = Buffer.from("docker-composer-api:opaqu
 /** 关闭思考的强度取值：命中即视为客户端明确不要 thinking 块。 */
 const THINKING_DISABLED = new Set(["none", "off", "false", "disabled", "disable", "no", "0"]);
 
-/** 客户端是否希望在响应里看到 thinking 块（解析期算好，见 `prepareAnthropicMessages`）。 */
-export function thinkingRequested(prepared: PreparedRequest): boolean {
-  return prepared.emitThinking === true;
-}
-
 /**
- * 是否输出 thinking 块：只看请求体 / 模型 id 后缀解析出的意图，
+ * thinking 块可见性：只看请求体 / 模型 id 后缀解析出的意图，
  * 网关默认值与请求头不算——未主动要求思考的客户端不该收到 thinking 块。
  */
-function shouldEmitThinking(record: Record<string, unknown>, intent: ModelIntent): boolean {
-  if (suppressesThinkingOutput(record)) return false;
+function resolveThinkingVisibility(record: Record<string, unknown>, intent: ModelIntent): ThinkingVisibility {
+  if (thinkingDisabledByRequest(record)) return "off";
   const effort = intent.reasoningEffort;
-  return typeof effort === "string" && effort.trim() !== "" && !THINKING_DISABLED.has(effort.trim().toLowerCase());
+  const enabled = typeof effort === "string" && effort.trim() !== "" && !THINKING_DISABLED.has(effort.trim().toLowerCase());
+  if (!enabled) return "off";
+  return thinkingDisplayOmitted(record) ? "omitted" : "full";
 }
 
 export function openAiToolCall(toolCall: GatewayToolCall): Record<string, unknown> {
@@ -342,14 +364,27 @@ export function openAiToolCall(toolCall: GatewayToolCall): Record<string, unknow
   };
 }
 
+/** 同一调用对象四个事件各求一次 id，必须稳定：首次解析后按对象缓存。 */
+const resolvedCallSuffixes = new WeakMap<GatewayToolCall, string>();
+
 /**
  * function_call item 的两个 id 是不同命名空间：item `id` 用 `fc_` 前缀，`call_id` 用 `call_` 前缀
  * （客户端回传 function_call_output 时引用的是 call_id）。上游 id 已带 `call_` 时不再重复加前缀。
+ * 传入 `used`（响应级去重集）可防止不同原始 id（如 "foo" 与 "call_foo"）归一化后撞成同一个 call_id。
  */
-export function responseCallIds(toolCall: GatewayToolCall): { itemId: string; callId: string } {
-  // 上游 id 由单一生成器产出（`call_<uuid>` 或 `tool_<uuid>`），同一响应内不混用前缀，
-  // 所以补前缀不会把两个不同调用撞成同一个 call_id。
-  const suffix = toolCall.id.trim().replace(/^call_/, "") || degenerateCallSuffix(toolCall);
+export function responseCallIds(toolCall: GatewayToolCall, used?: Set<string>): { itemId: string; callId: string } {
+  let suffix = resolvedCallSuffixes.get(toolCall);
+  if (suffix === undefined) {
+    suffix = toolCall.id.trim().replace(/^call_/, "") || degenerateCallSuffix(toolCall);
+    if (used) {
+      let candidate = suffix;
+      let counter = 2;
+      while (used.has(candidate)) candidate = `${suffix}_${counter++}`;
+      suffix = candidate;
+      used.add(suffix);
+    }
+    resolvedCallSuffixes.set(toolCall, suffix);
+  }
   return { itemId: `fc_${suffix}`, callId: `call_${suffix}` };
 }
 
@@ -368,8 +403,8 @@ function degenerateCallSuffix(toolCall: GatewayToolCall): string {
   return suffix;
 }
 
-export function responseToolCallItem(toolCall: GatewayToolCall, status: "in_progress" | "completed" = "completed"): Record<string, unknown> {
-  const { itemId, callId } = responseCallIds(toolCall);
+export function responseToolCallItem(toolCall: GatewayToolCall, status: "in_progress" | "completed" = "completed", used?: Set<string>): Record<string, unknown> {
+  const { itemId, callId } = responseCallIds(toolCall, used);
   return {
     id: itemId,
     type: "function_call",
@@ -555,20 +590,23 @@ function reasoningEffortValue(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
-/**
- * 客户端是否明确不要看到 thinking 块。两种表达：
- * - 关闭思考（`thinking:false` / `{type:"disabled"}` / `enabled:false`）；
- * - `thinking.display:"omitted"`：仍然思考，但明确要求不要把思考内容回传。
- * 只影响对外是否输出 thinking 块，不改变发给上游的思考强度。
- */
-function suppressesThinkingOutput(record: Record<string, unknown>): boolean {
+/** 客户端明确关闭思考（`thinking:false` / `{type:"disabled"}` / `enabled:false`）→ 完全不输出 thinking 块。 */
+function thinkingDisabledByRequest(record: Record<string, unknown>): boolean {
   const thinking = record.thinking;
   if (thinking === false) return true;
   const thinkingRecord = asOptionalRecord(thinking);
   if (!thinkingRecord) return false;
   const type = typeof thinkingRecord.type === "string" ? thinkingRecord.type.trim().toLowerCase() : "";
-  if (type === "disabled" || type === "disable" || type === "none" || type === "off" || thinkingRecord.enabled === false) return true;
-  return typeof thinkingRecord.display === "string" && thinkingRecord.display.trim().toLowerCase() === "omitted";
+  return type === "disabled" || type === "disable" || type === "none" || type === "off" || thinkingRecord.enabled === false;
+}
+
+/**
+ * `thinking.display:"omitted"`：仍然思考，但省略思考文本。
+ * 官方语义是发**空 thinking 块**（含 signature），不是删除整个块。不改变发给上游的思考强度。
+ */
+function thinkingDisplayOmitted(record: Record<string, unknown>): boolean {
+  const thinkingRecord = asOptionalRecord(record.thinking);
+  return typeof thinkingRecord?.display === "string" && thinkingRecord.display.trim().toLowerCase() === "omitted";
 }
 
 function booleanField(value: unknown): boolean | undefined {

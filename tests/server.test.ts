@@ -2682,6 +2682,8 @@ class FakeRunner implements CursorRunner {
     failMidStream?: Error;
     /** 一直挂到被 abort，用于验证超时映射。 */
     hangUntilAborted?: boolean;
+    /** 吐完 thinking/chunks 后再挂住，用于验证流中途的空闲超时（区别于首事件前超时）。 */
+    hangAfterChunks?: boolean;
   } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
@@ -2713,6 +2715,7 @@ class FakeRunner implements CursorRunner {
       yield { type: "text", text: chunk };
     }
     if (this.output.failMidStream) throw this.output.failMidStream;
+    if (this.output.hangAfterChunks) await abortedPromise(signal);
     for (const toolCall of this.output.toolCalls ?? []) {
       yield { type: "tool_call", toolCall };
     }
@@ -3225,7 +3228,7 @@ test("explicitly disabled thinking suppresses the block without changing upstrea
   assert.equal(runner.lastInput?.reasoningEffort, "high");
 });
 
-test("thinking display:omitted keeps the reasoning out of the response", async () => {
+test("thinking display:omitted emits an empty thinking block but keeps the reasoning text out", async () => {
   const runner = new FakeRunner({ thinking: ["private reasoning"], chunks: ["answer"] });
   const { app } = await createTestApp({ runner });
   const streamed = await app.inject({
@@ -3242,8 +3245,11 @@ test("thinking display:omitted keeps the reasoning out of the response", async (
   });
   assert.equal(streamed.statusCode, 200);
   assert.ok(!streamed.body.includes("private reasoning"), "omitted thinking must not be streamed back");
-  assert.ok(!streamed.body.includes("thinking_delta"));
-  // 思考本身仍然请求上游执行（budget 2048 → low），只是不回传。
+  assert.ok(!streamed.body.includes("thinking_delta"), "no thinking text deltas in omitted mode");
+  // 官方 omitted 语义：仍发**空 thinking 块**（start 带 signature 字段 + signature_delta 收尾），不是删除整个块。
+  assert.match(streamed.body, /"content_block_start".*"type":"thinking"/);
+  assert.match(streamed.body, /signature_delta/);
+  // 思考本身仍然请求上游执行（budget 2048 → low），只是不回传文本。
   assert.equal(runner.lastInput?.reasoningEffort, "low");
 
   const plain = await app.inject({
@@ -3257,7 +3263,11 @@ test("thinking display:omitted keeps the reasoning out of the response", async (
       messages: [{ role: "user", content: "Hello" }]
     }
   });
-  assert.deepEqual((plain.json().content as { type: string }[]).map((block) => block.type), ["text"]);
+  const content = plain.json().content as { type: string; thinking?: string; signature?: string }[];
+  assert.deepEqual(content.map((block) => block.type), ["thinking", "text"]);
+  assert.equal(content[0].thinking, "", "omitted thinking block carries empty text");
+  assert.ok(content[0].signature, "omitted thinking block still carries a signature");
+  assert.ok(!JSON.stringify(content).includes("private reasoning"));
 });
 
 test("responses text defaults to the official object rather than null", async () => {
@@ -3576,7 +3586,8 @@ test("anthropic responses always carry a request-id header", async () => {
   assert.notEqual(streamed.headers["request-id"], ok.headers["request-id"]);
 });
 
-test("stream idle timeouts surface as a 504 timeout error event, not an abort", { timeout: 5000 }, async () => {
+test("idle timeout before the first upstream event returns a plain HTTP 504", { timeout: 5000 }, async () => {
+  // 首个事件都没等到就超时：SSE 尚未提交，必须是真正的 HTTP 错误信封，而不是 200 + 流内错误。
   const { app } = await createTestApp({
     runner: new FakeRunner({ hangUntilAborted: true }),
     config: { requestTimeoutMs: 20 }
@@ -3587,10 +3598,9 @@ test("stream idle timeouts surface as a 504 timeout error event, not an abort", 
     headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
     payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
   });
-  assert.equal(response.statusCode, 200);
-  const last = sseFrames(response.body).at(-1)?.data as { type: string; error: { type: string } };
-  assert.equal(last.type, "error");
-  assert.equal(last.error.type, "timeout_error");
+  assert.equal(response.statusCode, 504);
+  assert.equal(response.json().type, "error");
+  assert.equal(response.json().error.type, "timeout_error");
 
   const chat = await createTestApp({
     runner: new FakeRunner({ hangUntilAborted: true }),
@@ -3602,9 +3612,148 @@ test("stream idle timeouts surface as a 504 timeout error event, not an abort", 
     headers: { authorization: "Bearer gateway-key" },
     payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
   });
+  assert.equal(chatResponse.statusCode, 504);
+  assert.equal(chatResponse.json().error.type, "server_error");
+  assert.equal(chatResponse.json().error.code, "timeout_error");
+});
+
+test("mid-stream idle timeouts surface as a 504 timeout error event", { timeout: 5000 }, async () => {
+  // 已经吐过内容后才超时：流已提交，用规范的流内错误事件收场。
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], hangAfterChunks: true }),
+    config: { requestTimeoutMs: 30 }
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /"text_delta","text":"partial"/);
+  const last = sseFrames(response.body).at(-1)?.data as { type: string; error: { type: string } };
+  assert.equal(last.type, "error");
+  assert.equal(last.error.type, "timeout_error");
+
+  const chat = await createTestApp({
+    runner: new FakeRunner({ chunks: ["partial"], hangAfterChunks: true }),
+    config: { requestTimeoutMs: 30 }
+  });
+  const chatResponse = await chat.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(chatResponse.statusCode, 200);
   const chatLast = sseFrames(chatResponse.body).at(-1)?.data as { error: { type: string; code: string } };
   assert.equal(chatLast.error.code, "timeout_error");
   assert.equal(chatLast.error.type, "server_error");
+});
+
+test("upstream failure before the first event returns a plain HTTP error on all stream endpoints", async () => {
+  for (const [url, headers, payload] of [
+    ["/v1/chat/completions", { authorization: "Bearer direct-cursor-key" }, { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hi" }] }],
+    ["/v1/responses", { authorization: "Bearer direct-cursor-key" }, { model: "composer-2.5", stream: true, input: "Hi" }],
+    ["/v1/messages", { "x-api-key": "direct-cursor-key", "anthropic-version": "2023-06-01" }, { model: "composer-2.5", max_tokens: 64, stream: true, messages: [{ role: "user", content: "Hi" }] }]
+  ] as const) {
+    const runner = new FakeRunner({ text: "unused" });
+    runner.failWith.set("direct-cursor-key", new ApiError("Invalid API key provided", 401, "unauthorized"));
+    const { app } = await createTestApp({ runner });
+    const response = await app.inject({ method: "POST", url, headers: { ...headers }, payload });
+    assert.equal(response.statusCode, 401, `${url} must fail with a real HTTP status`);
+    assert.match(response.headers["content-type"] as string, /application\/json/, `${url} must not commit an SSE response`);
+  }
+});
+
+test("responses stream synthesizes lifecycle events when the runner only reports via done", async () => {
+  // 合法契约：runner 流阶段零增量，全部产出只在 done.result。
+  const runner: CursorRunner = {
+    run: async () => ({ text: "final text", toolCalls: [], reasoningText: "final reasoning" }),
+    stream: async function* (): AsyncIterable<CursorStreamEvent> {
+      yield {
+        type: "done",
+        result: {
+          text: "final text",
+          toolCalls: [{ id: "call_late", name: "get_weather", arguments: { city: "Lyon" } }],
+          reasoningText: "final reasoning"
+        }
+      };
+    }
+  };
+  const { app } = await createTestApp({ runner: runner as unknown as FakeRunner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, input: "Hi", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const body = response.body;
+  assert.match(body, /response\.reasoning_summary_text\.delta/);
+  assert.match(body, /"delta":"final text"/);
+  assert.match(body, /response\.function_call_arguments\.done/);
+  const completed = sseFrames(response.body).find((frame) => frame.event === "response.completed")?.data as { response: { output: { type: string }[] } };
+  assert.deepEqual(completed.response.output.map((item) => item.type), ["reasoning", "message", "function_call"]);
+});
+
+test("normalized function call ids never collide across different raw ids", async () => {
+  const runner = new FakeRunner({
+    text: "",
+    toolCalls: [
+      { id: "foo", name: "get_weather", arguments: { city: "A" } },
+      { id: "call_foo", name: "get_weather", arguments: { city: "B" } }
+    ]
+  });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Hi", tools: [FLAT_WEATHER_TOOL] }
+  });
+  assert.equal(response.statusCode, 200);
+  const calls = (response.json().output as { type: string; call_id?: string; id?: string }[]).filter((item) => item.type === "function_call");
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0].call_id, calls[1].call_id, "normalized call_ids must stay distinct");
+  assert.notEqual(calls[0].id, calls[1].id, "normalized item ids must stay distinct");
+});
+
+test("hidden thinking does not block key rotation on streaming requests", async () => {
+  const inner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (input: CursorRunRequest): AsyncIterable<CursorStreamEvent> {
+      if (input.apiKey === "key-a") {
+        yield { type: "thinking", text: "hidden" };
+        throw new ApiError("Cursor upstream run ended in error", 502, "upstream_run_failed");
+      }
+      yield { type: "text", text: "ok" };
+      yield { type: "done", result: { text: "ok", toolCalls: [] } };
+    }
+  };
+  const store = new MemoryStateStore();
+  const keyPool = new CursorKeyPool(store);
+  await keyPool.seedFromEnv(["key-a", "key-b"]);
+  const rotating = new KeyRotatingRunner(inner, keyPool);
+  const events: CursorStreamEvent[] = [];
+  // messages 端点未请求 thinking → thinkingVisible:false：thinking 会被端点丢弃，不算已交付，失败仍可换 key。
+  for await (const event of rotating.stream({
+    protocol: "anthropic-messages",
+    apiKey: "",
+    useKeyPool: true,
+    model: "composer-2.5",
+    prompt: "hi",
+    sessionKey: "session",
+    stream: true,
+    thinkingVisible: false,
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  })) {
+    events.push(event);
+  }
+  const texts = events.filter((event): event is { type: "text"; text: string } => event.type === "text").map((event) => event.text);
+  assert.deepEqual(texts, ["ok"], "second key must serve the request");
 });
 
 test("raw upstream errors carrying a status do not leak it to the client", async () => {

@@ -36,7 +36,6 @@ import {
   responseTextPart,
   responseToolCallItem,
   responsesUsage,
-  thinkingRequested,
   toRunRequest,
   type PreparedRequest
 } from "./protocol.js";
@@ -45,6 +44,7 @@ import type {
   AuthContext,
   CursorRunResult,
   CursorRunner,
+  CursorStreamEvent,
   GatewayConfig,
   KeyUsageRef,
   RequestLogRecord,
@@ -142,7 +142,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, run, deps, log, signal: abort.signal }))));
+      const events = await openRunnerStream(deps, log, run, abort);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return chatCompletionObject({ id, created, prepared, output });
@@ -169,7 +170,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, run, deps, log, signal: abort.signal }))));
+      const events = await openRunnerStream(deps, log, run, abort);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, auth, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     const response = responseObject({ id, created, prepared, output, previousResponseId });
@@ -218,7 +220,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, run, deps, log, signal: abort.signal }))));
+      const events = await openRunnerStream(deps, log, run, abort);
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run);
     return anthropicMessageObject({ id, prepared, output });
@@ -384,12 +387,57 @@ async function* withStreamAbort(abort: { touch: () => void; done: () => void }, 
   }
 }
 
+/**
+ * 提交 SSE 响应前预取 runner 的第一个事件：上游即时失败（无效 key、额度耗尽、模型不可用等）
+ * 必须走正常的 HTTP 错误信封，而不是 200 + 流内错误——SDK 的重试/错误处理依赖真实状态码。
+ * 成功后把首事件塞回流，交给各端点的 SSE 生成器继续消费。
+ */
+async function openRunnerStream(
+  deps: AppDeps,
+  log: RequestLog,
+  run: Parameters<CursorRunner["run"]>[0],
+  abort: { signal: AbortSignal; done: () => void }
+): Promise<AsyncIterable<CursorStreamEvent>> {
+  const iterator = deps.runner.stream(run, abort.signal)[Symbol.asyncIterator]();
+  let first: IteratorResult<CursorStreamEvent>;
+  try {
+    first = await iterator.next();
+  } catch (error) {
+    abort.done();
+    const normalized = normalizeError(error);
+    // runner 把 abort 一律表达成内部 499；预取阶段命中空闲超时时还原成对客户端有意义的 504。
+    const resolved = normalized.statusCode === 499 && abort.signal.aborted && abort.signal.reason instanceof ApiError
+      ? abort.signal.reason
+      : normalized;
+    finishLog(deps, log, resolved.statusCode, errorMessage(error));
+    throw resolved;
+  }
+  return {
+    [Symbol.asyncIterator]() {
+      let deliveredFirst = false;
+      return {
+        next(): Promise<IteratorResult<CursorStreamEvent>> {
+          if (!deliveredFirst) {
+            deliveredFirst = true;
+            return Promise.resolve(first);
+          }
+          return iterator.next();
+        },
+        return(value?: unknown): Promise<IteratorResult<CursorStreamEvent>> {
+          deliveredFirst = true;
+          return iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined });
+        }
+      };
+    }
+  };
+}
+
 async function* chatStream(input: {
   id: string;
   created: number;
   prepared: PreparedRequest;
   auth: AuthContext;
-  run: Parameters<CursorRunner["run"]>[0];
+  events: AsyncIterable<CursorStreamEvent>;
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
@@ -407,7 +455,7 @@ async function* chatStream(input: {
   try {
     yield chunk({ role: "assistant" }, null);
     let final: CursorRunResult = { text: "", toolCalls: [] };
-    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    for await (const event of input.events) {
       if (event.type === "thinking" && event.text) {
         // DeepSeek 惯例的 reasoning_content 增量，兼容多数 OpenAI 客户端；不识别的客户端会忽略该字段。
         yield chunk({ reasoning_content: event.text }, null);
@@ -467,7 +515,7 @@ async function* responsesStream(input: {
   prepared: PreparedRequest;
   previousResponseId?: string;
   auth: AuthContext;
-  run: Parameters<CursorRunner["run"]>[0];
+  events: AsyncIterable<CursorStreamEvent>;
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
@@ -523,7 +571,8 @@ async function* responsesStream(input: {
       return chunks;
     };
 
-    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    const usedCallSuffixes = new Set<string>();
+    for await (const event of input.events) {
       if (event.type === "thinking" && event.text) {
         if (openKind !== "reasoning") {
           yield* closeOpenItem();
@@ -553,7 +602,7 @@ async function* responsesStream(input: {
       } else if (event.type === "tool_call") {
         yield* closeOpenItem();
         const outputIndex = nextOutputIndex++;
-        const { itemId } = responseCallIds(event.toolCall);
+        const { itemId } = responseCallIds(event.toolCall, usedCallSuffixes);
         const args = JSON.stringify(event.toolCall.arguments);
         const item = responseToolCallItem(event.toolCall);
         yield emit({ type: "response.output_item.added", output_index: outputIndex, item: responseToolCallItem(event.toolCall, "in_progress") });
@@ -568,6 +617,49 @@ async function* responsesStream(input: {
       }
     }
     yield* closeOpenItem();
+
+    // 流阶段零增量、只在 done.result 给出产出的 runner（合法契约）：补发完整生命周期事件；
+    // 真正零产出时也补一个空 message item，与非流式 responseOutputItems 的形状保持一致。
+    if (!items.length) {
+      const fallbackReasoning = final.reasoningText ?? "";
+      if (fallbackReasoning) {
+        const outputIndex = nextOutputIndex++;
+        const itemId = `rs_${suffix}_${itemCounter++}`;
+        const item = responseReasoningItem(itemId, fallbackReasoning);
+        yield emit({ type: "response.output_item.added", output_index: outputIndex, item: { id: itemId, type: "reasoning", summary: [] } });
+        yield emit({ type: "response.reasoning_summary_part.added", item_id: itemId, output_index: outputIndex, summary_index: 0, part: { type: "summary_text", text: "" } });
+        yield emit({ type: "response.reasoning_summary_text.delta", item_id: itemId, output_index: outputIndex, summary_index: 0, delta: fallbackReasoning });
+        yield emit({ type: "response.reasoning_summary_text.done", item_id: itemId, output_index: outputIndex, summary_index: 0, text: fallbackReasoning });
+        yield emit({ type: "response.reasoning_summary_part.done", item_id: itemId, output_index: outputIndex, summary_index: 0, part: { type: "summary_text", text: fallbackReasoning } });
+        yield emit({ type: "response.output_item.done", output_index: outputIndex, item });
+        items.push(item);
+        reasoning += fallbackReasoning;
+      }
+      if (final.text || !final.toolCalls.length) {
+        const outputIndex = nextOutputIndex++;
+        const itemId = `msg_${suffix}_${itemCounter++}`;
+        const item = responseMessageItem(itemId, final.text);
+        yield emit({ type: "response.output_item.added", output_index: outputIndex, item: { id: itemId, type: "message", status: "in_progress", role: "assistant", content: [] } });
+        yield emit({ type: "response.content_part.added", item_id: itemId, output_index: outputIndex, content_index: 0, part: responseTextPart("") });
+        if (final.text) yield emit({ type: "response.output_text.delta", item_id: itemId, output_index: outputIndex, content_index: 0, delta: final.text, logprobs: [] });
+        yield emit({ type: "response.output_text.done", item_id: itemId, output_index: outputIndex, content_index: 0, text: final.text, logprobs: [] });
+        yield emit({ type: "response.content_part.done", item_id: itemId, output_index: outputIndex, content_index: 0, part: responseTextPart(final.text) });
+        yield emit({ type: "response.output_item.done", output_index: outputIndex, item });
+        items.push(item);
+        text = final.text;
+      }
+      for (const toolCall of final.toolCalls) {
+        const outputIndex = nextOutputIndex++;
+        const { itemId } = responseCallIds(toolCall, usedCallSuffixes);
+        const args = JSON.stringify(toolCall.arguments);
+        const item = responseToolCallItem(toolCall);
+        yield emit({ type: "response.output_item.added", output_index: outputIndex, item: responseToolCallItem(toolCall, "in_progress") });
+        yield emit({ type: "response.function_call_arguments.delta", item_id: itemId, output_index: outputIndex, delta: args });
+        yield emit({ type: "response.function_call_arguments.done", item_id: itemId, output_index: outputIndex, name: toolCall.name, arguments: args });
+        yield emit({ type: "response.output_item.done", output_index: outputIndex, item });
+        items.push(item);
+      }
+    }
 
     const usage = responsesUsage(input.prepared.prompt.length, text.length + JSON.stringify(items.filter(isFunctionCallItem)).length, reasoning.length);
     const response = snapshot("completed", items, usage, final);
@@ -594,13 +686,13 @@ function isFunctionCallItem(item: Record<string, unknown>): boolean {
 async function* anthropicStream(input: {
   id: string;
   prepared: PreparedRequest;
-  run: Parameters<CursorRunner["run"]>[0];
+  events: AsyncIterable<CursorStreamEvent>;
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
 }): AsyncIterable<string> {
-  // 客户端没请求思考时不产出 thinking 块：未申明 thinking 的客户端收到该块会解码失败或误显示。
-  const wantsThinking = thinkingRequested(input.prepared);
+  // 客户端没请求思考时不产出 thinking 块；display:"omitted" 时仍产出空块（含 signature）但省略思考文本。
+  const thinkingVisibility = input.prepared.thinkingVisibility ?? "off";
   try {
     yield sse({
       type: "message_start",
@@ -633,9 +725,9 @@ async function* anthropicStream(input: {
       openType = null;
       return chunks;
     };
-    for await (const event of input.deps.runner.stream(input.run, input.signal)) {
+    for await (const event of input.events) {
       if (event.type === "thinking" && event.text) {
-        if (!wantsThinking) continue;
+        if (thinkingVisibility === "off") continue;
         if (openType !== "thinking") {
           yield* closeOpenBlock();
           openIndex = nextIndex;
@@ -645,7 +737,10 @@ async function* anthropicStream(input: {
           yield sse({ type: "content_block_start", index: openIndex, content_block: { type: "thinking", thinking: "", signature: "" } }, "content_block_start");
         }
         thinkingChars += event.text.length;
-        yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: event.text } }, "content_block_delta");
+        // display:"omitted"：块存在（含 signature_delta 收尾），但不下发思考文本增量。
+        if (thinkingVisibility === "full") {
+          yield sse({ type: "content_block_delta", index: openIndex, delta: { type: "thinking_delta", thinking: event.text } }, "content_block_delta");
+        }
       } else if (event.type === "text" && event.text) {
         if (openType !== "text") {
           yield* closeOpenBlock();

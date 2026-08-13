@@ -44,7 +44,8 @@
 现状:SSE 已开始后 runner 抛错 → 连接直接截断,无任何终止标记。
 改法(参考 CLIProxyAPI 的三套约定,`sdk/api/handlers/`):
 - chat:`data: {"error":{"message":"...","type":"server_error","code":"..."}}` 后关闭,**不发** `[DONE]`。
-- responses:`event: error` + `data: {"type":"error","code":"server_error","message":"...","sequence_number":<接续>}`(或对 Codex 类客户端 `response.failed`,首期只做 `error` 事件即可)。
+- responses:`event: error` + `data: {"type":"error","code":<语义码>,"message":"...","sequence_number":<接续>}`(或对 Codex 类客户端 `response.failed`,首期只做 `error` 事件即可)。
+  > 执行备注(2026-08-13):实现保留具体语义 code(如 `insufficient_quota`/`upstream_run_failed`)而非笼统 `server_error`——官方枚举同样使用具体 code,SDK 不校验该枚举,具体码对排查更有用。
 - messages:`event: error` + `data: {"type":"error","error":{"type":"api_error","message":"..."}}`,不补 `message_stop`。
 - 实现:在 `src/server.ts` 三个 stream 生成器外层各包一个 try/catch(注意与 `withStreamLog` 的日志逻辑协调:错误已发给客户端,日志记真实 status)。
 - 测试:FakeRunner 中途抛错,断言各端点的错误事件形状,且 chat 不出现 `[DONE]`。
