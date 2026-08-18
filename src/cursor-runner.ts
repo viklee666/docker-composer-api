@@ -2,7 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
-import { parseToolCallJson, parseToolMarkers } from "./protocol.js";
+import { isRitualAssistantText, parseToolCallJson, parseToolMarkers } from "./protocol.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
 import type {
   AgentMode,
@@ -249,6 +249,8 @@ export class CursorSdkRunner implements CursorRunner {
       let textSource: "none" | "delta" | "message" = "none";
       let thinkingSource: "none" | "delta" | "message" = "none";
       let streamError: unknown;
+      // 流里只要来过 delta/event（含被丢掉的 task/status），wait() 文本就不能再当助手正文。
+      let streamHadItems = false;
       // cancel 也走坏传输时可能挂死：加时长上限，别让工具调用下发/abort 收尾被它堵住。
       const cancelRun = () => withCleanupTimeout(run.cancel?.().catch(() => undefined));
       // 过滤 marker/事件里未被客户端声明的工具调用（转发只会让客户端报 unknown tool）。
@@ -271,6 +273,7 @@ export class CursorSdkRunner implements CursorRunner {
         // 事件里的工具调用延后到文本处理之后再转发：同一 assistant 事件可能同时带 text 和 tool_use，文本必须先下发。
         let eventToolCalls: GatewayToolCall[] = [];
         if (item.kind === "delta") {
+          streamHadItems = true;
           const update = asRecord(item.update);
           const type = typeof update?.type === "string" ? update.type : "";
           // 空字符串 delta 不锁定来源，否则后续合法的消息级全文会被误屏蔽。
@@ -283,6 +286,7 @@ export class CursorSdkRunner implements CursorRunner {
             yield { type: "thinking", text: update.text };
           }
         } else if (item.kind === "event") {
+          streamHadItems = true;
           const event = item.event;
           const thinking = thinkingFromSdkEvent(event);
           if (thinking && thinkingSource !== "delta") {
@@ -398,7 +402,8 @@ export class CursorSdkRunner implements CursorRunner {
         yield { type: "tool_call", toolCall };
       }
       const waitedText = resultText(waited);
-      if (!toolCalls.length && !textParts.length && waitedText) {
+      // 整段流为空才用 wait() 文本；流里已有过 event/delta（含过滤掉的 task）则不用。仪式句丢弃。
+      if (!streamHadItems && !toolCalls.length && !textParts.length && waitedText && !isRitualAssistantText(waitedText)) {
         // 流阶段没有任何产出、只有 wait() 的最终文本时才使用它；仍需做一次静态 marker 解析。
         const parsed = input.tools.length ? parseToolMarkers(waitedText) : { text: waitedText, toolCalls: [] };
         const declared = keepDeclaredOnly(parsed.toolCalls);
@@ -728,21 +733,37 @@ function thinkingFromSdkEvent(event: unknown): string {
   return typeof message?.text === "string" ? message.text : "";
 }
 
-function textFromSdkEvent(event: unknown): string {
+/** 只从 assistant 抽正文；task 等里程碑带 .text，兜底会泄漏并锁死 textSource。 */
+export function textFromSdkEvent(event: unknown): string {
   const record = asRecord(event);
   if (!record) return "";
   const type = typeof record.type === "string" ? record.type : "";
-  if (type === "status" || type === "thinking" || type === "thinkingMessage") return "";
+  if (
+    type === "status" ||
+    type === "thinking" ||
+    type === "thinkingMessage" ||
+    type === "task" ||
+    type === "system" ||
+    type === "user" ||
+    type === "tool_call" ||
+    type === "request" ||
+    type === "usage"
+  ) {
+    return "";
+  }
   if (type === "assistant") {
     const message = asRecord(record.message);
     const content = Array.isArray(message?.content) ? message.content : [];
-    return content.flatMap((block) => {
+    const fromBlocks = content.flatMap((block) => {
       const item = asRecord(block);
-      return item?.type === "text" && typeof item.text === "string" ? [item.text] : [];
+      return item && (item.type === "text" || item.type === "output_text") && typeof item.text === "string" ? [item.text] : [];
     }).join("");
+    if (fromBlocks) return fromBlocks;
+    if (typeof message?.content === "string") return message.content;
+    if (typeof message?.text === "string") return message.text;
+    if (typeof record.text === "string") return record.text;
+    return "";
   }
-  if (typeof record.text === "string") return record.text;
-  if (typeof record.delta === "string") return record.delta;
   return "";
 }
 

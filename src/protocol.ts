@@ -8,6 +8,7 @@ import {
   type ModelIntent
 } from "./model-params.js";
 import { normalizeModel } from "./models.js";
+import { filterHostMetaTools, isHostMetaTool } from "./tool-compat.js";
 import type { AgentMode, AuthContext, CursorRunRequest, CursorRunResult, GatewayImage, GatewayTool, GatewayToolCall, KeyUsageRef } from "./types.js";
 
 export interface PreparedRequest {
@@ -64,16 +65,32 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
   appendToolInstructions(transcript, tools, record.tool_choice);
   transcript.push("", "Conversation:");
   const images: GatewayImage[] = [];
+  // 先扫完全部 tool_calls / 旧版 function_call，result 出现在 call 前面时也能丢掉元工具输出。
+  const metaCallIds = collectHostMetaCallIds(messages);
   for (const message of messages) {
     const item = asRecord(message, "messages[]");
     const role = stringField(item, "role", "user");
-    const content = contentToTextAndImages(item.content, images);
-    if (role === "tool") {
-      transcript.push(`TOOL RESULT (${stringField(item, "tool_call_id", "unknown")}): ${content || "[empty]"}`);
-    } else {
-      transcript.push(`${role.toUpperCase()}: ${content || "[empty]"}`);
+    if (role === "tool" || role === "function") {
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      if (name && isHostMetaTool(name)) continue;
+      const callId = typeof item.tool_call_id === "string" && item.tool_call_id.trim()
+        ? item.tool_call_id.trim()
+        : name || "unknown";
+      if (metaCallIds.has(callId)) continue;
+      const content = contentToTextAndImages(item.content, images, false);
+      transcript.push(`TOOL RESULT (${callId}): ${content || "[empty]"}`);
+      continue;
     }
-    if (Array.isArray(item.tool_calls)) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(item.tool_calls)}`);
+    const content = contentToTextAndImages(item.content, images, role === "assistant");
+    const calls = Array.isArray(item.tool_calls) ? item.tool_calls : item.function_call !== undefined && item.function_call !== null ? [item.function_call] : [];
+    const kept = calls.filter((call) => {
+      const name = chatToolCallName(call);
+      return !name || !isHostMetaTool(name);
+    });
+    // strip 后既无正文也无保留工具则整轮不写，避免发明 [empty] 回灌。
+    if (!content && !kept.length) continue;
+    if (content) transcript.push(`${role.toUpperCase()}: ${content}`);
+    if (kept.length) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(kept)}`);
   }
   appendToolReminder(transcript, tools);
   return basePrepared(record, transcript.join("\n"), images, tools, messages);
@@ -90,11 +107,16 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   const instructions = instructionsText(record.instructions).trim();
   if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
   if (previous?.response) {
-    transcript.push("", `PREVIOUS_RESPONSE:\n${JSON.stringify(previous.response)}`);
+    transcript.push("", `PREVIOUS_RESPONSE:\n${JSON.stringify(sanitizePreviousResponseForPrompt(previous.response))}`);
   }
   transcript.push("", "INPUT:");
   const inputItems = normalizedResponseInput(record.input);
-  transcript.push(responseInputToTextAndImages(record.input, images));
+  // previous.output 里的元工具 call_id 要能对上本轮只带 function_call_output 的续请求。
+  const priorMetaIds = collectHostMetaCallIds([
+    ...(Array.isArray(previous?.response?.output) ? previous.response.output : []),
+    ...(previous?.inputItems ?? [])
+  ]);
+  transcript.push(responseInputToTextAndImages(record.input, images, priorMetaIds));
   appendToolReminder(transcript, tools);
   const prepared = basePrepared(record, transcript.join("\n"), images, tools, inputItems);
   prepared.responsesEcho = {
@@ -133,10 +155,13 @@ export function prepareAnthropicMessages(body: unknown, options?: { countTokens?
   const system = anthropicSystemText(record.system, images);
   if (system) transcript.push("", `SYSTEM:\n${system}`);
   transcript.push("", "Conversation:");
+  const metaToolUseIds = collectHostMetaCallIds(messages);
   for (const message of messages) {
     const item = asRecord(message, "messages[]");
     const role = stringField(item, "role", "user");
-    transcript.push(`${role.toUpperCase()}: ${anthropicContentToTextAndImages(item.content, images) || "[empty]"}`);
+    const text = anthropicContentToTextAndImages(item.content, images, role === "assistant", metaToolUseIds);
+    if (!text) continue;
+    transcript.push(`${role.toUpperCase()}: ${text}`);
   }
   appendToolReminder(transcript, tools);
   const prepared = basePrepared(record, transcript.join("\n"), images, tools, messages);
@@ -694,13 +719,13 @@ function appendToolReminder(transcript: string[], tools: GatewayTool[]): void {
 function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
+  return filterHostMetaTools(value.flatMap((item) => {
     const record = asOptionalRecord(item);
     const fn = asOptionalRecord(record?.function);
     const name = typeof fn?.name === "string" ? fn.name.trim() : "";
     if (!name) return [];
     return [{ name, description: typeof fn?.description === "string" ? fn.description : undefined, inputSchema: fn?.parameters }];
-  });
+  }));
 }
 
 /**
@@ -711,7 +736,7 @@ function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
 function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
+  return filterHostMetaTools(value.flatMap((item) => {
     const record = asOptionalRecord(item);
     if (!record) return [];
     // 先按 type 分流：内置工具（web_search 等）即使带 function 字段也不能当成客户端函数工具。
@@ -731,7 +756,7 @@ function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[]
     }
     logOnce("responses-unnamed-tool", "[responses] a function tool without a usable name was ignored.");
     return [];
-  });
+  }));
 }
 
 /**
@@ -781,68 +806,203 @@ function logOnce(key: string, message: string): void {
 function parseAnthropicTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (asOptionalRecord(toolChoice)?.type === "none") return [];
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
+  return filterHostMetaTools(value.flatMap((item) => {
     const record = asOptionalRecord(item);
     const name = typeof record?.name === "string" ? record.name.trim() : "";
     if (!name) return [];
     return [{ name, description: typeof record?.description === "string" ? record.description : undefined, inputSchema: record?.input_schema }];
-  });
+  }));
 }
 
-function contentToTextAndImages(value: unknown, images: GatewayImage[]): string {
-  if (typeof value === "string") return value;
+/** 历史短仪式句（拉齐 schema / GetMcpTools 等）不进合成 prompt；只判整段且 ≤200 字，避免误删讨论 schema 的长回复。 */
+const RITUAL_ASSISTANT_RE = /拉齐\s*schema|对齐\s*schema|schema\s*拉齐|schema\s*对齐|align\s+schema|对齐工具|拉齐工具|align\s+tools|align\s+the\s+tool|搜到工具了|found\s+the\s+tool|\bGetMcpTools\b|\bCallMcpTool\b/i;
+
+export function isRitualAssistantText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 200) return false;
+  return RITUAL_ASSISTANT_RE.test(trimmed);
+}
+
+export function stripRitualAssistantText(text: string): string {
+  return isRitualAssistantText(text) ? "" : text;
+}
+
+function chatToolCallName(value: unknown): string {
+  const record = asOptionalRecord(value);
+  const fn = asOptionalRecord(record?.function);
+  if (typeof fn?.name === "string" && fn.name.trim()) return fn.name.trim();
+  return typeof record?.name === "string" ? record.name.trim() : "";
+}
+
+function chatToolCallId(value: unknown): string {
+  const record = asOptionalRecord(value);
+  return typeof record?.id === "string" ? record.id.trim() : "";
+}
+
+/** 从 function_call / tool_use 收集宿主元工具 call_id，让另包或后到的 function_call_output 也能丢掉。 */
+export function collectHostMetaCallIds(items: unknown[]): Set<string> {
+  const ids = new Set<string>();
+  walkHostMetaCallIds(items, ids);
+  return ids;
+}
+
+function walkHostMetaCallIds(value: unknown, ids: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const item of value) walkHostMetaCallIds(item, ids);
+    return;
+  }
+  const record = asOptionalRecord(value);
+  if (!record) return;
+  if (record.type === "function_call" || record.type === "tool_use") {
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (name && isHostMetaTool(name)) {
+      if (typeof record.call_id === "string" && record.call_id.trim()) ids.add(record.call_id.trim());
+      if (typeof record.id === "string" && record.id.trim()) ids.add(record.id.trim());
+    }
+  }
+  if (Array.isArray(record.tool_calls)) {
+    for (const call of record.tool_calls) {
+      const name = chatToolCallName(call);
+      const id = chatToolCallId(call);
+      if (name && isHostMetaTool(name) && id) ids.add(id);
+    }
+  }
+  const fc = asOptionalRecord(record.function_call);
+  if (fc) {
+    const name = typeof fc.name === "string" ? fc.name.trim() : "";
+    if (name && isHostMetaTool(name) && typeof fc.id === "string" && fc.id.trim()) ids.add(fc.id.trim());
+  }
+  if (record.role === "function") {
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (name && isHostMetaTool(name)) {
+      ids.add(name);
+      if (typeof record.tool_call_id === "string" && record.tool_call_id.trim()) ids.add(record.tool_call_id.trim());
+    }
+  }
+  if (Array.isArray(record.content)) walkHostMetaCallIds(record.content, ids);
+}
+
+/** 只清洗写入合成 prompt 的副本，不改客户端取回的已存 Response。 */
+function sanitizePreviousResponseForPrompt(response: Record<string, unknown>): Record<string, unknown> {
+  const copy = JSON.parse(JSON.stringify(response)) as Record<string, unknown>;
+  if (Array.isArray(copy.tools)) {
+    copy.tools = copy.tools.filter((item) => {
+      const record = asOptionalRecord(item);
+      const nested = asOptionalRecord(record?.function);
+      const name = typeof record?.name === "string" ? record.name : typeof nested?.name === "string" ? nested.name : "";
+      return !name || !isHostMetaTool(name);
+    });
+  }
+  if (!Array.isArray(copy.output)) return copy;
+  const metaCallIds = collectHostMetaCallIds(copy.output);
+  copy.output = copy.output.flatMap((item) => {
+    const record = asOptionalRecord(item);
+    if (!record) return [];
+    if (record.type === "reasoning") return [];
+    if (record.type === "function_call" && typeof record.name === "string" && isHostMetaTool(record.name)) return [];
+    if ((record.type === "function_call_output" || record.type === "tool_result") && typeof record.call_id === "string" && metaCallIds.has(record.call_id.trim())) return [];
+    if (record.type === "message" && typeof record.content === "string") {
+      const text = stripRitualAssistantText(record.content);
+      if (!text) return [];
+      record.content = text;
+      return [record];
+    }
+    if (record.type === "message" && Array.isArray(record.content)) {
+      record.content = record.content.flatMap((part) => {
+        const block = asOptionalRecord(part);
+        if (!block) return [];
+        if ((block.type === "output_text" || block.type === "input_text" || block.type === "text") && typeof block.text === "string") {
+          const text = stripRitualAssistantText(block.text);
+          if (!text) return [];
+          return [{ ...block, text }];
+        }
+        return [block];
+      });
+      const hasText = (record.content as unknown[]).some((part) => {
+        const block = asOptionalRecord(part);
+        return Boolean(block && typeof block.text === "string" && block.text);
+      });
+      if (!hasText) return [];
+    }
+    return [record];
+  });
+  return copy;
+}
+
+function contentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false): string {
+  if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === null || value === undefined ? "" : JSON.stringify(value);
   const parts: string[] = [];
   for (const part of value) {
     const record = asOptionalRecord(part);
     if (!record) continue;
-    if (record.type === "text" && typeof record.text === "string") parts.push(record.text);
-    else if (record.type === "image_url") {
+    if (record.type === "text" && typeof record.text === "string") {
+      const text = stripRitual ? stripRitualAssistantText(record.text) : record.text;
+      if (text) parts.push(text);
+    } else if (record.type === "image_url") {
       const imageUrl = asOptionalRecord(record.image_url);
       const url = typeof imageUrl?.url === "string" ? imageUrl.url : "";
       if (url) images.push(imageFromUrl(url));
       parts.push(`[image:${url ? "attached" : "missing"}]`);
+    } else if (record.type === "reasoning" || record.type === "thinking" || record.type === "redacted_thinking") {
+      continue;
     } else parts.push(JSON.stringify(record));
   }
   return parts.join("\n");
 }
 
-function responseInputToTextAndImages(value: unknown, images: GatewayImage[]): string {
+function responseInputToTextAndImages(value: unknown, images: GatewayImage[], priorMetaIds?: ReadonlySet<string>): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
+  const metaCallIds = new Set(priorMetaIds);
+  for (const id of collectHostMetaCallIds(value)) metaCallIds.add(id);
   const parts: string[] = [];
   for (const item of value) {
     const record = asOptionalRecord(item);
     if (!record) continue;
-    if (record.type === "message") parts.push(`${stringField(record, "role", "user").toUpperCase()}: ${responseContentToText(record.content, images)}`);
-    else if (record.type === "input_text" && typeof record.text === "string") parts.push(record.text);
+    if (record.type === "reasoning") continue;
+    if (record.type === "message") {
+      const role = stringField(record, "role", "user");
+      const text = responseContentToText(record.content, images, role === "assistant");
+      if (!text) continue;
+      parts.push(`${role.toUpperCase()}: ${text}`);
+    } else if (record.type === "input_text" && typeof record.text === "string") parts.push(record.text);
     else if (record.type === "input_image") {
       const url = typeof record.image_url === "string" ? record.image_url : "";
       const data = typeof record.image_base64 === "string" ? record.image_base64 : "";
       if (url) images.push(imageFromUrl(url));
       if (data) images.push({ type: "image", source: "base64", data, mediaType: typeof record.media_type === "string" ? record.media_type : undefined });
       parts.push("[image:attached]");
+    } else if (record.type === "function_call") {
+      const name = typeof record.name === "string" ? record.name : "";
+      if (name && isHostMetaTool(name)) continue;
+      parts.push(JSON.stringify(record));
     } else if (record.type === "function_call_output" || record.type === "tool_result") {
+      const callId = stringField(record, "call_id", "unknown");
+      if (metaCallIds.has(callId)) continue;
       // output 已是字符串时直接用：再 JSON.stringify 一次会把工具结果变成带转义的引号串。
       const raw = record.output ?? record.content ?? "";
-      parts.push(`TOOL RESULT (${stringField(record, "call_id", "unknown")}): ${typeof raw === "string" ? raw : JSON.stringify(raw)}`);
+      parts.push(`TOOL RESULT (${callId}): ${typeof raw === "string" ? raw : JSON.stringify(raw)}`);
     } else parts.push(JSON.stringify(record));
   }
   return parts.join("\n");
 }
 
-function responseContentToText(value: unknown, images: GatewayImage[]): string {
-  if (typeof value === "string") return value;
+function responseContentToText(value: unknown, images: GatewayImage[], stripRitual = false): string {
+  if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
   return value.map((part) => {
     const record = asOptionalRecord(part);
     if (!record) return "";
-    if ((record.type === "input_text" || record.type === "output_text") && typeof record.text === "string") return record.text;
+    if ((record.type === "input_text" || record.type === "output_text" || record.type === "text") && typeof record.text === "string") {
+      return stripRitual ? stripRitualAssistantText(record.text) : record.text;
+    }
     if (record.type === "input_image") {
       const url = typeof record.image_url === "string" ? record.image_url : "";
       if (url) images.push(imageFromUrl(url));
       return "[image:attached]";
     }
+    if (record.type === "reasoning" || record.type === "thinking" || record.type === "redacted_thinking") return "";
     return JSON.stringify(record);
   }).filter(Boolean).join("\n");
 }
@@ -859,15 +1019,21 @@ function anthropicSystemText(value: unknown, images: GatewayImage[]): string {
   return value === undefined ? "" : JSON.stringify(value);
 }
 
-function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[]): string {
-  if (typeof value === "string") return value;
+function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false, metaToolUseIds?: Set<string>): string {
+  if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
   const parts: string[] = [];
   for (const part of value) {
     const record = asOptionalRecord(part);
     if (!record) continue;
-    if (record.type === "text" && typeof record.text === "string") parts.push(record.text);
-    else if (record.type === "image") {
+    if (record.type === "text" && typeof record.text === "string") {
+      if (stripRitual) {
+        const text = stripRitualAssistantText(record.text);
+        if (text) parts.push(text);
+      } else {
+        parts.push(record.text);
+      }
+    } else if (record.type === "image") {
       const source = asOptionalRecord(record.source);
       const type = typeof source?.type === "string" ? source.type : "";
       if (type === "base64" && typeof source?.data === "string") {
@@ -879,9 +1045,17 @@ function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[])
     } else if (record.type === "thinking" || record.type === "redacted_thinking") {
       // 客户端回传的历史思考块（含网关的占位签名）不进入合成 prompt：纯内部推理，原样注入只会污染提示词、浪费 token。
     } else if (record.type === "tool_use") {
+      const name = typeof record.name === "string" ? record.name : "";
+      const id = typeof record.id === "string" ? record.id : "";
+      if (name && isHostMetaTool(name)) {
+        if (id && metaToolUseIds) metaToolUseIds.add(id);
+        continue;
+      }
       parts.push(`ASSISTANT TOOL_USE: ${JSON.stringify(record)}`);
     } else if (record.type === "tool_result") {
-      parts.push(`TOOL RESULT (${stringField(record, "tool_use_id", "unknown")}): ${JSON.stringify(record.content ?? "")}`);
+      const toolUseId = stringField(record, "tool_use_id", "unknown");
+      if (metaToolUseIds?.has(toolUseId)) continue;
+      parts.push(`TOOL RESULT (${toolUseId}): ${JSON.stringify(record.content ?? "")}`);
     } else if (record.type === "document") {
       throw new ApiError(
         "Gateway limitation: document/PDF content blocks are not supported by this Cursor-backed gateway (the Cursor upstream accepts text and images only). Extract the text client-side and send it as a text block.",

@@ -16,6 +16,34 @@ const TOOL_ALIASES: Record<string, string[]> = {
   WebSearch: ["websearch", "web_search"]
 };
 
+/** Claude Code 宿主元工具不得进 customTools，否则内层会再演 MCP 发现或 Task 套娃。精确名、大小写不敏感。 */
+const HOST_META_TOOL_NAMES = new Set([
+  "getmcptools",
+  "callmcptool",
+  "fetchmcpresource",
+  "listmcpresources",
+  "mcp_auth",
+  "task",
+  "taskoutput",
+  "taskstop",
+  "agent",
+  "skill",
+  "slashcommand",
+  "enterplanmode",
+  "exitplanmode",
+  "switchmode",
+  "askuserquestion",
+  "askquestion"
+]);
+
+export function isHostMetaTool(name: string): boolean {
+  return HOST_META_TOOL_NAMES.has(name.toLowerCase());
+}
+
+export function filterHostMetaTools(tools: GatewayTool[]): GatewayTool[] {
+  return tools.filter((tool) => !isHostMetaTool(tool.name));
+}
+
 /**
  * 参数改名映射：同一来源键可尝试多个目标键（按顺序取第一个存在于客户端 schema 的）。
  * 例如 Claude Code 的 Grep 用 `-A`/`-B`/`-C`/`-i`，其他客户端可能用 context_after 等长名。
@@ -55,9 +83,10 @@ export function createSdkCustomTools(
   tools: GatewayTool[],
   onToolCall: (toolCall: GatewayToolCall) => void
 ): Record<string, SDKCustomTool> | undefined {
-  if (!tools.length) return undefined;
+  const clientTools = filterHostMetaTools(tools);
+  if (!clientTools.length) return undefined;
   const customTools: Record<string, SDKCustomTool> = {};
-  for (const tool of tools) {
+  for (const tool of clientTools) {
     if (!tool.name) continue;
     customTools[tool.name] = {
       description: tool.description,
@@ -67,7 +96,7 @@ export function createSdkCustomTools(
           id: context.toolCallId ?? `call_${randomUUID().replaceAll("-", "")}`,
           name: tool.name,
           arguments: jsonRecordToPlain(args)
-        }, tools));
+        }, clientTools));
         // 必须返回“成功”而非 isError：错误结果会诱导 agent 重试改参数或改用内置工具，
         // 恰好产生外部客户端观察到的“参数错误/重复调用”。网关随后会 cancel 整个 run。
         return {
@@ -99,7 +128,10 @@ export function normalizeToolCallForClient(toolCall: GatewayToolCall, tools: Gat
 /** 该调用（解包/别名映射后）是否命中客户端声明过的工具；未命中的内置工具调用不应转发给客户端。 */
 export function matchesClientTool(toolCall: GatewayToolCall, tools: GatewayTool[]): boolean {
   if (!tools.length) return false;
-  return findClientTool(unwrapMcpToolCall(toolCall).name, tools) !== undefined;
+  const unwrapped = unwrapMcpToolCall(toolCall);
+  // unwrap 后内层 toolName 若是 GetMcpTools / Task 等宿主元名，直接 false，不转发。
+  if (isHostMetaTool(unwrapped.name)) return false;
+  return findClientTool(unwrapped.name, tools) !== undefined;
 }
 
 export function normalizeToolCallsForClient(toolCalls: GatewayToolCall[], tools: GatewayTool[]): GatewayToolCall[] {

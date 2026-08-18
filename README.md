@@ -211,6 +211,10 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 - **stop_reason 只有 `end_turn` / `tool_use`**：上游不区分 `max_tokens` / `stop_sequence` 等终止原因。
 - **Anthropic `max_tokens` 缺失只记日志不拒绝**：官方要求必填，这里为兼容宽松客户端放行（该参数本来也不生效）。
 - **不支持的内容与工具**：Anthropic `document` / PDF 内容块返回 400（上游只接受文本与图片，请客户端侧抽取文本后作为 text 块发送）；`n>1`、`audio`、`modalities`、内置工具（web search 等）明确 400 或忽略；`logprobs: true` 返回 400（`logprobs: false` 与 `top_logprobs` 接受但不生效）。
+- **宿主元工具不转发、不注册**：Claude Code 等宿主的 `GetMcpTools` / `CallMcpTool` / `Task` 等元工具不会经网关转发给上游，也不注册为 Cursor `customTools`，避免内层再演工具发现或子代理套娃。
+- **SDK `task` 里程碑不下发**：Cursor SDK 的 `task` 事件只是里程碑/摘要，不会作为助手正文发给客户端。
+- **短仪式句不回灌 prompt**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条协议都会丢掉历史 assistant 里的短仪式句（如「对齐 schema」「搜到工具了」），以及 GetMcpTools / Task 等元工具的历史调用与结果。清洗后既无正文也无保留工具调用的空轮整段省略，不会写出 `ASSISTANT: [empty]`。Responses 的 `previous_response_id` 整包转储只清洗写入 prompt 的副本、不改已存快照；续轮里对应 GetMcpTools 的 follow-up `function_call_output` 不回放，`input[]` 的 `reasoning` 项也不注入下一轮 prompt。
+- **不恢复 SDK session resume**：默认仍为 `CURSOR_SDK_DISABLE_SESSION_RESUME=true`，每次请求新建 agent，不把 `tool_result` 送回同一 `Run`。
 
 ## 多 key 自动切换
 
