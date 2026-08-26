@@ -15,6 +15,7 @@ import {
 } from "./errors.js";
 import type { CursorKeyPool } from "./key-pool.js";
 import { errorMessage } from "./key-pool.js";
+import { resolveCursorClientType, runWithCursorClientType } from "./sand-client.js";
 import { mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-params.js";
 import { listAvailableModels, openAiModelList, openAiModelObject, type ModelLister } from "./models.js";
 import {
@@ -44,6 +45,7 @@ import {
 import { sse, sseDone } from "./sse.js";
 import type {
   AuthContext,
+  CursorClientType,
   CursorRunResult,
   CursorRunner,
   CursorStreamEvent,
@@ -250,15 +252,25 @@ export function createApp(deps: AppDeps): FastifyInstance {
 async function listModels(deps: AppDeps, request: Parameters<typeof authenticate>[0]): ReturnType<ModelLister> {
   const lister = deps.modelLister ?? listAvailableModels;
   let apiKey: string | undefined;
+  const fallback: CursorClientType = deps.config.sandClientMode ? "sand" : "sdk";
+  let clientType = fallback;
   if (extractToken(request)) {
     try {
       const auth = authenticate(request, deps.config);
-      apiKey = auth.mode === "direct" ? auth.apiKey : (await deps.keyPool.pickActive(new Set()))?.apiKey;
+      if (auth.mode === "direct") {
+        apiKey = auth.apiKey;
+        const record = apiKey ? await deps.keyPool.getByValue(apiKey) : undefined;
+        clientType = resolveCursorClientType(record?.clientType, fallback);
+      } else {
+        const key = await deps.keyPool.pickActive(new Set());
+        apiKey = key?.apiKey;
+        clientType = resolveCursorClientType(key?.clientType, fallback);
+      }
     } catch {
       apiKey = undefined;
     }
   }
-  return lister(apiKey);
+  return runWithCursorClientType(clientType, () => lister(apiKey));
 }
 
 function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest): RequestLog {

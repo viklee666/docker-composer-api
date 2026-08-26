@@ -6,8 +6,10 @@ import {
   saveAutoDisableKeys,
   saveAutoDisableThreshold,
   saveCursorFastDefault,
-  saveCursorMaxModeDefault
+  saveCursorMaxModeDefault,
+  saveSandClientMode
 } from "./gateway-settings.js";
+import { isSandClientHookPatched, parseCursorClientTypeSetting, resolveCursorClientType, runWithCursorClientType, setGlobalCursorClientType } from "./sand-client.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel } from "./models.js";
 import {
@@ -34,7 +36,10 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const keys = await deps.keyPool.list();
     const requests = await deps.store.requestLogStats();
     const poolKey = keys.find((key) => key.status === "active");
-    const modelList = await (deps.modelLister ?? listAvailableModels)(poolKey?.apiKey);
+    const modelList = await runWithCursorClientType(
+      resolveCursorClientType(poolKey?.clientType, deps.config.sandClientMode ? "sand" : "sdk"),
+      () => (deps.modelLister ?? listAvailableModels)(poolKey?.apiKey)
+    );
     const cursorSdkUseHttp1ForAgent = await loadCursorSdkUseHttp1ForAgent(deps.store, deps.config.cursorSdkUseHttp1ForAgent);
     return {
       service: SERVICE_NAME,
@@ -50,6 +55,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         cursorFast: deps.config.cursorFast === true,
         autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
         autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
+        sandClientMode: deps.config.sandClientMode === true,
+        sandClientHookPatched: isSandClientHookPatched(),
         gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey)
       },
       keys: {
@@ -124,6 +131,16 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       touched = true;
     }
 
+    if (body.sandClientMode !== undefined) {
+      if (typeof body.sandClientMode !== "boolean") {
+        throw new ApiError("sandClientMode must be a boolean.", 400, "invalid_request_error", "sandClientMode");
+      }
+      await saveSandClientMode(deps.store, body.sandClientMode);
+      deps.config.sandClientMode = body.sandClientMode;
+      setGlobalCursorClientType(body.sandClientMode ? "sand" : "sdk");
+      touched = true;
+    }
+
     if (!touched) throw new ApiError("No settings provided.", 400, "invalid_request_error");
 
     return {
@@ -133,7 +150,9 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         cursorMaxMode: deps.config.cursorMaxMode === true,
         cursorFast: deps.config.cursorFast === true,
         autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
-        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold
+        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
+        sandClientMode: deps.config.sandClientMode === true,
+        sandClientHookPatched: isSandClientHookPatched()
       }
     };
   });
@@ -149,7 +168,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const body = objectBody(request.body);
     const key = typeof body.key === "string" ? body.key : "";
     const label = typeof body.label === "string" ? body.label : undefined;
-    const record = await deps.keyPool.add(key, label);
+    const clientType = body.clientType === undefined ? "inherit" : parseCursorClientTypeSetting(body.clientType);
+    if (!clientType) {
+      throw new ApiError("clientType must be inherit, sdk, or sand.", 400, "invalid_request_error", "clientType");
+    }
+    const record = await deps.keyPool.add(key, label, clientType);
     return { ok: true, key: publicKey(record) };
   });
 
@@ -174,6 +197,19 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const ok = await deps.keyPool.disable(keyId(request), "manual");
     if (!ok) throw new ApiError("Key not found.", 404, "not_found");
     return { ok: true };
+  });
+
+  app.post("/admin/api/keys/:id/channel", async (request) => {
+    requireAdmin(request, deps);
+    const body = objectBody(request.body);
+    const clientType = parseCursorClientTypeSetting(body.clientType);
+    if (!clientType) {
+      throw new ApiError("clientType must be inherit, sdk, or sand.", 400, "invalid_request_error", "clientType");
+    }
+    const ok = await deps.keyPool.setClientType(keyId(request), clientType);
+    if (!ok) throw new ApiError("Key not found.", 404, "not_found");
+    const record = await deps.keyPool.get(keyId(request));
+    return { ok: true, key: record ? publicKey(record) : undefined };
   });
 
   app.delete("/admin/api/keys/:id", async (request) => {
@@ -281,6 +317,7 @@ function publicKey(record: CursorKeyRecord): Record<string, unknown> {
     lastError: record.lastError ?? null,
     requestCount: record.requestCount,
     failureCount: record.failureCount,
+    clientType: record.clientType,
     createdAt: record.createdAt
   };
 }

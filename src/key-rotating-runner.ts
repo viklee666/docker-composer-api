@@ -1,6 +1,8 @@
 import { ApiError } from "./errors.js";
 import { classifyKeyFailure, CursorKeyPool, errorMessage } from "./key-pool.js";
+import { getGlobalCursorClientType, resolveCursorClientType } from "./sand-client.js";
 import type {
+  CursorClientType,
   CursorRunRequest,
   CursorRunResult,
   CursorRunner,
@@ -21,6 +23,8 @@ export interface KeyRotatingOptions {
   maxKeyAttempts?: number;
   /** 单次请求软失败的最大次数，超过则不再换 key、直接透出上游错误。默认 3。 */
   maxTransientAttempts?: number;
+  /** 全局通道；未提供时读模块级总开关。测试里应绑到 config，避免并行用例互相污染。 */
+  resolveGlobalClientType?: () => CursorClientType;
 }
 
 /**
@@ -32,6 +36,7 @@ export interface KeyRotatingOptions {
 export class KeyRotatingRunner implements CursorRunner {
   private readonly maxKeyAttempts: number;
   private readonly maxTransientAttempts: number;
+  private readonly resolveGlobalClientType?: () => CursorClientType;
 
   constructor(
     private readonly inner: CursorRunner,
@@ -40,6 +45,11 @@ export class KeyRotatingRunner implements CursorRunner {
   ) {
     this.maxKeyAttempts = positiveIntOr(options.maxKeyAttempts, DEFAULT_MAX_KEY_ATTEMPTS);
     this.maxTransientAttempts = positiveIntOr(options.maxTransientAttempts, DEFAULT_MAX_TRANSIENT_ATTEMPTS);
+    this.resolveGlobalClientType = options.resolveGlobalClientType;
+  }
+
+  private globalClientType(): CursorClientType {
+    return this.resolveGlobalClientType?.() ?? getGlobalCursorClientType();
   }
 
   async run(input: CursorRunRequest, signal?: AbortSignal): Promise<CursorRunResult> {
@@ -60,7 +70,9 @@ export class KeyRotatingRunner implements CursorRunner {
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     if (!input.useKeyPool) {
       if (!input.apiKey) throw new ApiError("Missing Cursor API key.", 401, "unauthorized");
-      yield* this.inner.stream(input, signal);
+      const record = await this.pool.getByValue(input.apiKey);
+      const clientType = input.clientType ?? resolveCursorClientType(record?.clientType, this.globalClientType());
+      yield* this.inner.stream({ ...input, clientType }, signal);
       return;
     }
 
@@ -96,6 +108,7 @@ export class KeyRotatingRunner implements CursorRunner {
         input.keyUsageRef.keyLabel = key.label;
       }
       await this.pool.recordUse(key.id);
+      const clientType = resolveCursorClientType(key.clientType, this.globalClientType());
 
       let emitted = false;
       // 非流式：整段缓冲到本次尝试成功结束后再放行——失败尝试的任何事件（含 thinking）都不会
@@ -103,7 +116,7 @@ export class KeyRotatingRunner implements CursorRunner {
       const buffering = !input.stream;
       const buffered: CursorStreamEvent[] = [];
       try {
-        for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey }, signal)) {
+        for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey, clientType }, signal)) {
           if (buffering) {
             buffered.push(event);
             continue;

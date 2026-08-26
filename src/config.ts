@@ -26,7 +26,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     cursorMaxMode: optionalBoolean(env.CURSOR_MAX_MODE),
     cursorFast: optionalBoolean(env.CURSOR_FAST),
     cursorModelParams: parseModelParamsSpec(env.CURSOR_MODEL_PARAMS),
-    cursorAgentMode: optionalAgentMode(env.CURSOR_AGENT_MODE)
+    cursorAgentMode: optionalAgentMode(env.CURSOR_AGENT_MODE),
+    sandClientMode: booleanValue(env.SAND_CLIENT_MODE, false)
   };
 }
 

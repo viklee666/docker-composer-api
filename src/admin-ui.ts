@@ -70,6 +70,9 @@ td.mono,.mono{font-family:var(--mono);font-size:12px}
 .badge.gateway{background:rgba(91,140,255,.12);color:var(--accent)}
 .badge.direct{background:rgba(245,184,77,.14);color:var(--yellow)}
 .badge.admin{background:rgba(54,198,176,.13);color:var(--accent-2)}
+.badge.sand{background:rgba(168,130,255,.14);color:#c4a6ff}
+.badge.sdk{background:rgba(91,140,255,.12);color:var(--accent)}
+.badge.inherit{background:rgba(139,150,173,.12);color:var(--muted)}
 .badge.s2xx{background:rgba(46,204,143,.12);color:var(--green)}
 .badge.s4xx{background:rgba(245,184,77,.14);color:var(--yellow)}
 .badge.s5xx{background:rgba(255,107,107,.12);color:var(--red)}
@@ -126,6 +129,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         <span class="chip" id="chip-direct">直传 key：-</span>
         <span class="chip" id="chip-http1">HTTP：-</span>
         <span class="chip" id="chip-autodisable">自动禁用：-</span>
+        <span class="chip" id="chip-sand">通道：-</span>
       </div>
     </div>
     <div class="spacer"></div>
@@ -162,6 +166,13 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       </div>
       <div class="row" style="margin-bottom:10px">
         <label class="toggle" style="font-size:13px;color:var(--text)">
+          <input type="checkbox" id="sand-mode-toggle">
+          全局默认走 Sand 通道（x-cursor-client-type: sand）
+        </label>
+        <span class="muted small" id="sand-hook-hint"></span>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <label class="toggle" style="font-size:13px;color:var(--text)">
           <input type="checkbox" id="auto-disable-toggle">
           额度不足 / key 失效时自动禁用 key
         </label>
@@ -173,7 +184,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       </div>
       <div class="row">
         <button id="btn-save-settings">保存设置</button>
-        <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 用于代理不兼容 HTTP/2 的排查。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。</span>
+        <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 用于代理不兼容 HTTP/2 的排查。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
       </div>
     </div>
   </div>
@@ -187,12 +198,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       <div class="row" style="margin-bottom:14px">
         <input id="new-key" placeholder="粘贴 Cursor API Key（key_...）" style="flex:2;min-width:260px" autocomplete="off">
         <input id="new-label" placeholder="备注（可选）" style="flex:1;min-width:140px" autocomplete="off">
+        <select id="new-channel" style="min-width:120px" title="该 key 的 Cursor 通道">
+          <option value="inherit">跟随全局</option>
+          <option value="sdk">强制 SDK</option>
+          <option value="sand">强制 Sand</option>
+        </select>
         <button class="primary" id="btn-add-key">添加 Key</button>
       </div>
       <div class="table-scroll">
         <table>
           <thead><tr>
-            <th>顺序</th><th>备注</th><th>Key</th><th>状态</th><th>来源</th><th>请求数</th><th>最近使用</th><th>禁用原因 / 最近错误</th><th>操作</th>
+            <th>顺序</th><th>备注</th><th>Key</th><th>状态</th><th>通道</th><th>来源</th><th>请求数</th><th>最近使用</th><th>禁用原因 / 最近错误</th><th>操作</th>
           </tr></thead>
           <tbody id="keys-body"></tbody>
         </table>
@@ -333,6 +349,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('auto-disable-threshold').value = autoDisableThreshold;
     $('chip-autodisable').textContent = '自动禁用：'
       + (data.config.autoDisableKeys ? '连续失败 ' + autoDisableThreshold + ' 次' : '已关闭');
+    sandClientMode = !!data.config.sandClientMode;
+    $('sand-mode-toggle').checked = sandClientMode;
+    $('chip-sand').textContent = '通道：' + (sandClientMode ? 'Sand' : 'SDK');
+    $('sand-hook-hint').textContent = sandClientMode && data.config.sandClientHookPatched === false
+      ? '（SDK 尚未加载或注入未生效，重启后看启动日志）'
+      : '';
     $('st-keys').textContent = data.keys.active + ' / ' + data.keys.total;
     $('st-keys-d').textContent = '已禁用 ' + data.keys.disabled + ' 个';
     $('st-total').textContent = data.requests.total;
@@ -354,6 +376,28 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
   var lastKeys = [];
   var autoDisableThreshold = 1;
+  var sandClientMode = false;
+
+  function channelLabel(value){
+    if (value === 'sand') return 'Sand';
+    if (value === 'sdk') return 'SDK';
+    return '跟随全局';
+  }
+  function resolvedChannel(key){
+    if (key.clientType === 'sand' || key.clientType === 'sdk') return key.clientType;
+    return sandClientMode ? 'sand' : 'sdk';
+  }
+  function channelSelect(key){
+    var current = key.clientType === 'sand' || key.clientType === 'sdk' ? key.clientType : 'inherit';
+    var html = '<select data-action="channel" data-id="' + key.id + '" title="该 key 的 Cursor 通道" style="padding:4px 8px;font-size:12px">';
+    [['inherit','跟随全局'],['sdk','强制 SDK'],['sand','强制 Sand']].forEach(function(item){
+      html += '<option value="' + item[0] + '"' + (current === item[0] ? ' selected' : '') + '>' + item[1] + '</option>';
+    });
+    html += '</select>';
+    var resolved = resolvedChannel(key);
+    html += ' <span class="badge ' + resolved + '">' + (resolved === 'sand' ? 'Sand' : 'SDK') + '</span>';
+    return html;
+  }
 
   function renderKeys(keys){
     lastKeys = keys;
@@ -387,6 +431,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '<td>' + esc(key.label) + '</td>'
         + '<td class="mono">' + esc(key.maskedKey) + '</td>'
         + '<td><span class="badge ' + key.status + '">' + (key.status === 'active' ? '可用' : '已禁用') + '</span></td>'
+        + '<td>' + channelSelect(key) + '</td>'
         + '<td class="muted">' + (key.source === 'env' ? '环境变量' : '手动添加') + '</td>'
         + '<td>' + key.requestCount + '</td>'
         + '<td class="muted small">' + fmtTime(key.lastUsedAt) + '</td>'
@@ -446,21 +491,24 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     body.innerHTML = html;
   }
 
+  var loadGen = 0;
   function loadAll(){
-    if (loading) return;
+    var gen = ++loadGen;
     loading = true;
     Promise.all([
       api('GET', '/admin/api/overview'),
       api('GET', '/admin/api/keys'),
       api('GET', '/admin/api/logs?limit=50')
     ]).then(function(results){
+      if (gen !== loadGen) return;
       renderOverview(results[0]);
       renderKeys(results[1].keys);
       renderLogs(results[2].logs);
     }).catch(function(err){
+      if (gen !== loadGen) return;
       if (err.message !== 'unauthorized') toast('加载失败：' + err.message, true);
     }).finally(function(){
-      loading = false;
+      if (gen === loadGen) loading = false;
     });
   }
 
@@ -487,12 +535,30 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var key = $('new-key').value.trim();
     var label = $('new-label').value.trim();
     if (!key) { toast('请先粘贴 Cursor API Key', true); return; }
-    api('POST', '/admin/api/keys', { key: key, label: label || undefined }).then(function(){
+    api('POST', '/admin/api/keys', {
+      key: key,
+      label: label || undefined,
+      clientType: $('new-channel').value || 'inherit'
+    }).then(function(){
       $('new-key').value = '';
       $('new-label').value = '';
+      $('new-channel').value = 'inherit';
       toast('已添加 key');
       loadAll();
     }).catch(function(err){ toast('添加失败：' + err.message, true); });
+  });
+
+  $('sand-mode-toggle').addEventListener('change', function(){
+    var enabled = $('sand-mode-toggle').checked;
+    api('POST', '/admin/api/settings', { sandClientMode: enabled }).then(function(data){
+      sandClientMode = !!data.config.sandClientMode;
+      $('chip-sand').textContent = '通道：' + (sandClientMode ? 'Sand' : 'SDK');
+      toast(sandClientMode ? '已全局切换到 Sand 通道' : '已全局切换到 SDK 通道');
+      loadAll();
+    }).catch(function(err){
+      toast('切换通道失败：' + err.message, true);
+      loadAll();
+    });
   });
 
   $('btn-save-settings').addEventListener('click', function(){
@@ -516,6 +582,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       autoDisableThreshold = data.config.autoDisableThreshold || 1;
       $('auto-disable-toggle').checked = !!data.config.autoDisableKeys;
       $('auto-disable-threshold').value = autoDisableThreshold;
+      sandClientMode = !!data.config.sandClientMode;
+      $('sand-mode-toggle').checked = sandClientMode;
+      $('chip-sand').textContent = '通道：' + (sandClientMode ? 'Sand' : 'SDK');
       loadAll();
     }).catch(function(err){
       toast('保存设置失败：' + err.message, true);
@@ -523,6 +592,23 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }).finally(function(){
       button.disabled = false;
       button.textContent = '保存设置';
+    });
+  });
+
+  $('keys-body').addEventListener('change', function(event){
+    var select = event.target.closest('select[data-action="channel"]');
+    if (!select) return;
+    var id = select.getAttribute('data-id');
+    var clientType = select.value;
+    select.disabled = true;
+    api('POST', '/admin/api/keys/' + id + '/channel', { clientType: clientType }).then(function(){
+      toast('已切换为' + channelLabel(clientType));
+      loadAll();
+    }).catch(function(err){
+      toast('切换通道失败：' + err.message, true);
+      loadAll();
+    }).finally(function(){
+      select.disabled = false;
     });
   });
 

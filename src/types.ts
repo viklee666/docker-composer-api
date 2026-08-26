@@ -39,7 +39,18 @@ export interface GatewayConfig {
   cursorModelParams?: ModelParameterValue[];
   /** 默认 Cursor 会话模式 agent/plan（env: CURSOR_AGENT_MODE）。 */
   cursorAgentMode?: AgentMode;
+  /**
+   * 全局 Sand 通道：把发给 Cursor 的 x-cursor-client-type 从 sdk 改成 sand。
+   * 单个 key 可覆盖（inherit / sdk / sand）。env: SAND_CLIENT_MODE，后台可改。
+   */
+  sandClientMode: boolean;
 }
+
+/** 实际发给 Cursor 的 x-cursor-client-type。 */
+export type CursorClientType = "sdk" | "sand";
+
+/** key 级通道：跟随全局总开关，或强制 sdk / sand。 */
+export type CursorClientTypeSetting = "inherit" | CursorClientType;
 
 export type AgentMode = "agent" | "plan";
 
@@ -138,6 +149,8 @@ export interface CursorRunRequest {
   modelParams?: ModelParameterValue[];
   /** Cursor 会话模式 agent/plan。 */
   mode?: AgentMode;
+  /** 本次请求解析后的 Cursor client-type（sdk / sand）。由 KeyRotatingRunner 按 key 设置写入。 */
+  clientType?: CursorClientType;
 }
 
 export interface CursorRunResult {
@@ -197,6 +210,8 @@ export interface CursorKeyRecord {
   requestCount: number;
   /** 连续失败次数（成功或人工启用即归零），达到自动禁用阈值才会被禁用。 */
   failureCount: number;
+  /** 该 key 的通道：跟随全局 / 强制 SDK / 强制 Sand。 */
+  clientType: CursorClientTypeSetting;
   createdAt: string;
 }
 
@@ -211,6 +226,7 @@ export interface CursorKeyPatch {
   failureCount?: number;
   incrementRequestCount?: boolean;
   incrementFailureCount?: boolean;
+  clientType?: CursorClientTypeSetting;
 }
 
 export interface RequestLogRecord {

@@ -4,6 +4,7 @@ const MAX_MODE_DEFAULT_SETTING = "cursorMaxModeDefault";
 const FAST_DEFAULT_SETTING = "cursorFastDefault";
 const AUTO_DISABLE_KEYS_SETTING = "autoDisableKeys";
 const AUTO_DISABLE_THRESHOLD_SETTING = "autoDisableThreshold";
+const SAND_CLIENT_MODE_SETTING = "sandClientMode";
 
 /**
  * 读取管理后台持久化的“默认开启”状态：
@@ -55,4 +56,15 @@ export async function loadAutoDisableThreshold(store: StateStore, fallback: numb
 
 export function saveAutoDisableThreshold(store: StateStore, threshold: number): Promise<void> {
   return store.setSetting(AUTO_DISABLE_THRESHOLD_SETTING, String(threshold));
+}
+
+/** Sand 通道总开关：off 是明确的「全局走 SDK」，不是「交回默认」。 */
+export async function loadSandClientMode(store: StateStore, fallback: boolean): Promise<boolean> {
+  const stored = await store.getSetting(SAND_CLIENT_MODE_SETTING);
+  if (stored === undefined) return fallback;
+  return stored === "on";
+}
+
+export function saveSandClientMode(store: StateStore, enabled: boolean): Promise<void> {
+  return saveDefault(store, SAND_CLIENT_MODE_SETTING, enabled);
 }

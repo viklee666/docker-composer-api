@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "./errors.js";
-import type { CursorKeyRecord, StateStore } from "./types.js";
+import type { CursorClientTypeSetting, CursorKeyRecord, StateStore } from "./types.js";
 
 export type KeyFailureKind = "quota" | "auth" | "transient";
 
@@ -52,6 +52,7 @@ export class CursorKeyPool {
         sortOrder: await this.nextSortOrder(),
         requestCount: 0,
         failureCount: 0,
+        clientType: "inherit",
         createdAt: new Date().toISOString()
       });
     }
@@ -70,7 +71,7 @@ export class CursorKeyPool {
     return (await this.store.listCursorKeys()).length > 0;
   }
 
-  async add(apiKey: string, label?: string): Promise<CursorKeyRecord> {
+  async add(apiKey: string, label?: string, clientType: CursorClientTypeSetting = "inherit"): Promise<CursorKeyRecord> {
     const trimmed = apiKey.trim();
     if (!trimmed) throw new ApiError("Cursor key must not be empty.", 400, "invalid_request_error", "key");
     const existing = await this.store.getCursorKeyByValue(trimmed);
@@ -84,10 +85,19 @@ export class CursorKeyPool {
       sortOrder: await this.nextSortOrder(),
       requestCount: 0,
       failureCount: 0,
+      clientType,
       createdAt: new Date().toISOString()
     };
     await this.store.insertCursorKey(record);
     return record;
+  }
+
+  async getByValue(apiKey: string): Promise<CursorKeyRecord | undefined> {
+    return this.store.getCursorKeyByValue(apiKey);
+  }
+
+  async setClientType(id: string, clientType: CursorClientTypeSetting): Promise<boolean> {
+    return this.store.updateCursorKey(id, { clientType });
   }
 
   /** 按给定 id 序列调整取用顺序；id 必须全部存在于池中。 */

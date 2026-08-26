@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { getCurrentCursorClientType, runWithCursorClientType } from "./sand-client.js";
 import type { GatewayModel, ModelParameterDefinition, ModelVariantDefinition } from "./types.js";
 
 /** 上游不可达且无缓存时的静态兜底列表。 */
@@ -39,7 +40,8 @@ const failureAt = new Map<string, number>();
 let lastForcedRefreshAt = 0;
 
 function cacheBucket(apiKey: string): string {
-  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+  // Sand / SDK 通道可见模型可能不同，按通道分桶避免串名单。
+  return createHash("sha256").update(`${apiKey}\0${getCurrentCursorClientType()}`).digest("hex").slice(0, 16);
 }
 
 function setCache(bucket: string, entry: { models: ModelEntry[]; at: number }): void {
@@ -87,7 +89,7 @@ export async function listAvailableModels(apiKey?: string, forceRefresh = false)
     const cursor = sdk.Cursor as
       | { models?: { list?: (options: { apiKey: string }) => Promise<unknown> } }
       | undefined;
-    const listed = await cursor?.models?.list?.({ apiKey });
+    const listed = await runWithCursorClientType(getCurrentCursorClientType(), () => cursor?.models?.list?.({ apiKey }));
     const models = parseSdkModels(listed);
     if (models.length) {
       setCache(bucket, { models, at: Date.now() });

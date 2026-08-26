@@ -1,6 +1,6 @@
 {
   "name": "docker-composer-api",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "Docker-deployable OpenAI and Anthropic compatible API gateway for Cursor Composer.",

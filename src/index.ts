@@ -6,14 +6,26 @@ import {
   loadAutoDisableKeys,
   loadAutoDisableThreshold,
   loadCursorFastDefault,
-  loadCursorMaxModeDefault
+  loadCursorMaxModeDefault,
+  loadSandClientMode
 } from "./gateway-settings.js";
 import { CursorKeyPool } from "./key-pool.js";
 import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
+import {
+  installSandClientHeaderHook,
+  isSandClientHookPatched,
+  resolveCursorClientType,
+  runWithCursorClientType,
+  setGlobalCursorClientType,
+  waitForSandClientHook
+} from "./sand-client.js";
 import { applyCursorSdkNetworkConfig, loadCursorSdkUseHttp1ForAgent } from "./sdk-network.js";
 import { createApp } from "./server.js";
 import { SqliteStateStore } from "./store.js";
+
+// 必须在任何 import("@cursor/sdk") 之前挂上 loader，否则硬编码的 client-type 头无法按请求改写。
+installSandClientHeaderHook();
 
 // Cursor SDK 在云端流以 end-stream error 收场时，底层 ConnectError 可能以 unhandledRejection 形式逃逸
 //（官方已确认的 SDK 行为）。兜底记录并截断，避免拖垮进程或在未来 Node 版本触发非零退出；不打印完整堆栈以免泄露敏感上下文。
@@ -24,6 +36,10 @@ process.on("unhandledRejection", (reason) => {
 
 const config = loadConfig();
 const store = new SqliteStateStore(config.sqlitePath);
+// Sand 总开关必须在任何 @cursor/sdk import 之前落到 __cursorClientType。
+// HTTP/1 配置会动态 import SDK，不能放在 setGlobal 前面。
+config.sandClientMode = await loadSandClientMode(store, config.sandClientMode);
+setGlobalCursorClientType(config.sandClientMode ? "sand" : "sdk");
 config.cursorSdkUseHttp1ForAgent = await loadCursorSdkUseHttp1ForAgent(store, config.cursorSdkUseHttp1ForAgent);
 if (config.cursorSdkUseHttp1ForAgent) {
   await applyCursorSdkNetworkConfig(true);
@@ -67,7 +83,8 @@ const sdkRunner = new CursorSdkRunner(store, {
 });
 const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
   maxKeyAttempts: config.maxKeyAttempts,
-  maxTransientAttempts: config.maxTransientAttempts
+  maxTransientAttempts: config.maxTransientAttempts,
+  resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
 });
 const app = createApp({
   config,
@@ -82,6 +99,7 @@ console.log(`Docker Composer API listening on http://${config.host}:${config.por
 console.log(`Admin panel available at /admin (${config.adminPassword ? "enabled" : "disabled: set ADMIN_PASSWORD"})`);
 if (config.cursorSdkDisableSessionResume) console.log("Cursor SDK session resume disabled (stateless per request)");
 if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1.1 mode enabled");
+if (config.sandClientMode) console.log("Cursor Sand channel enabled globally (per-key overrides still apply)");
 
 // 启动即预热 SDK：默认路径下 SDK 是首个请求才懒加载的，冷加载 + 本地执行器初始化会拖慢首请求的首 token。
 // 预热失败不影响服务（首请求会再走懒加载）。
@@ -90,11 +108,15 @@ if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1
 void (async () => {
   try {
     await import("@cursor/sdk");
-    console.log("Cursor SDK preloaded");
+    const hooked = await waitForSandClientHook();
+    console.log(hooked || isSandClientHookPatched()
+      ? "Cursor SDK preloaded (client-type hook applied)"
+      : "Cursor SDK preloaded (client-type hook not confirmed; Sand requests will fail closed)");
     const poolKey = (await keyPool.list()).find((key) => key.status === "active");
     if (!poolKey) return;
     // 预扫描工作区（规则/忽略文件等），让首个 send() 少一段准备时间。
-    await executorLeases.warm(poolKey.apiKey, config.cursorWorkingDirectory);
+    const clientType = resolveCursorClientType(poolKey.clientType, config.sandClientMode ? "sand" : "sdk");
+    await runWithCursorClientType(clientType, () => executorLeases.warm(poolKey.apiKey, config.cursorWorkingDirectory));
     console.log("Cursor workspace prewarmed");
   } catch (error) {
     console.error(`[prewarm] Cursor SDK preload failed (first request will lazy-load): ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);

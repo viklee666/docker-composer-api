@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
+import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorClientType, waitForSandClientHook } from "./sand-client.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { isRitualAssistantText, parseToolCallJson, parseToolMarkers } from "./protocol.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
@@ -89,14 +90,16 @@ export class CursorSdkRunner implements CursorRunner {
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     if (signal?.aborted) throw new ApiError("Request was aborted.", 499, "request_aborted");
     const id = sessionId(input);
+    const clientType = input.clientType ?? getCurrentCursorClientType();
     try {
       // stateless 模式（默认）下每请求都是独立 fresh agent，没有共享会话状态需要保护；
       // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
+      // client-type 必须包住整段 SDK 调用：header 是在 create/send 时写入的。
       if (this.input.disableSessionResume) {
-        yield* this.streamLocked(input, signal, id);
+        yield* iterateWithCursorClientType(clientType, this.streamLocked(input, signal, id));
         return;
       }
-      yield* this.withSessionLock(id, () => this.streamLocked(input, signal, id));
+      yield* iterateWithCursorClientType(clientType, this.withSessionLock(id, () => this.streamLocked(input, signal, id)));
     } catch (error) {
       await this.recycleExecutorOnAuthFailure(input, error);
       throw error;
@@ -486,6 +489,18 @@ export class CursorSdkRunner implements CursorRunner {
     const { Agent } = await import("@cursor/sdk") as Record<string, unknown>;
     if (!Agent || typeof Agent !== "function" && typeof Agent !== "object") {
       throw new ApiError("@cursor/sdk Agent export is unavailable.", 500, "cursor_sdk_unavailable");
+    }
+    // 只拦 Sand 请求：hook 没打上时硬编码仍是 sdk，宁可 503 也不假装已经走 Sand。
+    // SDK 通道不依赖 hook，也不在这里多等，避免拖慢历史默认路径。
+    if (getCurrentCursorClientType() === "sand") {
+      await waitForSandClientHook();
+      if (!isSandClientHookPatched()) {
+        throw new ApiError(
+          "Sand channel is selected but the Cursor SDK client-type hook did not apply. Restart the gateway and check [sand-client-loader] logs.",
+          503,
+          "sand_channel_unavailable"
+        );
+      }
     }
     return Agent as AgentFactory;
   }
