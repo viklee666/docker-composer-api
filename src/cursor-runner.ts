@@ -3,7 +3,7 @@ import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
 import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorClientType, waitForSandClientHook } from "./sand-client.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
-import { isRitualAssistantText, parseToolCallJson, parseToolMarkers } from "./protocol.js";
+import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers } from "./protocol.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
 import type {
   AgentMode,
@@ -14,6 +14,8 @@ import type {
   ExecutorLeaseManager,
   GatewayToolCall,
   ModelParameterValue,
+  RequestUsage,
+  RunTelemetryRef,
   StateStore
 } from "./types.js";
 
@@ -128,6 +130,7 @@ export class CursorSdkRunner implements CursorRunner {
     // 目录拉取 / agent 创建 / send 这些 SDK 调用可能既不 settle 也不感知 signal（上游传输挂死）。
     // 全部与 abort 竞速：空闲超时或客户端断连时请求一定能收尾，而不是永久悬挂、随流量持续堆积句柄与内存。
     const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
+    recordRunTelemetry(input, resolved);
     const existingAgentId = this.input.disableSessionResume ? undefined : await this.store.getSession(id);
     let resumedAgent: AgentLike | undefined;
     if (existingAgentId && typeof factory.resume === "function") {
@@ -209,6 +212,8 @@ export class CursorSdkRunner implements CursorRunner {
   ): AsyncIterable<CursorStreamEvent> {
     let activeRun: RunLike | undefined;
     let finishedNormally = false;
+    // 上游用量按 turn 记账：两条通道都会报同一个 turn，收尾时只取一份（见 TurnUsageLedger）。
+    const usageLedger = new TurnUsageLedger();
     // onDelta（SDK 逐 token 回调）与 run.stream()（消息级事件）合流进同一个队列消费：
     // 文本以 token 粒度实时下发；tool_call / 错误归因仍走消息级事件。
     const queue = new AsyncQueue<QueueItem>();
@@ -226,6 +231,11 @@ export class CursorSdkRunner implements CursorRunner {
       };
       const run = await this.sendWithOptionalCustomTools(agent, input, customTools, resolved, onDelta, signal);
       activeRun = run;
+      // 记下 agent/run 标识，供 UsageReconciler 事后按 agent 回查计费金额。
+      if (input.telemetryRef) {
+        if (agent.agentId) input.telemetryRef.agentId = agent.agentId;
+        if (run.id) input.telemetryRef.runId = run.id;
+      }
       // abort 必须能唤醒空队列等待，否则超时/断连时上游无事件的 run 会永久挂住。
       signal?.addEventListener("abort", onAbort, { once: true });
       // abort 若恰好发生在 await send() 期间，事件在注册 listener 前已触发，必须补推一次。
@@ -287,10 +297,18 @@ export class CursorSdkRunner implements CursorRunner {
             thinkingSource = "delta";
             if (keepThinking) thinkingParts.push(update.text);
             yield { type: "thinking", text: update.text };
+          } else if (type === "turn-ended") {
+            // turn-ended 的 usage 是可选的，且线上不带 totalTokens；解析不出就什么都不记。
+            const turnUsage = parseSdkUsage(update);
+            if (turnUsage) {
+              usageLedger.addDeltaTurn(turnUsage);
+              publishUsageTotal(usageLedger, input.telemetryRef);
+            }
           }
         } else if (item.kind === "event") {
           streamHadItems = true;
           const event = item.event;
+          captureUsageFromSdkEvent(event, input.telemetryRef, usageLedger);
           const thinking = thinkingFromSdkEvent(event);
           if (thinking && thinkingSource !== "delta") {
             thinkingSource = "message";
@@ -780,6 +798,150 @@ export function textFromSdkEvent(event: unknown): string {
     return "";
   }
   return "";
+}
+
+/**
+ * 从 SDK 的 turn-ended / usage 负载里解析出用量；解析不出返回 undefined。
+ *
+ * 两种入参形状都接受：外层带 `usage` 字段的整包（turn-ended 更新、SDKUsageMessage），
+ * 或已经剥出来的 token 计数对象。四个必备字段（input/output/cacheRead/cacheWrite）
+ * 少任何一个都当作「上游这次没报用量」返回 undefined，绝不用半份数据冒充真实用量
+ * ——写进日志的 usageSource=sdk 是要拿来对账的。
+ */
+export function parseSdkUsage(payload: unknown): RequestUsage | undefined {
+  const record = asRecord(payload);
+  if (!record) return undefined;
+  const source = asRecord(record.usage) ?? record;
+  const inputTokens = finiteNumber(source.inputTokens);
+  const outputTokens = finiteNumber(source.outputTokens);
+  const cacheReadTokens = finiteNumber(source.cacheReadTokens);
+  const cacheWriteTokens = finiteNumber(source.cacheWriteTokens);
+  if (
+    inputTokens === undefined ||
+    outputTokens === undefined ||
+    cacheReadTokens === undefined ||
+    cacheWriteTokens === undefined
+  ) {
+    return undefined;
+  }
+  const reasoningTokens = finiteNumber(source.reasoningTokens);
+  // 即使 SDK 带 totalTokens 也重新按四桶校验；历史与协议估算必须共享同一不变量，不能让矛盾总数流出去：
+  // 四个桶互斥，合计是四者之和（reasoning 是 output 的子集，不另计）。
+  // 漏掉两个缓存桶会让历史里的合计显著偏小——缓存读取往往比未命中的输入还大一个量级。
+  const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens })
+  };
+}
+
+/** 字段级累加多个 turn 的用量。两侧都没有 reasoningTokens 时结果也不带这个字段。 */
+export function mergeUsage(base: RequestUsage | undefined, next: RequestUsage | undefined): RequestUsage | undefined {
+  if (!base) return next ? normalizeRequestUsage(next) : undefined;
+  if (!next) return normalizeRequestUsage(base);
+  const reasoningTokens = base.reasoningTokens === undefined && next.reasoningTokens === undefined
+    ? undefined
+    : (base.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0);
+  return normalizeRequestUsage({
+    inputTokens: base.inputTokens + next.inputTokens,
+    outputTokens: base.outputTokens + next.outputTokens,
+    cacheReadTokens: base.cacheReadTokens + next.cacheReadTokens,
+    cacheWriteTokens: base.cacheWriteTokens + next.cacheWriteTokens,
+    totalTokens: base.totalTokens + next.totalTokens,
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens })
+  });
+}
+
+/** onDelta 不带 run_id：它只服务当前这一个 run，用这个哨兵 key 归组。 */
+const UNKNOWN_RUN_KEY = "";
+
+/**
+ * 按 turn 记账，解决两条通道重复上报同一个 turn 的问题。
+ *
+ * 一次请求可能跑多个 turn，而同一个 turn 会被 onDelta 的 turn-ended 与 run.stream()
+ * 的消息级 usage 事件各报一次，直接相加就是双倍计量。去重办法：两条通道各自按
+ * 「run_id + 到达序号」建账（onDelta 没有 run_id，归到当前 run），收尾时同一序号
+ * 优先取消息级 usage —— 它自带权威 totalTokens；只有消息级没覆盖到的尾部 turn
+ * （例如流在 usage 事件到达前就被工具调用打断）才回退用 delta 的数字。
+ * 两条通道各自内部序号单调递增，所以只需在收尾时按数量对齐，不依赖跨通道的到达次序。
+ */
+class TurnUsageLedger {
+  private readonly deltaTurns: RequestUsage[] = [];
+  private readonly messageTurns = new Map<string, RequestUsage[]>();
+  /** onDelta 归属的 run：认第一个见到的 run_id。 */
+  private primaryRunKey?: string;
+
+  addDeltaTurn(usage: RequestUsage): void {
+    this.deltaTurns.push(usage);
+  }
+
+  addMessageTurn(runId: string | undefined, usage: RequestUsage): void {
+    const key = runId ?? UNKNOWN_RUN_KEY;
+    this.primaryRunKey ??= key;
+    const turns = this.messageTurns.get(key);
+    if (turns) turns.push(usage);
+    else this.messageTurns.set(key, [usage]);
+  }
+
+  total(): RequestUsage | undefined {
+    let total: RequestUsage | undefined;
+    for (const turns of this.messageTurns.values()) {
+      for (const usage of turns) total = mergeUsage(total, usage);
+    }
+    const covered = this.messageTurns.get(this.primaryRunKey ?? UNKNOWN_RUN_KEY)?.length ?? 0;
+    for (const usage of this.deltaTurns.slice(covered)) total = mergeUsage(total, usage);
+    return total;
+  }
+}
+
+/** 把账本当前合计写回遥测通道：提前 break / abort 收尾时也能留下已采到的那部分。 */
+function publishUsageTotal(ledger: TurnUsageLedger, telemetry: RunTelemetryRef | undefined): void {
+  if (!telemetry) return;
+  const total = ledger.total();
+  if (total) telemetry.usage = total;
+}
+
+/**
+ * 消息级事件里的用量与标识：system(init) 与 usage 事件都带 agent_id / run_id，
+ * usage 事件另带该 turn 的权威 TokenUsage。整段按未知边界防御解析，
+ * 畸形负载只会「没采到」，不会把异常抛进流循环。
+ */
+function captureUsageFromSdkEvent(
+  event: unknown,
+  telemetry: RunTelemetryRef | undefined,
+  ledger: TurnUsageLedger
+): void {
+  const record = asRecord(event);
+  const type = typeof record?.type === "string" ? record.type : "";
+  if (!record || (type !== "usage" && type !== "system")) return;
+  const runId = stringValue(record.run_id) ?? stringValue(record.runId);
+  if (telemetry) {
+    const agentId = stringValue(record.agent_id) ?? stringValue(record.agentId);
+    if (agentId) telemetry.agentId = agentId;
+    if (runId) telemetry.runId = runId;
+  }
+  if (type !== "usage") return;
+  const usage = parseSdkUsage(record);
+  if (!usage) return;
+  ledger.addMessageTurn(runId, usage);
+  publishUsageTotal(ledger, telemetry);
+}
+
+/** 把真实下发给上游的模型 / 参数 / 通道写回遥测通道，用于核对推理强度、1M、fast 是否真的生效。 */
+function recordRunTelemetry(input: CursorRunRequest, resolved: ResolvedModelRun): void {
+  const telemetry = input.telemetryRef;
+  if (!telemetry) return;
+  telemetry.upstreamModel = resolved.model.id;
+  if (resolved.model.params?.length) telemetry.modelParams = resolved.model.params.map((param) => ({ ...param }));
+  telemetry.clientType = input.clientType ?? getCurrentCursorClientType();
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function resultText(value: unknown): string {

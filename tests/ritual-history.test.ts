@@ -16,6 +16,8 @@ const CASUAL_FETCH_THEN_SCHEMA = "I'll fetch the notes, then discuss the schema.
 const INCOMPLETE_SCHEMA_SHORT = "incomplete schema ok";
 const SECRET_REASONING_ALIGN = "secret reasoning align";
 const EARLIER_ANSWER = "earlier answer";
+const STALE_INSTRUCTIONS = "Always answer in haiku form.";
+const FRESH_INSTRUCTIONS = "Always answer with a numbered list.";
 const USER_SCHEMA_MESSAGE = "Please keep discussing the course JSON schema in this thread.";
 
 /** >200 chars, mentions schema once, no 拉齐/对齐/align/fetch-schema planning phrasing. */
@@ -235,6 +237,7 @@ test("prepareOpenAiResponses drops ritual assistant input and host-meta function
 test("prepareOpenAiResponses sanitizes previous_response dump without mutating the stored snapshot", () => {
   const stored = {
     id: "resp_prev",
+    instructions: STALE_INSTRUCTIONS,
     tools: [
       { type: "function", name: "GetMcpTools", parameters: { type: "object" } },
       { type: "function", name: "Read", parameters: { type: "object" } }
@@ -254,8 +257,21 @@ test("prepareOpenAiResponses sanitizes previous_response dump without mutating t
   assert.ok(!prompt.includes("align schema internally"), "reasoning must not enter PREVIOUS_RESPONSE dump");
   assert.ok(prompt.includes(EARLIER_ANSWER), "regular assistant output stays in the dump");
   assert.ok(prompt.includes("Read"), "client Read tool stays in the dump");
+  // instructions 是逐轮参数：官方语义下它不随 previous_response_id 继承，快照回灌等于把过期指令又发一遍。
+  assert.ok(!prompt.includes(STALE_INSTRUCTIONS), "previous instructions must not re-enter the prompt");
   assert.equal(stored.tools[0].name, "GetMcpTools", "stored snapshot must not be mutated");
+  assert.equal(stored.instructions, STALE_INSTRUCTIONS, "stored instructions must not be mutated");
   assert.equal((stored.output[1] as { content: Array<{ text: string }> }).content[0].text, RITUAL_HISTORY_SENTENCE);
+});
+
+test("a resent instructions is this turn's client system, not the previous turn's leftover", () => {
+  const stored = { id: "resp_prev", instructions: STALE_INSTRUCTIONS, output: [] };
+  const prepared = prepareOpenAiResponses(
+    { model: "composer-2.5", instructions: FRESH_INSTRUCTIONS, input: "Continue" },
+    { response: stored, inputItems: [] }
+  );
+  assert.ok(prepared.prompt.includes(`INSTRUCTIONS:\n${FRESH_INSTRUCTIONS}`), prepared.prompt);
+  assert.ok(!prepared.prompt.includes(STALE_INSTRUCTIONS), prepared.prompt);
 });
 
 test("prepareAnthropicMessages drops host-meta tool_use and matching tool_result from history", () => {

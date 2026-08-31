@@ -1,10 +1,15 @@
-import type { StateStore } from "./types.js";
+import type { RoutingStrategy, StateStore, SystemPromptMode, SystemPromptSettings } from "./types.js";
 
 const MAX_MODE_DEFAULT_SETTING = "cursorMaxModeDefault";
 const FAST_DEFAULT_SETTING = "cursorFastDefault";
 const AUTO_DISABLE_KEYS_SETTING = "autoDisableKeys";
 const AUTO_DISABLE_THRESHOLD_SETTING = "autoDisableThreshold";
 const SAND_CLIENT_MODE_SETTING = "sandClientMode";
+const ROUTING_STRATEGY_SETTING = "routingStrategy";
+const SESSION_AFFINITY_SETTING = "sessionAffinity";
+const SESSION_AFFINITY_TTL_SETTING = "sessionAffinityTtlMs";
+const SYSTEM_PROMPT_MODE_SETTING = "systemPromptMode";
+const SYSTEM_PROMPT_TEXT_SETTING = "systemPromptText";
 
 /**
  * 读取管理后台持久化的“默认开启”状态：
@@ -67,4 +72,60 @@ export async function loadSandClientMode(store: StateStore, fallback: boolean): 
 
 export function saveSandClientMode(store: StateStore, enabled: boolean): Promise<void> {
   return saveDefault(store, SAND_CLIENT_MODE_SETTING, enabled);
+}
+
+/**
+ * key 取用策略。默认 fill-first：Cursor 按 key 缓存 prompt，轮询换 key 会丢掉缓存、
+ * 让同一段上下文重复计费，所以轮询必须由用户显式开启。
+ */
+export async function loadRoutingStrategy(store: StateStore, fallback: RoutingStrategy): Promise<RoutingStrategy> {
+  const stored = await store.getSetting(ROUTING_STRATEGY_SETTING);
+  if (stored === undefined) return fallback;
+  return stored === "round-robin" ? "round-robin" : "fill-first";
+}
+
+export function saveRoutingStrategy(store: StateStore, strategy: RoutingStrategy): Promise<void> {
+  return store.setSetting(ROUTING_STRATEGY_SETTING, strategy);
+}
+
+/** 会话粘性开关：off 是明确的「每次都重新选 key」，不是「交回默认」。 */
+export async function loadSessionAffinity(store: StateStore, fallback: boolean): Promise<boolean> {
+  const stored = await store.getSetting(SESSION_AFFINITY_SETTING);
+  if (stored === undefined) return fallback;
+  return stored === "on";
+}
+
+export function saveSessionAffinity(store: StateStore, enabled: boolean): Promise<void> {
+  return saveDefault(store, SESSION_AFFINITY_SETTING, enabled);
+}
+
+export async function loadSessionAffinityTtlMs(store: StateStore, fallback: number): Promise<number> {
+  const stored = Number.parseInt((await store.getSetting(SESSION_AFFINITY_TTL_SETTING)) ?? "", 10);
+  return Number.isFinite(stored) && stored > 0 ? stored : fallback;
+}
+
+export function saveSessionAffinityTtlMs(store: StateStore, ttlMs: number): Promise<void> {
+  return store.setSetting(SESSION_AFFINITY_TTL_SETTING, String(ttlMs));
+}
+
+/**
+ * 默认系统提示词。mode 与正文分两个键存：正文可能很长且含换行，
+ * 与 mode 混在一个值里会让「关掉注入但保留草稿」变得不可能。
+ */
+export async function loadSystemPromptSettings(
+  store: StateStore,
+  fallback: SystemPromptSettings
+): Promise<SystemPromptSettings> {
+  const storedMode = await store.getSetting(SYSTEM_PROMPT_MODE_SETTING);
+  const storedText = await store.getSetting(SYSTEM_PROMPT_TEXT_SETTING);
+  const mode: SystemPromptMode = storedMode === undefined
+    ? fallback.mode
+    : storedMode === "append" || storedMode === "override" ? storedMode : "off";
+  const text = storedText === undefined ? fallback.text : storedText || undefined;
+  return { mode, ...(text ? { text } : {}) };
+}
+
+export async function saveSystemPromptSettings(store: StateStore, settings: SystemPromptSettings): Promise<void> {
+  await store.setSetting(SYSTEM_PROMPT_MODE_SETTING, settings.mode);
+  await store.setSetting(SYSTEM_PROMPT_TEXT_SETTING, settings.text ?? "");
 }

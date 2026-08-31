@@ -8,15 +8,28 @@ import { createEphemeralAgentStore } from "../src/agent-store.js";
 import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError, openAiErrorType, openAiStatus } from "../src/errors.js";
 import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
 import { ExecutorWarmPool } from "../src/executor-warmup.js";
+import { GatewayKeyPool } from "../src/gateway-key-pool.js";
 import { CursorKeyPool, classifyKeyFailure, indicatesUpstreamAuthFailure, type AutoDisablePolicy } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
 import type { ModelLister } from "../src/models.js";
 import { parseToolMarkers } from "../src/protocol.js";
+import { sessionBindingHash } from "../src/routing.js";
 import { createApp } from "../src/server.js";
 import { MemoryStateStore, SqliteStateStore } from "../src/store.js";
 import { normalizeToolCallForClient } from "../src/tool-compat.js";
-import type { CursorRunRequest, CursorRunResult, CursorRunner, CursorStreamEvent, GatewayConfig, GatewayTool } from "../src/types.js";
+import { UsageReconciler } from "../src/usage-reconciler.js";
+import type {
+  CursorRunRequest,
+  CursorRunResult,
+  CursorRunner,
+  CursorStreamEvent,
+  GatewayConfig,
+  GatewayTool,
+  ModelScope,
+  RequestLogRecord,
+  RunTelemetryRef
+} from "../src/types.js";
 
 const baseConfig: GatewayConfig = {
   host: "127.0.0.1",
@@ -26,6 +39,7 @@ const baseConfig: GatewayConfig = {
   adminPassword: "gateway-key",
   allowDirectCursorKeys: true,
   sqlitePath: ":memory:",
+  requestLogKeep: 0,
   cursorWorkingDirectory: "/workspace",
   requestTimeoutMs: 10_000,
   sdkClientVersion: "sdk-1.0.27",
@@ -36,7 +50,12 @@ const baseConfig: GatewayConfig = {
   maxTransientAttempts: 3,
   autoDisableKeys: true,
   autoDisableThreshold: 2,
-  sandClientMode: false
+  sandClientMode: false,
+  routingStrategy: "fill-first",
+  sessionAffinity: false,
+  sessionAffinityTtlMs: 60 * 60 * 1000,
+  systemPromptMode: "off",
+  cursorPrewarm: false
 };
 
 test("health and models are available", async () => {
@@ -80,6 +99,45 @@ test("models endpoint serves upstream list with auth and supports retrieval by i
     headers: { authorization: "Bearer gateway-key" }
   });
   assert.equal(missing.statusCode, 404);
+});
+
+test("models endpoint does not send an unregistered direct token to the model lister", async () => {
+  const asked: (string | undefined)[] = [];
+  const { app } = await createTestApp({
+    modelLister: async (apiKey) => {
+      asked.push(apiKey);
+      return {
+        models: [{ id: "composer-2.5", name: "Composer", aliases: [] }],
+        source: "cursor"
+      };
+    }
+  });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/v1/models",
+    headers: { authorization: "Bearer unregistered-direct-token" }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(asked, [undefined]);
+});
+
+test("models endpoint applies a registered direct key's own model scope", async () => {
+  const { app, keyPool } = await createTestApp({ keys: ["server-cursor-key", "other-cursor-key"] });
+  const direct = (await keyPool.list()).find((key) => key.apiKey === "server-cursor-key");
+  assert.ok(direct);
+  await keyPool.setModelScope(direct.id, { allowed: [], excluded: ["claude-fable-5"] });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/v1/models",
+    headers: { authorization: "Bearer server-cursor-key" }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(
+    response.json().data.map((model: { id: string }) => model.id),
+    ["composer-2.5"]
+  );
 });
 
 test("chat completions supports gateway auth via key pool", async () => {
@@ -230,6 +288,40 @@ test("sqlite store migrates legacy cursor_keys table and supports reorder", asyn
   assert.equal(await store.getSession("session-a"), "agent-a");
   assert.equal(await store.deleteSession("session-a"), true);
   assert.equal(await store.getSession("session-a"), undefined);
+});
+
+test("sqlite store backfills the conversation seed column on a legacy responses table", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "composer-api-test-")), "state.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE responses (
+      id TEXT PRIMARY KEY,
+      owner_hash TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      input_items_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO responses (id, owner_hash, response_json, input_items_json, created_at, updated_at) VALUES
+      ('resp_old', 'owner', '{"id":"resp_old"}', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+  `);
+  legacy.close();
+
+  const store = new SqliteStateStore(path);
+  // 补列之前存下的响应没有种子：续聊时退回按请求体现算，认不出就不启用粘性，而不是报错。
+  const old = await store.getResponse("resp_old", "owner");
+  assert.ok(old);
+  assert.equal(old.conversationSeed, undefined);
+  assert.deepEqual(old.inputItems, []);
+
+  const now = new Date().toISOString();
+  const record = { id: "resp_new", ownerHash: "owner", response: {}, inputItems: [], createdAt: now, updatedAt: now };
+  await store.saveResponse({ ...record, conversationSeed: "seed-abc" });
+  assert.equal((await store.getResponse("resp_new", "owner"))?.conversationSeed, "seed-abc");
+  // 覆写同一条记录时种子跟着走，续聊链不会因为一次重写而断掉。
+  await store.saveResponse({ ...record, conversationSeed: "seed-def" });
+  assert.equal((await store.getResponse("resp_new", "owner"))?.conversationSeed, "seed-def");
+  assert.equal(await store.getResponse("resp_new", "other-owner"), undefined);
 });
 
 test("returns 429 insufficient_quota when every key is exhausted", async () => {
@@ -420,7 +512,8 @@ test("upstream auth failures recycle the shared SDK executor so a poisoned auth 
       warm: async () => undefined,
       recycle: async (apiKey, cwd) => {
         recycled.push(`${apiKey}@${cwd}`);
-      }
+      },
+      releaseAll: async () => ({ ok: true, failures: [] })
     }
   }, factory);
 
@@ -458,7 +551,8 @@ test("quota failures keep the prewarmed executor instead of throwing away the wa
       warm: async () => undefined,
       recycle: async (apiKey, cwd) => {
         recycled.push(`${apiKey}@${cwd}`);
-      }
+      },
+      releaseAll: async () => ({ ok: true, failures: [] })
     }
   }, factory);
 
@@ -715,6 +809,27 @@ test("key rotation stops at maxKeyAttempts instead of trying the whole pool", as
   assert.ok(keys.every((key) => key.status === "active"), "transient failures must not disable keys");
 });
 
+test("the maxKeyAttempts guard does not consume an unexecuted round-robin slot", async () => {
+  const runner = new FakeRunner({ text: "served by key-b" });
+  runner.failWith.set("key-a", new ApiError("Cursor upstream run ended in error", 502, "upstream_run_failed"));
+  const { app } = await createTestApp({
+    runner,
+    keys: ["key-a", "key-b"],
+    config: { routingStrategy: "round-robin" },
+    runnerOptions: { maxKeyAttempts: 1, maxTransientAttempts: 99 }
+  });
+  const request = () => app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+
+  assert.equal((await request()).statusCode, 502);
+  assert.equal((await request()).statusCode, 200);
+  assert.deepEqual(runner.seen, ["key-a", "key-b"]);
+});
+
 test("transient failures stop after maxTransientAttempts to avoid burning the whole pool", async () => {
   const allKeys = ["key-a", "key-b", "key-c", "key-d", "key-e"];
   const runner = new FakeRunner({});
@@ -790,6 +905,143 @@ test("responses stream emits OpenAI Responses events", async () => {
   assert.match(response.body, /event: response\.created/);
   assert.match(response.body, /event: response\.output_text\.delta/);
   assert.match(response.body, /event: response\.completed/);
+});
+
+// ---------------------------------------------------------------------------
+// previous_response_id 续聊的会话粘性
+// ---------------------------------------------------------------------------
+
+const RESPONSES_HEADERS = { authorization: "Bearer gateway-key" };
+const FIRST_TURN = { model: "composer-2.5", instructions: "You are helpful.", input: "Explain closures." };
+const SECOND_TURN = { model: "composer-2.5", input: "Now show me an example." };
+
+/** baseConfig 把粘性关着，这一组用例必须自己开，否则测的是「绑定压根没写」。 */
+function stickyResponsesApp(runner: FakeRunner, config: Partial<GatewayConfig> = {}, keys?: string[]) {
+  return createTestApp({ runner, ...(keys ? { keys } : {}), config: { sessionAffinity: true, ...config } });
+}
+
+async function postResponses(
+  app: ReturnType<typeof createApp>,
+  payload: Record<string, unknown>
+): Promise<Record<string, string>> {
+  const response = await app.inject({ method: "POST", url: "/v1/responses", headers: RESPONSES_HEADERS, payload });
+  assert.equal(response.statusCode, 200, response.body);
+  return response.json();
+}
+
+test("a responses chain keeps one sticky identity across three turns", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await stickyResponsesApp(runner);
+
+  const turn1 = await postResponses(app, FIRST_TURN);
+  const sticky = runner.lastInput?.stickyKey;
+  assert.ok(sticky, "第一轮的请求体里有 system + user，本来就该认得出");
+
+  const turn2 = await postResponses(app, { ...SECOND_TURN, previous_response_id: turn1.id });
+  assert.equal(runner.lastInput?.stickyKey, sticky);
+
+  // 第三轮是关键：链上每条记录只存直接父节点，靠的是每一轮都把继承来的种子再写回自己那行。
+  await postResponses(app, { model: "composer-2.5", previous_response_id: turn2.id, input: "What about memory leaks?" });
+  assert.equal(runner.lastInput?.stickyKey, sticky);
+
+  // 另一段对话必须落到另一个身份，否则粘性就成了「把所有会话钉到同一把 key 上」。
+  await postResponses(app, { ...FIRST_TURN, input: "Explain generators." });
+  assert.notEqual(runner.lastInput?.stickyKey, sticky);
+});
+
+test("the continuation identity comes from storage, not from the request body", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, store } = await stickyResponsesApp(runner);
+
+  const turn1 = await postResponses(app, FIRST_TURN);
+  const sticky = runner.lastInput?.stickyKey;
+  const seed = [...store.responses.values()].find((record) => record.id === turn1.id)?.conversationSeed;
+  assert.ok(seed, "种子必须落库，否则下一轮无从继承");
+  // 纯服务端状态：客户端拿到它就能自己指定这次打到哪把 key。
+  assert.ok(!JSON.stringify(turn1).includes(seed), "种子不得出现在回显给客户端的任何字段里");
+
+  await postResponses(app, { ...SECOND_TURN, previous_response_id: turn1.id });
+  assert.equal(runner.lastInput?.stickyKey, sticky);
+
+  // 同样的请求体去掉 previous_response_id：身份只可能来自库里那一行。
+  await postResponses(app, SECOND_TURN);
+  assert.notEqual(runner.lastInput?.stickyKey, sticky);
+});
+
+test("a responses continuation lands on the key its conversation was bound to", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, store, keyPool } = await stickyResponsesApp(runner, {}, ["key-a", "key-b"]);
+
+  const turn1 = await postResponses(app, FIRST_TURN);
+  const sticky = runner.lastInput?.stickyKey;
+  assert.ok(sticky, "第一轮认不出会话就根本不会写绑定");
+  const bound = store.sessionBindings.get(sessionBindingHash(sticky));
+  assert.ok(bound, "跑通之后这段对话应当被钉到某把 key 上");
+
+  // 把绑定改指到另一把 key：续聊只要真的复用了这段对话的身份就会跟着换过去，
+  // 而 fill-first 本来永远只挑第一把——这一步把「粘性生效」和「碰巧同一把」区分开。
+  const other = (await keyPool.list()).find((key) => key.id !== bound.keyId);
+  assert.ok(other);
+  await store.saveSessionBinding(sessionBindingHash(sticky), other.id);
+
+  await postResponses(app, { ...SECOND_TURN, previous_response_id: turn1.id });
+  assert.equal(runner.lastApiKey, other.apiKey);
+});
+
+test("the streaming save path carries the seed so the next turn still sticks", async () => {
+  const runner = new FakeRunner({ chunks: ["ok"] });
+  const { app } = await stickyResponsesApp(runner);
+
+  const stream = await app.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: RESPONSES_HEADERS,
+    payload: { ...FIRST_TURN, stream: true }
+  });
+  assert.equal(stream.statusCode, 200);
+  const sticky = runner.lastInput?.stickyKey;
+  assert.ok(sticky);
+  const completed = sseFrames(stream.body).at(-1)?.data as { response: { id: string } };
+
+  await postResponses(app, { ...SECOND_TURN, previous_response_id: completed.response.id });
+  assert.equal(runner.lastInput?.stickyKey, sticky);
+});
+
+test("a tool-only continuation still sticks even though its body names no conversation", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await stickyResponsesApp(runner);
+
+  const turn1 = await postResponses(app, { ...FIRST_TURN, input: "Weather in Paris?" });
+  const sticky = runner.lastInput?.stickyKey;
+  assert.ok(sticky);
+
+  const toolInput = [{ type: "function_call_output", call_id: "call_weather", output: "{\"temp\":21}" }];
+  await postResponses(app, { model: "composer-2.5", previous_response_id: turn1.id, input: toolInput });
+  assert.equal(runner.lastInput?.stickyKey, sticky);
+
+  // 同一段输入没有父节点时确实认不出对话——这正是继承要补上的那一环。
+  await postResponses(app, { model: "composer-2.5", input: toolInput });
+  assert.equal(runner.lastInput?.stickyKey, undefined);
+});
+
+test("an unstored or unknown previous_response_id degrades instead of crashing", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await stickyResponsesApp(runner);
+
+  const ephemeral = await postResponses(app, { ...FIRST_TURN, store: false });
+  // 不落库不等于认不出对话：本轮仍按请求体算身份，只是没人能接着往下聊。
+  assert.ok(runner.lastInput?.stickyKey);
+
+  for (const previousResponseId of [ephemeral.id, "resp_never_existed"]) {
+    const continued = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: RESPONSES_HEADERS,
+      payload: { ...SECOND_TURN, previous_response_id: previousResponseId }
+    });
+    assert.equal(continued.statusCode, 404, previousResponseId);
+    assert.equal(continued.json().error.param, "previous_response_id");
+  }
 });
 
 /** Responses 的官方工具定义是扁平的：`{type:"function", name, parameters}`，不是 Chat 的嵌套 function 对象。 */
@@ -3126,6 +3378,414 @@ test("openai chat stream forwards thinking as reasoning_content deltas", async (
   assert.match(response.body, /"content":"answer"/);
 });
 
+// ---------------------------------------------------------------------------
+// 网关密钥的模型可见范围
+// ---------------------------------------------------------------------------
+
+const RESTRICTED_GATEWAY_KEY = "restricted-gateway-key";
+
+/** 四个入口的最小合法请求体：同一条可见范围规则要在每个协议上都成立。 */
+function inferenceCalls(model: string): { url: string; payload: Record<string, unknown> }[] {
+  return [
+    { url: "/v1/chat/completions", payload: { model, messages: [{ role: "user", content: "Hello" }] } },
+    { url: "/v1/responses", payload: { model, input: "Hello" } },
+    { url: "/v1/messages", payload: { model, max_tokens: 64, messages: [{ role: "user", content: "Hello" }] } },
+    { url: "/v1/messages/count_tokens", payload: { model, messages: [{ role: "user", content: "Hello" }] } }
+  ];
+}
+
+async function gatewayKeyApp(
+  apiKey: string,
+  modelScope: ModelScope,
+  runner: CursorRunner,
+  options: { modelLister?: ModelLister; keys?: string[]; config?: Partial<GatewayConfig> } = {}
+): Promise<{ app: ReturnType<typeof createApp>; keyPool: CursorKeyPool }> {
+  const store = new MemoryStateStore();
+  const gatewayKeyPool = new GatewayKeyPool(store);
+  await gatewayKeyPool.add(apiKey, { label: "scoped", modelScope });
+  const { app, keyPool } = await createTestApp({ store, runner, gatewayKeyPool, ...options });
+  return { app, keyPool };
+}
+
+/** 目录整个不可达：冷缓存的进程碰上上游挂掉，正是别名绕过最好用的那个窗口。 */
+const brokenCatalogue: ModelLister = () => {
+  throw new Error("model catalogue unreachable");
+};
+
+/** 目录通了，但里面压根没有这个模型。 */
+const emptyCatalogue: ModelLister = async () => ({ models: [], source: "cursor" });
+
+/** 陈旧快照：还是「fable 这个别名加上去之前」的样子。目录缓存 10 分钟，这段窗口真实存在。 */
+const staleCatalogue: ModelLister = async () => ({
+  models: [
+    { id: "composer-2.5", name: "Cursor Composer 2.5", aliases: ["composer-latest"] },
+    { id: "claude-fable-5", name: "Fable 5", aliases: ["fable-5"] }
+  ],
+  source: "cursor"
+});
+
+/** 只有 cursor-key-b 的账号看得到 fable 这个别名。 */
+const perKeyCatalogue: ModelLister = async (apiKey) => ({
+  models: apiKey === "cursor-key-b"
+    ? [{ id: "claude-fable-5", name: "Fable 5", aliases: ["fable", "fable-5"] }]
+    : [{ id: "composer-2.5", name: "Cursor Composer 2.5", aliases: [] }],
+  source: "cursor"
+});
+
+test("a partial catalogue failure leaves the merged identity unconfirmed", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  const mixedCatalogue: ModelLister = async (apiKey) => {
+    if (apiKey === "cursor-key-a") throw new Error("catalogue unavailable for account A");
+    return {
+      models: [{ id: "claude-fable-5", name: "Fable 5", aliases: [] }],
+      source: "cursor"
+    };
+  };
+  const { app } = await gatewayKeyApp(
+    RESTRICTED_GATEWAY_KEY,
+    { allowed: [], excluded: ["fable"] },
+    runner,
+    { modelLister: mixedCatalogue, keys: ["cursor-key-a", "cursor-key-b"] }
+  );
+
+  // A 的目录可能认识 canonical id 的别名 fable，B 的成功响应不能证明并集已经完整。
+  const response = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "claude-fable-5");
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "model_identity_unverified");
+  assert.deepEqual(runner.seen, []);
+});
+
+test("a Cursor key denylist fails closed when its catalogue is unavailable", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  const { app, keyPool } = await createTestApp({ runner, modelLister: brokenCatalogue });
+  const key = (await keyPool.list())[0];
+  assert.ok(key);
+  await keyPool.setModelScope(key.id, { allowed: [], excluded: ["claude-fable-5"] });
+
+  // 目录挂掉时，fable 可能只是这把 key 的别名；黑名单不能把未知叫法当成安全。
+  const response = await aliasChat(app, "gateway-key", "fable");
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "model_identity_unverified");
+  assert.deepEqual(runner.seen, []);
+});
+
+function aliasChat(app: ReturnType<typeof createApp>, token: string, model: string, stream = false) {
+  return app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { model, messages: [{ role: "user", content: "Hello" }], ...(stream ? { stream: true } : {}) }
+  });
+}
+
+test("a gateway deny list stays enforced when the catalogue cannot confirm the model", async () => {
+  // 「黑名单写 canonical id + 请求写别名 + 目录说不出这是谁」是一条可以主动触发的绕过：
+  // 三种降级形态（挂了 / 没这条 / 陈旧到还没有那个别名）都必须拒绝，而不是当作「没命中」放行。
+  for (const lister of [brokenCatalogue, emptyCatalogue, staleCatalogue]) {
+    const runner = new FakeRunner({ text: "should never run" });
+    const { app } = await gatewayKeyApp(
+      RESTRICTED_GATEWAY_KEY,
+      { allowed: [], excluded: ["claude-fable-5"] },
+      runner,
+      { modelLister: lister }
+    );
+    const response = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "fable");
+    assert.equal(response.statusCode, 403);
+    assert.equal(response.json().error.code, "model_identity_unverified");
+    assert.equal(response.json().error.param, "model");
+    // 与真命中黑名单分开报：运维要区分的正是「该改可见范围」与「上游目录挂了、等一会儿就好」。
+    assert.match(response.json().error.message, /catalogue is unavailable/);
+    assert.deepEqual(runner.seen, []);
+  }
+});
+
+test("the streaming variants of every entry point are refused before any SSE is opened", async () => {
+  const runner = new FakeRunner({ chunks: ["should never run"] });
+  const { app } = await gatewayKeyApp(RESTRICTED_GATEWAY_KEY, { allowed: [], excluded: ["claude-fable-5"] }, runner);
+  const streaming = [
+    { url: "/v1/chat/completions", payload: { model: "fable", stream: true, messages: [{ role: "user", content: "Hello" }] } },
+    { url: "/v1/responses", payload: { model: "fable", stream: true, input: "Hello" } },
+    { url: "/v1/messages", payload: { model: "fable", stream: true, max_tokens: 64, messages: [{ role: "user", content: "Hello" }] } }
+  ];
+  for (const call of streaming) {
+    const response = await app.inject({
+      method: "POST",
+      url: call.url,
+      headers: { authorization: `Bearer ${RESTRICTED_GATEWAY_KEY}`, "anthropic-version": "2023-06-01" },
+      payload: call.payload
+    });
+    assert.equal(response.statusCode, 403, call.url);
+    // 错误必须走信封而不是流：客户端还没开始读 SSE，塞一个流内 error 事件它接不住。
+    assert.ok(!(response.headers["content-type"] ?? "").toString().includes("event-stream"), call.url);
+    assert.equal(response.json().error.type, "permission_error", call.url);
+  }
+  assert.deepEqual(runner.seen, []);
+});
+
+test("a streaming request is refused the same way when the catalogue is down", async () => {
+  const runner = new FakeRunner({ chunks: ["should never run"] });
+  const { app } = await gatewayKeyApp(
+    RESTRICTED_GATEWAY_KEY,
+    { allowed: [], excluded: ["claude-fable-5"] },
+    runner,
+    { modelLister: brokenCatalogue }
+  );
+  const response = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "fable", true);
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "model_identity_unverified");
+  assert.deepEqual(runner.seen, []);
+});
+
+test("model identity does not depend on which key the router happens to pick", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  // 身份取全池并集之前，判定读的是「借来的那把」的目录、执行落在另一把上：
+  // round-robin 两把等权 key 时这两把必然错开，于是只有 b 认识的那个别名永远躲得过黑名单。
+  const { app } = await gatewayKeyApp(
+    RESTRICTED_GATEWAY_KEY,
+    { allowed: [], excluded: ["claude-fable-5"] },
+    runner,
+    { modelLister: perKeyCatalogue, keys: ["cursor-key-a", "cursor-key-b"], config: { routingStrategy: "round-robin" } }
+  );
+  const denied = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "fable");
+  assert.equal(denied.statusCode, 403);
+  assert.equal(denied.json().error.code, "model_not_allowed");
+  assert.deepEqual(runner.seen, []);
+});
+
+test("reading the catalogue no longer steals a slot from round-robin", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({
+    runner,
+    keys: ["key-a", "key-b"],
+    config: { routingStrategy: "round-robin" }
+  });
+  for (let index = 0; index < 2; index += 1) {
+    assert.equal((await aliasChat(app, "gateway-key", "composer-2.5")).statusCode, 200);
+  }
+  // 每请求一次「借 key 读目录」会把游标多推一格，两把等权 key 就会稳定错开。
+  assert.deepEqual(runner.seen, ["key-a", "key-b"]);
+});
+
+test("a gateway allow list and a key allow list may spell the same model differently", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, keyPool } = await gatewayKeyApp(
+    RESTRICTED_GATEWAY_KEY,
+    { allowed: ["claude-fable-5"], excluded: [] },
+    runner
+  );
+  const key = (await keyPool.list())[0];
+  await keyPool.setModelScope(key.id, { allowed: ["fable"], excluded: [] });
+  // 两侧描述的是同一个模型，按字符串求交会落空成「什么都不许用」，把本该放行的请求拒掉。
+  const response = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "claude-fable-5");
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().choices[0].message.content, "ok");
+});
+
+test("an allow-list-only gateway key keeps working while the catalogue is down", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await gatewayKeyApp(
+    RESTRICTED_GATEWAY_KEY,
+    { allowed: ["claude-fable-5"], excluded: [] },
+    runner,
+    { modelLister: brokenCatalogue }
+  );
+  // 白名单只会往更严的方向降级，所以不该被黑名单那条 fail-closed 波及。
+  assert.equal((await aliasChat(app, RESTRICTED_GATEWAY_KEY, "claude-fable-5")).statusCode, 200);
+
+  // 别名请求在目录不可用时会被误拒——这正是「更严」的那一侧，报的也仍是普通的策略拒绝。
+  const byAlias = await aliasChat(app, RESTRICTED_GATEWAY_KEY, "fable");
+  assert.equal(byAlias.statusCode, 403);
+  assert.equal(byAlias.json().error.code, "model_not_allowed");
+});
+
+test("count_tokens honours the scope registered for a direct Cursor key", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, keyPool } = await createTestApp({ runner });
+  const key = (await keyPool.list())[0];
+  await keyPool.setModelScope(key.id, { allowed: [], excluded: ["claude-fable-5"] });
+
+  // count_tokens 不进 runner，另外三个入口那份「已登记 key 的可见范围」在这条路上没人兜。
+  const denied = await app.inject({
+    method: "POST",
+    url: "/v1/messages/count_tokens",
+    headers: { authorization: "Bearer server-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(denied.statusCode, 403);
+  assert.equal(denied.json().error.type, "permission_error");
+
+  // 范围内的模型照常估算。
+  const allowed = await app.inject({
+    method: "POST",
+    url: "/v1/messages/count_tokens",
+    headers: { authorization: "Bearer server-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(allowed.statusCode, 200);
+  assert.ok(allowed.json().input_tokens > 0);
+
+  // 池里没登记过的直传 key 没有范围可言，行为不变。
+  const unregistered = await app.inject({
+    method: "POST",
+    url: "/v1/messages/count_tokens",
+    headers: { authorization: "Bearer direct-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(unregistered.statusCode, 200);
+});
+
+test("a gateway key model denylist is enforced on every inference entry point", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  const { app } = await gatewayKeyApp(RESTRICTED_GATEWAY_KEY, { allowed: [], excluded: ["claude-fable-5"] }, runner);
+  for (const call of inferenceCalls("claude-fable-5")) {
+    const response = await app.inject({
+      method: "POST",
+      url: call.url,
+      headers: { authorization: `Bearer ${RESTRICTED_GATEWAY_KEY}`, "anthropic-version": "2023-06-01" },
+      payload: call.payload
+    });
+    assert.equal(response.statusCode, 403, call.url);
+    assert.equal(response.json().error.type, "permission_error", call.url);
+    // Anthropic 信封没有 code 字段，只有 OpenAI 侧能断言到具体错误码。
+    if (!call.url.startsWith("/v1/messages")) {
+      assert.equal(response.json().error.code, "model_not_allowed", call.url);
+      assert.equal(response.json().error.param, "model", call.url);
+    }
+  }
+  // 一次都没打到上游，这才叫「快速拒绝」。
+  assert.deepEqual(runner.seen, []);
+});
+
+test("requesting a model by alias does not slip past a gateway key denylist", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  const { app } = await gatewayKeyApp(RESTRICTED_GATEWAY_KEY, { allowed: [], excluded: ["claude-fable-5"] }, runner);
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${RESTRICTED_GATEWAY_KEY}` },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "model_not_allowed");
+  assert.deepEqual(runner.seen, []);
+});
+
+test("a gateway key allowlist naming only the canonical id still accepts an alias request", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await gatewayKeyApp(RESTRICTED_GATEWAY_KEY, { allowed: ["claude-fable-5"], excluded: [] }, runner);
+  const allowed = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${RESTRICTED_GATEWAY_KEY}` },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(allowed.statusCode, 200);
+  assert.equal(allowed.json().choices[0].message.content, "ok");
+  // 第二层：网关范围与解析好的身份都随请求下传，选 key 时不必再查目录。
+  assert.deepEqual(runner.lastInput?.gatewayModelScope, { allowed: ["claude-fable-5"], excluded: [] });
+  assert.deepEqual(runner.lastInput?.modelIdentity?.names, ["fable", "claude-fable-5", "fable-5"]);
+
+  const denied = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${RESTRICTED_GATEWAY_KEY}` },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(denied.statusCode, 403);
+  assert.equal(denied.json().error.code, "model_not_allowed");
+});
+
+test("an unrestricted gateway key reaches every entry point unchanged", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await gatewayKeyApp("unrestricted-gateway-key", { allowed: [], excluded: [] }, runner);
+  for (const call of inferenceCalls("claude-fable-5")) {
+    const response = await app.inject({
+      method: "POST",
+      url: call.url,
+      headers: { authorization: "Bearer unrestricted-gateway-key", "anthropic-version": "2023-06-01" },
+      payload: call.payload
+    });
+    assert.equal(response.statusCode, 200, call.url);
+  }
+  // 没有范围就不该往下传，选 key 时才不会白算一次交集。
+  assert.equal(runner.lastInput?.gatewayModelScope, undefined);
+});
+
+test("a Cursor key model denylist also catches a request made by alias", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, keyPool } = await createTestApp({ runner });
+  const key = (await keyPool.list())[0];
+  await keyPool.setModelScope(key.id, { allowed: [], excluded: ["claude-fable-5"] });
+
+  const denied = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(denied.statusCode, 403);
+  assert.equal(denied.json().error.code, "model_not_allowed");
+
+  const allowed = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(allowed.statusCode, 200);
+});
+
+test("direct mode honours the model scope registered for that Cursor key", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app, keyPool } = await createTestApp({ runner });
+  const key = (await keyPool.list())[0];
+  await keyPool.setModelScope(key.id, { allowed: [], excluded: ["claude-fable-5"] });
+
+  const scoped = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer server-cursor-key" },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(scoped.statusCode, 403);
+  assert.equal(scoped.json().error.code, "model_not_allowed");
+
+  // 池里没登记过的直传 key 没有范围可言，行为不变。
+  const unregistered = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "fable", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(unregistered.statusCode, 200);
+});
+
+test("direct mode rejects a disabled registered Cursor key", async () => {
+  const runner = new FakeRunner({ text: "should never run" });
+  const { app, keyPool } = await createTestApp({ runner });
+  const key = (await keyPool.list())[0];
+  assert.ok(key);
+  await keyPool.setModelScope(key.id, { allowed: [], excluded: ["claude-fable-5"] });
+  await keyPool.disable(key.id, "manual");
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer server-cursor-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 401);
+  assert.equal(response.json().error.code, "unauthorized");
+  assert.deepEqual(runner.seen, []);
+
+  const models = await app.inject({
+    method: "GET",
+    url: "/v1/models",
+    headers: { authorization: "Bearer server-cursor-key" }
+  });
+  assert.equal(models.statusCode, 401);
+});
+
 async function createTestApp(options: {
   runner?: CursorRunner;
   store?: MemoryStateStore;
@@ -3134,32 +3794,71 @@ async function createTestApp(options: {
   runnerOptions?: KeyRotatingOptions;
   autoDisable?: Partial<AutoDisablePolicy>;
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
+  /**
+   * 多密钥模式的入站密钥池。不传时鉴权走 config.gatewayApiKey 的单密钥老路径，
+   * 拿不到 per-key 的绑定与模型范围；要验证受限网关密钥的用例必须传。
+   */
+  gatewayKeyPool?: GatewayKeyPool;
+  /** 金额补写器。不传时请求路径完全不查金额（绝大多数用例都不需要）。 */
+  usageReconciler?: UsageReconciler;
+  /** 模型目录。默认是一份健康的双模型目录；要验证目录降级的用例才需要覆盖。 */
+  modelLister?: ModelLister;
 } = {}): Promise<{ app: ReturnType<typeof createApp>; store: MemoryStateStore; keyPool: CursorKeyPool }> {
   const store = options.store ?? new MemoryStateStore();
-  const keyPool = new CursorKeyPool(store, options.autoDisable);
+  const config = { ...baseConfig, ...options.config };
+  // 路由策略必须跟着 config 走：key 池自己也留一份副本，不显式传进来的话
+  // 用例拿到的是池的默认值（会话粘性默认开），跟 config 里写的策略对不上。
+  const keyPool = new CursorKeyPool(store, options.autoDisable, {
+    strategy: config.routingStrategy,
+    sessionAffinity: config.sessionAffinity,
+    sessionAffinityTtlMs: config.sessionAffinityTtlMs
+  });
   await keyPool.seedFromEnv(options.keys ?? ["server-cursor-key"]);
   const inner = options.runner ?? new FakeRunner();
-  const config = { ...baseConfig, ...options.config };
   const runner = new KeyRotatingRunner(inner, keyPool, {
     ...options.runnerOptions,
     resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
   });
-  const modelLister: ModelLister = async () => ({
+  const modelLister: ModelLister = options.modelLister ?? (async () => ({
     models: [
       { id: "composer-2.5", name: "Cursor Composer 2.5", aliases: ["composer-latest", "composer"] },
       { id: "claude-fable-5", name: "Fable 5", aliases: ["fable", "fable-5"] }
     ],
     source: "cursor"
-  });
+  }));
   const app = createApp({
     config,
     store,
     runner,
     keyPool,
+    ...(options.gatewayKeyPool ? { gatewayKeyPool: options.gatewayKeyPool } : {}),
+    ...(options.usageReconciler ? { usageReconciler: options.usageReconciler } : {}),
     modelLister,
     applyCursorSdkNetworkConfig: options.applyCursorSdkNetworkConfig
   });
   return { app, store, keyPool };
+}
+
+/**
+ * 请求历史里最新的一条。走后台接口而不是直接读 store：finishLog 里的落库是 fire-and-forget，
+ * 多一次完整请求往返才能保证它已经写完，顺带把对外暴露的形状也测了。
+ */
+async function latestLog(
+  app: ReturnType<typeof createApp>,
+  endpoint = "/v1/chat/completions"
+): Promise<RequestLogRecord> {
+  const response = await app.inject({ method: "GET", url: "/admin/api/logs", headers: { authorization: "Bearer gateway-key" } });
+  assert.equal(response.statusCode, 200);
+  const log = (response.json().logs as RequestLogRecord[]).find((entry) => entry.endpoint === endpoint);
+  assert.ok(log, `no request log for ${endpoint}`);
+  return log;
+}
+
+/** 让 finishLog 那条 fire-and-forget 的落库链（含它 then 里的金额补写排队）跑完。 */
+function tick(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
 }
 
 interface SseFrame {
@@ -3240,6 +3939,8 @@ class FakeRunner implements CursorRunner {
     hangIgnoringAbort?: boolean;
     /** 吐完 chunks 后无视 abort 永久挂死，验证流中途的竞速兜底。 */
     hangAfterChunksIgnoringAbort?: boolean;
+    /** 覆盖写回 telemetryRef 的遥测（实测用量、真正下发的 model.params 等）。 */
+    telemetry?: Partial<RunTelemetryRef>;
   } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
@@ -3247,10 +3948,12 @@ class FakeRunner implements CursorRunner {
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    this.noteTelemetry(input);
     if (this.output.hangIgnoringAbort) await new Promise(() => undefined);
     return {
       text: this.output.text ?? "ok",
       toolCalls: this.output.toolCalls ?? [],
+      ...(this.output.reasoningText ? { reasoningText: this.output.reasoningText } : {}),
       agentId: "agent-test",
       runId: "run-test"
     };
@@ -3261,9 +3964,11 @@ class FakeRunner implements CursorRunner {
     this.lastInput = input;
     this.seen.push(input.apiKey);
     this.maybeFail(input);
+    this.noteTelemetry(input);
     if (this.output.hangIgnoringAbort) await new Promise(() => undefined);
     if (this.output.hangUntilAborted) await abortedPromise(signal);
-    for (const thinking of this.output.thinking ?? []) {
+    const thinkingChunks = this.output.thinking ?? (this.output.reasoningText ? [this.output.reasoningText] : []);
+    for (const thinking of thinkingChunks) {
       yield { type: "thinking", text: thinking };
     }
     const chunks = this.output.chunks ?? (this.output.text ? [this.output.text] : []);
@@ -3278,7 +3983,7 @@ class FakeRunner implements CursorRunner {
     for (const toolCall of this.output.toolCalls ?? []) {
       yield { type: "tool_call", toolCall };
     }
-    const thinking = (this.output.thinking ?? []).join("");
+    const thinking = thinkingChunks.join("");
     yield {
       type: "done",
       result: {
@@ -3296,6 +4001,19 @@ class FakeRunner implements CursorRunner {
     if (custom) throw custom;
     const failure = this.failFor.get(input.apiKey);
     if (failure) throw new Error(failure);
+  }
+
+  /**
+   * 真实 runner 拿到 agent 之后会把 agentId/runId 写回 telemetryRef，金额补写全靠它认人；
+   * 实测用量与真正下发的 model.params 也走同一条回传通道。跑失败的尝试没有 agent，所以放在 maybeFail 之后。
+   */
+  private noteTelemetry(input: CursorRunRequest): void {
+    const telemetry = input.telemetryRef;
+    if (!telemetry) return;
+    telemetry.agentId = this.output.telemetry?.agentId ?? "agent-test";
+    telemetry.runId = this.output.telemetry?.runId ?? "run-test";
+    if (this.output.telemetry?.modelParams) telemetry.modelParams = this.output.telemetry.modelParams;
+    if (this.output.telemetry?.usage) telemetry.usage = this.output.telemetry.usage;
   }
 }
 
@@ -3450,6 +4168,243 @@ test("a failed stream is logged with the real status instead of 200", async () =
   const logs = await app.inject({ method: "GET", url: "/admin/api/logs", headers: { authorization: "Bearer gateway-key" } });
   const entry = (logs.json().logs as { endpoint: string; status: number }[]).find((log) => log.endpoint === "/v1/chat/completions");
   assert.equal(entry?.status, 502);
+});
+
+test("a non-streaming history row carries the same estimated numbers the client was told", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "hello there, this is the answer" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+
+  const log = await latestLog(app);
+  assert.equal(log.usageSource, "estimated");
+  // 以前这里只写 estimated 不写数字，后台显示「估算」加一片空白。数字必须和响应体里那份对得上。
+  const usage = response.json().usage as { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  assert.ok(usage.total_tokens > 0);
+  assert.equal(log.usage?.inputTokens, usage.prompt_tokens);
+  assert.equal(log.usage?.outputTokens, usage.completion_tokens);
+  assert.equal(log.usage?.totalTokens, usage.total_tokens);
+});
+
+test("a streaming history row carries the estimate the usage chunk reported", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hello ", "there"] }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(response.statusCode, 200);
+  const usage = sseFrames(response.body)
+    .map((frame) => (frame.data as { usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } | undefined)?.usage)
+    .filter(Boolean)
+    .at(-1);
+  assert.ok(usage);
+
+  // 流式在 finishLog 之前就走完了整条流，估算补在收尾那一步，和 usage 块用同一份字符数。
+  const log = await latestLog(app);
+  assert.equal(log.usageSource, "estimated");
+  assert.equal(log.usage?.inputTokens, usage.prompt_tokens);
+  assert.equal(log.usage?.outputTokens, usage.completion_tokens);
+  assert.equal(log.usage?.totalTokens, usage.total_tokens);
+});
+
+test("estimated history matches rendered reasoning and tool output in every protocol", async () => {
+  const toolCall = { id: "call-weather", name: "get_weather", arguments: { city: "Paris" } };
+
+  const chatRunner = new FakeRunner({ text: "answer", reasoningText: "think", toolCalls: [toolCall] });
+  const { app: chatApp } = await createTestApp({ runner: chatRunner });
+  const chatResponse = await chatApp.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(chatResponse.statusCode, 200);
+  const chatBody = chatResponse.json();
+  const chatUsage = chatBody.usage as { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  const chatTools = chatBody.choices[0].message.tool_calls as unknown[];
+  const expectedChatCompletion = Math.ceil(("answer".length + "think".length + JSON.stringify(chatTools).length) / 4);
+  assert.equal(chatUsage.completion_tokens, expectedChatCompletion);
+  const chatLog = await latestLog(chatApp);
+  assert.equal(chatLog.usage?.outputTokens, expectedChatCompletion);
+
+  const anthropicRunner = new FakeRunner({ text: "answer", reasoningText: "hidden thinking", toolCalls: [toolCall] });
+  const { app: anthropicApp } = await createTestApp({ runner: anthropicRunner });
+  const anthropicResponse = await anthropicApp.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 256,
+      thinking: { type: "enabled", display: "omitted" },
+      messages: [{ role: "user", content: "Hello" }]
+    }
+  });
+  assert.equal(anthropicResponse.statusCode, 200);
+  const anthropicBody = anthropicResponse.json();
+  const anthropicTools = (anthropicBody.content as { type: string }[]).filter((item) => item.type === "tool_use");
+  const expectedAnthropicCompletion = Math.ceil(("answer".length + JSON.stringify(anthropicTools).length) / 4);
+  assert.equal(anthropicBody.usage.output_tokens, expectedAnthropicCompletion);
+  const anthropicLog = await latestLog(anthropicApp, "/v1/messages");
+  assert.equal(anthropicLog.usage?.outputTokens, expectedAnthropicCompletion);
+
+  const responsesRunner = new FakeRunner({ text: "answer", reasoningText: "abcde", toolCalls: [toolCall] });
+  const { app: responsesApp } = await createTestApp({ runner: responsesRunner });
+  const responsesResponse = await responsesApp.inject({
+    method: "POST",
+    url: "/v1/responses",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", input: "Hello" }
+  });
+  assert.equal(responsesResponse.statusCode, 200);
+  const responsesBody = responsesResponse.json();
+  const responseItems = responsesBody.output as { type: string; content?: { text?: string }[]; summary?: { text?: string }[] }[];
+  const responseText = responseItems
+    .flatMap((item) => item.content ?? [])
+    .map((part) => part.text ?? "")
+    .join("");
+  const responseReasoning = responseItems
+    .flatMap((item) => item.summary ?? [])
+    .map((part) => part.text ?? "")
+    .join("");
+  const responseTools = responseItems.filter((item) => item.type === "function_call");
+  const expectedResponsesOutput = Math.ceil((responseText.length + JSON.stringify(responseTools).length) / 4);
+  const expectedResponsesReasoning = Math.ceil(responseReasoning.length / 4);
+  assert.equal(responsesBody.usage.output_tokens, expectedResponsesOutput + expectedResponsesReasoning);
+  const responsesLog = await latestLog(responsesApp, "/v1/responses");
+  assert.equal(responsesLog.usage?.outputTokens, expectedResponsesOutput + expectedResponsesReasoning);
+});
+
+test("real upstream usage beats the estimate and is labelled as such", async () => {
+  const runner = new FakeRunner({
+    text: "ok",
+    telemetry: {
+      usage: { inputTokens: 120, outputTokens: 45, cacheReadTokens: 900, cacheWriteTokens: 30, totalTokens: 1095 }
+    }
+  });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+
+  const log = await latestLog(app);
+  assert.equal(log.usageSource, "sdk");
+  assert.equal(log.usage?.totalTokens, 1095);
+});
+
+test("a request that never produced anything claims no usage at all", async () => {
+  const runner = new FakeRunner({});
+  runner.failWith.set("direct-cursor-key", new ApiError("Cursor upstream run ended in error", 502, "upstream_run_failed"));
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 502);
+
+  const log = await latestLog(app);
+  // 没有产出就没有可估的东西：标 estimated 而字段全空比什么都不标更误导人。
+  assert.equal(log.usage, undefined);
+  assert.equal(log.usageSource, undefined);
+});
+
+test("direct-mode requests get their cost backfilled with the client's own key", async () => {
+  const store = new MemoryStateStore();
+  const calls: string[][] = [];
+  const usageReconciler = new UsageReconciler({
+    store,
+    delayMs: 1,
+    getUsage: async (agentId, apiKey) => {
+      calls.push([agentId, apiKey]);
+      return { cost: { rawCostCents: 3.5, chargedCents: 1.25 } };
+    }
+  });
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }), store, usageReconciler });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer direct-cursor-key" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  await tick();
+  await usageReconciler.drain();
+  usageReconciler.close();
+
+  // 直传不经过密钥池、没有 keyId，只能拿客户端自己那把 key 去查金额，否则直传请求永远没有金额。
+  assert.deepEqual(calls, [["agent-test", "direct-cursor-key"]]);
+  const [log] = (await store.listRequestLogs({ limit: 5 })).logs;
+  assert.deepEqual(log.cost, { rawCostCents: 3.5, chargedCents: 1.25 });
+});
+
+test("parameter columns record what took effect and leave the unrecoverable ones as intent", async () => {
+  const runner = new FakeRunner({
+    text: "ok",
+    // 上游实际收到的是 fast=false：1m 上下文与 fast 互斥，网关自己降了级，与客户端要的正好相反。
+    telemetry: { modelParams: [{ id: "context", value: "1m" }, { id: "effort", value: "low" }, { id: "fast", value: "false" }] }
+  });
+  const { app } = await createTestApp({ runner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: {
+      authorization: "Bearer gateway-key",
+      "x-cursor-reasoning-effort": "xhigh",
+      "x-cursor-max-mode": "true",
+      "x-cursor-fast": "true"
+    },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+
+  const log = await latestLog(app);
+  assert.equal(log.fast, false, "客户端要了 fast 但实际发的是 false，记意图就等于记了个假象");
+  assert.equal(log.reasoningEffort, "low");
+  // context=1m 是档位型参数，光看下发值不对照该模型的全部档位判断不出是不是最大档，
+  // 所以 maxMode 只能退回请求意图，并且不进 effectiveParams。
+  assert.equal(log.maxMode, true);
+  assert.deepEqual(log.effectiveParams, ["reasoningEffort", "fast"]);
+});
+
+test("parameter columns fall back to intent when nothing came back from the runner", async () => {
+  const { app } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: {
+      authorization: "Bearer gateway-key",
+      "x-cursor-reasoning-effort": "high",
+      "x-cursor-max-mode": "true",
+      "x-cursor-fast": "true"
+    },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
+  });
+  assert.equal(response.statusCode, 200);
+
+  const log = await latestLog(app);
+  assert.equal(log.reasoningEffort, "high");
+  assert.equal(log.maxMode, true);
+  assert.equal(log.fast, true);
+  // 一个都没确认：运维看到的是「客户端要了，但网关不知道最后发的是什么」。
+  assert.equal(log.effectiveParams, undefined);
 });
 
 // ---------------------------------------------------------------------------

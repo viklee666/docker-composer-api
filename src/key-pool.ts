@@ -1,6 +1,23 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "./errors.js";
-import type { CursorClientTypeSetting, CursorKeyRecord, StateStore } from "./types.js";
+import {
+  denyRuleUnverifiable,
+  identityAllowed,
+  intersectScopes,
+  modelIdentity,
+  normalizeModelList,
+  normalizeWeight,
+  pickWeighted,
+  NO_KEY_SENTINEL
+} from "./routing.js";
+import type {
+  CursorClientTypeSetting,
+  CursorKeyRecord,
+  ModelIdentity,
+  ModelScope,
+  RoutingStrategy,
+  StateStore
+} from "./types.js";
 
 export type KeyFailureKind = "quota" | "auth" | "transient";
 
@@ -11,10 +28,69 @@ export interface AutoDisablePolicy {
 }
 
 /**
+ * key 取用策略。
+ * - strategy：fill-first 吃满 sort_order 最靠前的 key（Cursor 按 key 缓存 prompt，换 key 就丢缓存），
+ *   round-robin 按 weight 加权轮询摊平各 key 用量。
+ * - sessionAffinity：同一会话固定复用上次成功的 key，让后续请求继续命中上游 prompt 缓存。
+ */
+export interface RoutingPolicy {
+  strategy: RoutingStrategy;
+  sessionAffinity: boolean;
+  sessionAffinityTtlMs: number;
+}
+
+export interface KeySelection {
+  /** 选中的 key。 */
+  key: CursorKeyRecord;
+  /** 是否来自会话粘性绑定（命中缓存），用于日志与后台展示。 */
+  sticky: boolean;
+}
+
+export interface PickOptions {
+  /** 本次请求的模型；给了就只选能服务该模型的 key。 */
+  model?: string;
+  /**
+   * 该模型的全部叫法，由调用方解析一次后传入（选 key 这一层拿不到 apiKey，查不了目录）。
+   * 不传就只按 model 这一个名字匹配，别名可能绕过 key 的黑白名单。
+   */
+  modelIdentity?: ModelIdentity;
+  /** 入站网关密钥的模型可见范围；与 key 自身范围求交后才是本次请求的有效范围。 */
+  gatewayModelScope?: ModelScope;
+  /** 网关密钥限定的 key id；空/undefined = 不限制。 */
+  allowedKeyIds?: string[];
+  /** 会话粘性标识（已散列）；配合 sessionAffinity 生效。 */
+  sessionHash?: string;
+}
+
+/** 候选为空的原因，让上层能给出准确报错而不是笼统的额度耗尽。 */
+export type NoKeyReason =
+  | "none-configured"
+  | "all-disabled"
+  | "model-not-allowed"
+  | "model-unverified"
+  | "not-authorized"
+  | "exhausted";
+
+/** add() 的可选字段，保证既有三参调用不受影响。 */
+export interface AddKeyOptions {
+  modelScope?: ModelScope;
+  weight?: number;
+}
+
+/**
  * 默认连续失败 2 次才禁用：上游偶发的额度/认证抖动（Cursor 侧会话问题、瞬时误报）不该一次就废掉一个好 key，
  * 真正失效的 key 也只多浪费一次尝试就会被禁用。
  */
 export const DEFAULT_AUTO_DISABLE_THRESHOLD = 2;
+
+/** 会话粘性绑定的默认存活时长，与 config 的 SESSION_AFFINITY_TTL_MS 默认值一致。 */
+export const DEFAULT_SESSION_AFFINITY_TTL_MS = 60 * 60 * 1000;
+
+/** 每绑定 N 次顺带清一次过期绑定：避免 session_bindings 无界增长，又不给每次请求加固定开销。 */
+const SESSION_BINDING_PRUNE_EVERY = 200;
+
+/** 轮询游标的回绕点，只为长期运行后不越过安全整数，对分布没有实际影响。 */
+const ROTATION_CURSOR_MODULUS = 1_000_000_000;
 
 /**
  * Cursor key 池：网关模式下按后台设置的顺序（sort_order 升序）取第一个 active key；
@@ -23,9 +99,27 @@ export const DEFAULT_AUTO_DISABLE_THRESHOLD = 2;
  */
 export class CursorKeyPool {
   private policy: AutoDisablePolicy;
+  private routing: RoutingPolicy;
+  /** round-robin 的进程内单调游标；只影响取用顺序，不需要跨进程一致，故不落库。 */
+  private rotationCursor = 0;
+  private bindCount = 0;
 
-  constructor(private readonly store: StateStore, policy: Partial<AutoDisablePolicy> = {}) {
+  constructor(
+    private readonly store: StateStore,
+    policy: Partial<AutoDisablePolicy> = {},
+    routing: Partial<RoutingPolicy> = {}
+  ) {
     this.policy = normalizePolicy({ enabled: true, threshold: DEFAULT_AUTO_DISABLE_THRESHOLD }, policy);
+    // 没显式传取用策略的池保持旧行为：fill-first + 不粘会话。
+    // 粘性会让同一会话跳过重新选 key，属于要由调用方按 config 显式打开的行为改变。
+    this.routing = normalizeRouting(
+      {
+        strategy: "fill-first",
+        sessionAffinity: false,
+        sessionAffinityTtlMs: DEFAULT_SESSION_AFFINITY_TTL_MS
+      },
+      routing
+    );
   }
 
   get autoDisablePolicy(): AutoDisablePolicy {
@@ -36,6 +130,16 @@ export class CursorKeyPool {
   setAutoDisablePolicy(patch: Partial<AutoDisablePolicy>): AutoDisablePolicy {
     this.policy = normalizePolicy(this.policy, patch);
     return this.autoDisablePolicy;
+  }
+
+  get routingPolicy(): RoutingPolicy {
+    return { ...this.routing };
+  }
+
+  /** 同 setAutoDisablePolicy：后台改完即时生效，无需重启进程。 */
+  setRoutingPolicy(patch: Partial<RoutingPolicy>): RoutingPolicy {
+    this.routing = normalizeRouting(this.routing, patch);
+    return this.routingPolicy;
   }
 
   /** 把环境变量里的 key 幂等地播种进库（已存在的不动，保留其启停状态与排序）。 */
@@ -53,6 +157,8 @@ export class CursorKeyPool {
         requestCount: 0,
         failureCount: 0,
         clientType: "inherit",
+        modelScope: emptyScope(),
+        weight: 1,
         createdAt: new Date().toISOString()
       });
     }
@@ -62,16 +168,148 @@ export class CursorKeyPool {
     return this.store.listCursorKeys();
   }
 
-  async pickActive(excludedIds: ReadonlySet<string>): Promise<CursorKeyRecord | undefined> {
+  /**
+   * 只读地借一把可用 key（拉模型目录用），**不推进轮询游标**。
+   * 走 selectKey 会让「读目录」这个旁路动作改变下一次真正执行时选中的 key：
+   * 加权轮询的配比被拉偏，两把等权 key 还会稳定退化成「目录永远读 A、执行永远打 B」，
+   * 于是判定依据与执行依据分属两把 key 的目录，这正是别名绕过的温床。
+   */
+  async pickActive(excludedIds: ReadonlySet<string>, options?: PickOptions): Promise<CursorKeyRecord | undefined> {
+    const selection = await this.select(excludedIds, options ?? {}, false);
+    return "key" in selection ? selection.key : undefined;
+  }
+
+  /**
+   * 带 sticky 信息与失败归因的选择入口，供 KeyRotatingRunner 使用。
+   * 候选依次过 status / excludedIds / 网关密钥绑定 / 模型可见范围四道筛子，
+   * 落空时按「哪一道筛干净的」回报原因，让上层能报出可操作的错误而不是笼统的额度耗尽。
+   * advanceCursor=false 只用于确认「还有没有候选」：候选不会真的执行时，不能消耗轮询额度。
+   */
+  async selectKey(
+    excludedIds: ReadonlySet<string>,
+    options: PickOptions = {},
+    advanceCursor = true
+  ): Promise<KeySelection | { reason: NoKeyReason }> {
+    return this.select(excludedIds, options, advanceCursor);
+  }
+
+  private async select(
+    excludedIds: ReadonlySet<string>,
+    options: PickOptions,
+    advanceCursor: boolean
+  ): Promise<KeySelection | { reason: NoKeyReason }> {
+    const allowedKeyIds = new Set((options.allowedKeyIds ?? []).filter(Boolean));
+    if (allowedKeyIds.size === 1 && allowedKeyIds.has(NO_KEY_SENTINEL)) {
+      // 哨兵代表「绑定已失效」，即使池里没有任何 key 也应报权限拒绝而不是诱导客户端重试 429。
+      return { reason: "not-authorized" };
+    }
     const keys = await this.store.listCursorKeys();
-    return keys.find((key) => key.status === "active" && !excludedIds.has(key.id));
+    const active = keys.filter((key) => key.status === "active");
+    let authorized: CursorKeyRecord[];
+    if (allowedKeyIds.size) {
+      // 绑定是入站密钥的授权边界：绑定目标全被删掉/停用时，不能因为池里还有别的状态
+      // 就把它解释成「没有 key」或「稍后重试」，否则 403 会被错误降成 429。
+      authorized = active.filter((key) => allowedKeyIds.has(key.id));
+      if (!authorized.length) return { reason: "not-authorized" };
+    } else {
+      if (!keys.length) return { reason: "none-configured" };
+      if (!active.length) return { reason: "all-disabled" };
+      authorized = active;
+    }
+
+    const model = options.model?.trim();
+    const identity = model ? options.modelIdentity ?? modelIdentity(model) : undefined;
+    // 网关侧黑名单是多租户边界，目录没确认完整时必须先拒绝，不能让某一把 key
+    // 恰好能跑就把「尚未求值的规则」带过第二层。
+    if (identity && options.gatewayModelScope) {
+      if (!identityAllowed(identity, options.gatewayModelScope)) return { reason: "model-not-allowed" };
+      if (denyRuleUnverifiable(identity, options.gatewayModelScope)) return { reason: "model-unverified" };
+    }
+    let uncertainKeyScope = false;
+    const servable = identity
+      ? authorized.filter((key) => {
+        if (!identityAllowed(identity, effectiveScope(options.gatewayModelScope, key.modelScope, identity))) return false;
+        // Cursor key 的黑名单是硬限制：身份没确认全时，未知 alias 不能让请求绕过这把 key
+        // 的 deny 规则。只排除这把不确定的 key，池里其它没有该限制的 key 仍可服务。
+        if (denyRuleUnverifiable(identity, key.modelScope)) {
+          uncertainKeyScope = true;
+          return false;
+        }
+        return true;
+      })
+      : authorized;
+    // 能明确说出「这个模型被排除了」时就照实说，别退而报「算不准」，后者会把运维引去查上游。
+    if (!servable.length) return { reason: uncertainKeyScope ? "model-unverified" : "model-not-allowed" };
+
+    // 只有走到这里才可能是「试过但都失败了」，前面几种落空都比 exhausted 更具体。
+    const candidates = servable.filter((key) => !excludedIds.has(key.id));
+    if (!candidates.length) return { reason: "exhausted" };
+
+    const sticky = await this.stickyKey(candidates, options.sessionHash);
+    if (sticky) return { key: sticky, sticky: true };
+
+    const key = this.routing.strategy === "round-robin"
+      ? pickWeighted(candidates, advanceCursor ? this.nextRotationCursor() : this.rotationCursor)
+      : candidates[0];
+    // candidates 非空时两条分支都必然有值，兜底只为收窄类型。
+    return key ? { key, sticky: false } : { reason: "exhausted" };
+  }
+
+  /**
+   * 会话粘性：绑定仍指向一个可用候选才复用它。
+   * 绑定的 key 已被删除/禁用/本次已试过/不能服务该模型时，顺手删掉这条绑定再回落到正常选择——
+   * 留着它只会让后续请求每次都白查一遍，而下一次成功后本来就会重新绑定。
+   */
+  private async stickyKey(candidates: CursorKeyRecord[], sessionHash?: string): Promise<CursorKeyRecord | undefined> {
+    if (!this.routing.sessionAffinity || !sessionHash) return undefined;
+    const binding = await this.store.getSessionBinding(sessionHash, this.routing.sessionAffinityTtlMs);
+    if (!binding) return undefined;
+    const bound = candidates.find((key) => key.id === binding.keyId);
+    if (bound) return bound;
+    await this.store.deleteSessionBinding(sessionHash);
+    return undefined;
+  }
+
+  private nextRotationCursor(): number {
+    const current = this.rotationCursor;
+    this.rotationCursor = (current + 1) % ROTATION_CURSOR_MODULUS;
+    return current;
+  }
+
+  /** 请求成功后把会话钉到这个 key 上，让后续同会话请求命中上游 prompt 缓存。 */
+  async bindSession(sessionHash: string, keyId: string): Promise<void> {
+    if (!this.routing.sessionAffinity || !sessionHash || !keyId) return;
+    await this.store.saveSessionBinding(sessionHash, keyId);
+    this.bindCount += 1;
+    if (this.bindCount % SESSION_BINDING_PRUNE_EVERY !== 0) return;
+    // 过期绑定清理属于后台维护，失败不该冒泡影响正在收尾的请求。
+    await this.store.pruneSessionBindings(this.routing.sessionAffinityTtlMs).catch(() => 0);
+  }
+
+  async setModelScope(id: string, scope: ModelScope): Promise<boolean> {
+    return this.store.updateCursorKey(id, {
+      modelScope: {
+        allowed: normalizeModelList(scope?.allowed),
+        excluded: normalizeModelList(scope?.excluded)
+      }
+    });
+  }
+
+  /** 非法/小于 1 的权重按 1 收敛，与 store 的归一化一致，避免出现永远选不中的候选。 */
+  async setWeight(id: string, weight: number): Promise<boolean> {
+    return this.store.updateCursorKey(id, { weight: normalizeWeight(weight) });
   }
 
   async hasAnyKey(): Promise<boolean> {
     return (await this.store.listCursorKeys()).length > 0;
   }
 
-  async add(apiKey: string, label?: string, clientType: CursorClientTypeSetting = "inherit"): Promise<CursorKeyRecord> {
+  async add(
+    apiKey: string,
+    label?: string,
+    clientType: CursorClientTypeSetting = "inherit",
+    options: AddKeyOptions = {}
+  ): Promise<CursorKeyRecord> {
     const trimmed = apiKey.trim();
     if (!trimmed) throw new ApiError("Cursor key must not be empty.", 400, "invalid_request_error", "key");
     const existing = await this.store.getCursorKeyByValue(trimmed);
@@ -86,6 +324,11 @@ export class CursorKeyPool {
       requestCount: 0,
       failureCount: 0,
       clientType,
+      modelScope: {
+        allowed: normalizeModelList(options.modelScope?.allowed),
+        excluded: normalizeModelList(options.modelScope?.excluded)
+      },
+      weight: normalizeWeight(options.weight),
       createdAt: new Date().toISOString()
     };
     await this.store.insertCursorKey(record);
@@ -186,6 +429,29 @@ function normalizePolicy(current: AutoDisablePolicy, patch: Partial<AutoDisableP
       ? Math.floor(threshold)
       : current.threshold
   };
+}
+
+function normalizeRouting(current: RoutingPolicy, patch: Partial<RoutingPolicy>): RoutingPolicy {
+  const ttl = patch.sessionAffinityTtlMs;
+  return {
+    strategy: patch.strategy === "round-robin" || patch.strategy === "fill-first" ? patch.strategy : current.strategy,
+    sessionAffinity: typeof patch.sessionAffinity === "boolean" ? patch.sessionAffinity : current.sessionAffinity,
+    sessionAffinityTtlMs: typeof ttl === "number" && Number.isFinite(ttl) && ttl > 0
+      ? Math.floor(ttl)
+      : current.sessionAffinityTtlMs
+  };
+}
+
+function emptyScope(): ModelScope {
+  return { allowed: [], excluded: [] };
+}
+
+/**
+ * 本次请求对某把 key 的有效可见范围。网关侧不限制时直接用 key 自己的，省掉每个候选一次交集运算。
+ * 带上身份是为了让两侧写同一个模型的不同叫法时交集不落空（否则会误拒）。
+ */
+function effectiveScope(gateway: ModelScope | undefined, key: ModelScope, identity: ModelIdentity): ModelScope {
+  return gateway ? intersectScopes(gateway, key, identity) : key;
 }
 
 /**

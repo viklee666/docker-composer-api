@@ -286,6 +286,34 @@ function normalizeParamArray(value: unknown): ModelParameterValue[] | undefined 
   return params.length ? params : undefined;
 }
 
+/**
+ * `resolveModelParams` 的逆向：从真正下发给上游的 model.params 里反解出生效的语义意图。
+ * 请求日志靠它区分「客户端要了 fast 并且确实发出去了」与「客户端要了，但网关不知道最后发的是什么」。
+ * 反解不出来的字段一律留空，绝不猜：猜出来的值会被当成实测值拿去对账。
+ */
+export function effectiveIntentFromParams(params: ModelParameterValue[] | undefined): ModelIntent {
+  if (!params?.length) return {};
+  const intent: ModelIntent = {};
+  const fast = params.find((param) => /^fast$/i.test(param.id)) ?? params.find((param) => /fast/i.test(param.id));
+  const fastValue = booleanParamValue(fast?.value);
+  if (fastValue !== undefined) intent.fast = fastValue;
+  // Max Mode 只在参数本身是布尔时才确定得了。档位型（context=1m/272k/…）要对照该模型的全部档位
+  // 才知道下发的是不是最大档，而这里只有下发值本身，没有档位表，所以宁可留空退回请求意图。
+  const maxMode = booleanParamValue(params.find((param) => MAX_MODE_PARAM.test(param.id))?.value);
+  if (maxMode !== undefined) intent.maxMode = maxMode;
+  // 布尔 thinking 只说明思考开着、强度跟模型默认走，表达不出「强度是多少」，所以只认分级参数。
+  const effort = params.find((param) =>
+    REASONING_PARAM.test(param.id) && !BOOLEAN_THINKING_PARAM.test(param.id) && booleanParamValue(param.value) === undefined);
+  if (effort) intent.reasoningEffort = effort.value;
+  return intent;
+}
+
+function booleanParamValue(value: string | undefined): boolean | undefined {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return undefined;
+}
+
 /** 合并多个意图，后者覆盖前者；显式 params 逐 id 覆盖合并。 */
 export function mergeIntents(...intents: Array<ModelIntent | undefined>): ModelIntent {
   const merged: ModelIntent = {};

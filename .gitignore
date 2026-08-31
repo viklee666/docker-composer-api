@@ -26,5 +26,12 @@ data/
 *.crt
 *.p12
 
+# 根目录的临时脚本：这类文件历来是从 DevTools 复制 curl 直接粘出来的，
+# 里面往往带着 WorkosCursorSessionToken 这种等同账号密码的凭据。
+/*.py
+/*.sh
+/*.ps1
+!scripts/
+
 # 本地探测输出
 logs/

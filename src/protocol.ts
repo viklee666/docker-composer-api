@@ -8,8 +8,9 @@ import {
   type ModelIntent
 } from "./model-params.js";
 import { normalizeModel } from "./models.js";
+import { resolveSystemText, systemPromptActive } from "./system-prompt.js";
 import { filterHostMetaTools, isHostMetaTool } from "./tool-compat.js";
-import type { AgentMode, AuthContext, CursorRunRequest, CursorRunResult, GatewayImage, GatewayTool, GatewayToolCall, KeyUsageRef } from "./types.js";
+import type { AgentMode, AuthContext, CursorRunRequest, CursorRunResult, GatewayImage, GatewayTool, GatewayToolCall, KeyUsageRef, RequestUsage, SystemPromptSettings } from "./types.js";
 
 export interface PreparedRequest {
   model: string;
@@ -56,13 +57,41 @@ export interface ResponsesEcho {
   background: boolean;
 }
 
-export function prepareOpenAiChat(body: unknown): PreparedRequest {
+/**
+ * prepare* 的网关侧可选输入。缺省即「完全按客户端原文合成 prompt」，
+ * 所有既有调用点不传该参数时行为与改造前逐字节一致。
+ */
+export interface PrepareOptions {
+  /**
+   * 网关默认系统提示词。SDK 没有 system 入参，只能经合成 prompt 注入（见 system-prompt.ts）。
+   * mode 为 off 或正文为空时完全不改变任何东西。
+   */
+  systemPrompt?: SystemPromptSettings;
+}
+
+export interface PrepareAnthropicOptions extends PrepareOptions {
+  /** 见 `prepareAnthropicMessages` 的 @param 说明。 */
+  countTokens?: boolean;
+}
+
+export function prepareOpenAiChat(body: unknown, options?: PrepareOptions): PreparedRequest {
   const record = objectBody(body);
   const messages = arrayField(record, "messages");
   rejectCommonUnsupported(record);
   const tools = parseOpenAiTools(record.tools, record.tool_choice);
   const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
+  /*
+   * Chat 协议没有独立的 system 段，system/developer 轮次平时是就地折进 Conversation 的。
+   * 一旦注入生效就把它们上提成一个 SYSTEM 块，位置与 Anthropic/Responses 一致（工具说明之后、
+   * 对话之前）——只有这样网关正文才是模型眼里的系统级指令而不是一轮用户发言，
+   * 而且 append 要求「客户端在前、网关在后」、override 要求整段丢掉客户端 system，
+   * 就地改写这两点都做不到（多条 system 会重复追加，override 也删不干净）。
+   * 未注入时一行都不动，保持既有 prompt 形状。
+   */
+  const hoistSystem = systemPromptActive(options?.systemPrompt);
+  const systemBlockAt = transcript.length;
+  const clientSystemParts: string[] = [];
   transcript.push("", "Conversation:");
   const images: GatewayImage[] = [];
   // 先扫完全部 tool_calls / 旧版 function_call，result 出现在 call 前面时也能丢掉元工具输出。
@@ -82,6 +111,11 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
       continue;
     }
     const content = contentToTextAndImages(item.content, images, role === "assistant");
+    if (hoistSystem && (role === "system" || role === "developer")) {
+      // 图片副作用已在上面收完；正文改由 SYSTEM 块统一承载。
+      if (content) clientSystemParts.push(content);
+      continue;
+    }
     const calls = Array.isArray(item.tool_calls) ? item.tool_calls : item.function_call !== undefined && item.function_call !== null ? [item.function_call] : [];
     const kept = calls.filter((call) => {
       const name = chatToolCallName(call);
@@ -92,11 +126,16 @@ export function prepareOpenAiChat(body: unknown): PreparedRequest {
     if (content) transcript.push(`${role.toUpperCase()}: ${content}`);
     if (kept.length) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(kept)}`);
   }
+  if (hoistSystem) {
+    // 多条 system/developer 之间也按空行分隔，与 append 的拼接口径一致。
+    const system = resolveSystemText(clientSystemParts.join("\n\n"), options?.systemPrompt);
+    if (system) transcript.splice(systemBlockAt, 0, "", `SYSTEM:\n${system}`);
+  }
   appendToolReminder(transcript, tools);
   return basePrepared(record, transcript.join("\n"), images, tools, messages);
 }
 
-export function prepareOpenAiResponses(body: unknown, previous?: { response?: Record<string, unknown>; inputItems?: unknown[] }): PreparedRequest {
+export function prepareOpenAiResponses(body: unknown, previous?: { response?: Record<string, unknown>; inputItems?: unknown[] }, options?: PrepareOptions): PreparedRequest {
   const record = objectBody(body);
   rejectCommonUnsupported(record);
   const tools = parseResponsesTools(record.tools, record.tool_choice);
@@ -104,8 +143,16 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
   const rawInstructions = record.instructions === undefined ? null : record.instructions;
-  const instructions = instructionsText(record.instructions).trim();
-  if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
+  /*
+   * Responses 的客户端 system 有两个入口：顶层 instructions，以及 input[] 里 role=system/developer 的条目。
+   * 后者平时就地渲染成 INPUT: 下的一行 SYSTEM:，一旦注入生效就必须和 instructions 一起交给
+   * resolveSystemText——否则 override 模式下网关正文进了 INSTRUCTIONS:、客户端 system 还留在 INPUT: 里，
+   * 两套系统级指令并存，override 名存实亡。
+   * 未注入时一条都不上提，INPUT: 的渲染与改造前逐字节一致。
+   * INSTRUCTIONS 块要等 input 渲染完才知道上提了什么，所以先占位、最后 splice 回原位。
+   */
+  const hoistSystem = systemPromptActive(options?.systemPrompt);
+  const instructionsBlockAt = transcript.length;
   if (previous?.response) {
     transcript.push("", `PREVIOUS_RESPONSE:\n${JSON.stringify(sanitizePreviousResponseForPrompt(previous.response))}`);
   }
@@ -116,7 +163,13 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
     ...(Array.isArray(previous?.response?.output) ? previous.response.output : []),
     ...(previous?.inputItems ?? [])
   ]);
-  transcript.push(responseInputToTextAndImages(record.input, images, priorMetaIds));
+  const hoisted: string[] = [];
+  transcript.push(responseInputToTextAndImages(record.input, images, priorMetaIds, hoistSystem ? hoisted : undefined));
+  // 顺序即客户端书写顺序：instructions 在前、input[] 里的 system 在后，append 才能保证网关正文收尾。
+  const clientSystem = [instructionsText(record.instructions).trim(), ...hoisted].filter(Boolean).join("\n\n");
+  // 网关正文注入这里，回显仍用未加工的 rawInstructions。
+  const instructions = resolveSystemText(clientSystem, options?.systemPrompt);
+  if (instructions) transcript.splice(instructionsBlockAt, 0, "", `INSTRUCTIONS:\n${instructions}`);
   appendToolReminder(transcript, tools);
   const prepared = basePrepared(record, transcript.join("\n"), images, tools, inputItems);
   prepared.responsesEcho = {
@@ -139,7 +192,7 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
  *   不该触发缺字段日志——那条日志只记一次，被 count_tokens 抢先触发后，真正遗漏 max_tokens 的
  *   messages 请求就再也不会被记录。
  */
-export function prepareAnthropicMessages(body: unknown, options?: { countTokens?: boolean }): PreparedRequest {
+export function prepareAnthropicMessages(body: unknown, options?: PrepareAnthropicOptions): PreparedRequest {
   const record = objectBody(body);
   // Anthropic 的 thinking 不再拒绝：映射为 Cursor 的思考强度（reasoning/effort/thinking 参数）透传给 SDK。
   if (record.mcp_servers !== undefined) throw new ApiError("Anthropic server tools are not supported; pass client tools in tools instead.", 400, "unsupported_parameter", "mcp_servers");
@@ -152,7 +205,7 @@ export function prepareAnthropicMessages(body: unknown, options?: { countTokens?
   const images: GatewayImage[] = [];
   const transcript: string[] = [systemDirective(tools)];
   appendToolInstructions(transcript, tools, record.tool_choice);
-  const system = anthropicSystemText(record.system, images);
+  const system = resolveSystemText(anthropicSystemText(record.system, images), options?.systemPrompt);
   if (system) transcript.push("", `SYSTEM:\n${system}`);
   transcript.push("", "Conversation:");
   const metaToolUseIds = collectHostMetaCallIds(messages);
@@ -219,9 +272,9 @@ export function toRunRequest(input: {
   };
 }
 
-export function chatCompletionObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult }): Record<string, unknown> {
+export function chatCompletionObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult; usage?: RequestUsage }): Record<string, unknown> {
   const toolCalls = input.output.toolCalls.map(openAiToolCall);
-  const completionChars = input.output.text.length + JSON.stringify(toolCalls).length;
+  const completionChars = chatCompletionChars(input.output);
   const reasoning = input.output.reasoningText ?? "";
   return {
     id: input.id,
@@ -244,7 +297,7 @@ export function chatCompletionObject(input: { id: string; created: number; prepa
         finish_reason: toolCalls.length ? "tool_calls" : "stop"
       }
     ],
-    usage: openAiUsage(input.prepared.prompt.length, completionChars),
+    usage: openAiUsage(input.prepared.prompt.length, completionChars, input.usage),
     cursor_agent_id: input.output.agentId ?? null,
     cursor_run_id: input.output.runId ?? null
   };
@@ -299,7 +352,7 @@ export function responseSnapshot(input: {
   };
 }
 
-export function responseObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult; previousResponseId?: string }): Record<string, unknown> {
+export function responseObject(input: { id: string; created: number; prepared: PreparedRequest; output: CursorRunResult; previousResponseId?: string; usage?: RequestUsage }): Record<string, unknown> {
   const items = responseOutputItems(input.id, input.output);
   return responseSnapshot({
     id: input.id,
@@ -309,8 +362,9 @@ export function responseObject(input: { id: string; created: number; prepared: P
     output: items,
     usage: responsesUsage(
       input.prepared.prompt.length,
-      input.output.text.length + JSON.stringify(input.output.toolCalls.map((toolCall) => responseToolCallItem(toolCall))).length,
-      (input.output.reasoningText ?? "").length
+      responseCompletionChars(input.output),
+      responseReasoningChars(input.output),
+      input.usage
     ),
     previousResponseId: input.previousResponseId,
     agentId: input.output.agentId,
@@ -343,12 +397,10 @@ export function responseReasoningItem(itemId: string, text: string): Record<stri
   return { id: itemId, type: "reasoning", summary: [{ type: "summary_text", text }] };
 }
 
-export function anthropicMessageObject(input: { id: string; prepared: PreparedRequest; output: CursorRunResult }): Record<string, unknown> {
+export function anthropicMessageObject(input: { id: string; prepared: PreparedRequest; output: CursorRunResult; usage?: RequestUsage }): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
   const reasoning = input.output.reasoningText ?? "";
   const visibility = input.prepared.thinkingVisibility ?? "off";
-  // 计入输出的思考字符：与流式一致，display:"omitted" 下思考照样发生（只是不下发文本），仍要计数。
-  const thinkingChars = visibility === "off" ? 0 : reasoning.length;
   if (reasoning && visibility !== "off") {
     // display:"omitted" 的官方语义：仍返回 thinking 块（含 signature），但省略思考文本。
     content.push({ type: "thinking", thinking: visibility === "omitted" ? "" : reasoning, signature: gatewayThinkingSignature() });
@@ -363,13 +415,40 @@ export function anthropicMessageObject(input: { id: string; prepared: PreparedRe
     content,
     stop_reason: input.output.toolCalls.length ? "tool_use" : "end_turn",
     stop_sequence: null,
-    // 与流式同口径：正文 + 思考字符 + 工具调用 JSON。旧写法用 JSON.stringify(content)，
+    // 与流式同口径：正文 + 可见思考字符 + 客户端 tool_use JSON。旧写法用 JSON.stringify(content)，
     // 而 content 里已经含正文与思考全文，正文被算两遍——同一次对话走两种模式报出的 output_tokens 差近一倍。
     usage: anthropicUsage(
       input.prepared.prompt.length,
-      input.output.text.length + thinkingChars + JSON.stringify(input.output.toolCalls).length
+      anthropicCompletionChars(input.prepared, input.output),
+      input.usage
     )
   };
+}
+
+/** 各协议的估算必须按各自真正交给客户端的形状计数，不能拿 SDK 内部的 GatewayToolCall 代替。 */
+export function chatCompletionChars(output: CursorRunResult): number {
+  return output.text.length +
+    (output.reasoningText?.length ?? 0) +
+    JSON.stringify(output.toolCalls.map(openAiToolCall)).length;
+}
+
+export function responseCompletionChars(output: CursorRunResult): number {
+  const usedCallSuffixes = new Set<string>();
+  return output.text.length + JSON.stringify(
+    output.toolCalls.map((toolCall) => responseToolCallItem(toolCall, "completed", usedCallSuffixes))
+  ).length;
+}
+
+export function responseReasoningChars(output: CursorRunResult): number {
+  return output.reasoningText?.length ?? 0;
+}
+
+export function anthropicCompletionChars(prepared: PreparedRequest, output: CursorRunResult): number {
+  const visibility = prepared.thinkingVisibility ?? "off";
+  const thinkingChars = visibility === "full" ? (output.reasoningText?.length ?? 0) : 0;
+  return output.text.length +
+    thinkingChars +
+    JSON.stringify(output.toolCalls.map(anthropicToolUse)).length;
 }
 
 /**
@@ -467,37 +546,98 @@ export function anthropicToolUse(toolCall: GatewayToolCall): Record<string, unkn
   };
 }
 
-export function openAiUsage(promptChars: number, completionChars: number): Record<string, unknown> {
-  const promptTokens = estimateTokens(promptChars);
-  const completionTokens = estimateTokens(completionChars);
+/**
+ * 有真实用量就用真实值，否则退回按字符估算。
+ * 估算分支只填 input/output 两桶（缓存与推理无从估算，恒 0/缺省）。
+ */
+export function normalizeRequestUsage(usage: RequestUsage): RequestUsage {
+  const totalTokens = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
   return {
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens
+    ...usage,
+    // RequestUsage 的 totalTokens 是四个互斥桶的合计；边界收到旧对象时也要恢复这个不变量。
+    totalTokens
   };
 }
 
-/** 官方语义里 output_tokens 含 reasoning_tokens，这里同样把思考字符计入输出侧，避免 detail 大于总量。 */
-export function responsesUsage(promptChars: number, outputChars: number, reasoningChars = 0): Record<string, unknown> {
-  const inputTokens = estimateTokens(promptChars);
-  const reasoningTokens = estimateTokens(reasoningChars);
-  const outputTokens = estimateTokens(outputChars) + reasoningTokens;
+export function effectiveUsage(real: RequestUsage | undefined, estimatedPromptChars: number, estimatedCompletionChars: number): RequestUsage {
+  if (real) {
+    const normalized = normalizeRequestUsage(real);
+    return real.totalTokens === normalized.totalTokens ? real : normalized;
+  }
+  const inputTokens = estimateTokens(estimatedPromptChars);
+  const outputTokens = estimateTokens(estimatedCompletionChars);
+  return { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: inputTokens + outputTokens };
+}
+
+/**
+ * OpenAI 口径下 prompt/input 侧是「本轮处理的全部输入 token」，缓存命中只是它的子集
+ * （cached_tokens ≤ prompt_tokens）；而上游 RequestUsage 沿用 SDK 的四桶互斥口径
+ * （totalTokens = input + output + cacheRead + cacheWrite），所以要把两个缓存桶并回输入侧。
+ */
+function openAiInputTokens(usage: RequestUsage): number {
+  return usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+}
+
+/** reasoning 按契约是 output 的子集；万一上游报反了也不能让 detail 大于总量（严格客户端会判为非法）。 */
+function reasoningSubset(usage: RequestUsage): number {
+  return Math.min(Math.max(usage.reasoningTokens ?? 0, 0), usage.outputTokens);
+}
+
+/**
+ * total_tokens 一律按 prompt + completion 自算，不直接抄 RequestUsage.totalTokens：
+ * 后者不含 reasoning 而 completion_tokens 含（reasoning 是 output 的子集），直接抄会让三个数对不上。
+ * 在 SDK 的四桶口径下两者本来就相等，这里只是让关系在任何输入下都自洽。
+ * detail 字段只在拿到真实用量时出现：估算不出缓存/推理，凭空发 0 会误导客户端。
+ */
+export function openAiUsage(promptChars: number, completionChars: number, real?: RequestUsage): Record<string, unknown> {
+  const usage = effectiveUsage(real, promptChars, completionChars);
+  const promptTokens = openAiInputTokens(usage);
+  const completionTokens = usage.outputTokens;
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    ...(real
+      ? {
+        prompt_tokens_details: { cached_tokens: real.cacheReadTokens },
+        completion_tokens_details: { reasoning_tokens: reasoningSubset(real) }
+      }
+      : {})
+  };
+}
+
+/**
+ * 官方语义里 output_tokens 含 reasoning_tokens，这里同样把思考计入输出侧，避免 detail 大于总量：
+ * 估算分支把思考字符加进 output，真实分支直接用 outputTokens（reasoning 本就是它的子集）。
+ * input/total 口径同 `openAiUsage`：缓存读写并入 input_tokens，cached_tokens 是其子集。
+ */
+export function responsesUsage(promptChars: number, outputChars: number, reasoningChars = 0, real?: RequestUsage): Record<string, unknown> {
+  const estimatedReasoning = estimateTokens(reasoningChars);
+  const usage = effectiveUsage(real, promptChars, outputChars);
+  const inputTokens = openAiInputTokens(usage);
+  const reasoningTokens = real ? reasoningSubset(real) : estimatedReasoning;
+  const outputTokens = real ? usage.outputTokens : usage.outputTokens + estimatedReasoning;
   return {
     input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: usage.cacheReadTokens },
     output_tokens: outputTokens,
     output_tokens_details: { reasoning_tokens: reasoningTokens },
     total_tokens: inputTokens + outputTokens
   };
 }
 
-export function anthropicUsage(inputChars: number, outputChars: number): Record<string, unknown> {
+/**
+ * Anthropic 口径与 SDK 的四桶一一对应：input_tokens 只是「未命中缓存的输入」，
+ * 缓存读取/写入是**另外两个并列的桶**，不含在 input_tokens 里（这点与 OpenAI 相反，不能共用一套映射）。
+ * 常见客户端（含 Claude Code）会直接读这两个字段做统计；上游没报用量时按估算走，三桶恒 0。
+ */
+export function anthropicUsage(inputChars: number, outputChars: number, real?: RequestUsage): Record<string, unknown> {
+  const usage = effectiveUsage(real, inputChars, outputChars);
   return {
-    input_tokens: estimateTokens(inputChars),
-    // 常见客户端（含 Claude Code）会直接读这两个字段做统计；网关无缓存机制，恒 0。
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    output_tokens: estimateTokens(outputChars)
+    input_tokens: usage.inputTokens,
+    cache_creation_input_tokens: usage.cacheWriteTokens,
+    cache_read_input_tokens: usage.cacheReadTokens,
+    output_tokens: usage.outputTokens
   };
 }
 
@@ -885,6 +1025,12 @@ function walkHostMetaCallIds(value: unknown, ids: Set<string>): void {
 /** 只清洗写入合成 prompt 的副本，不改客户端取回的已存 Response。 */
 function sanitizePreviousResponseForPrompt(response: Record<string, unknown>): Record<string, unknown> {
   const copy = JSON.parse(JSON.stringify(response)) as Record<string, unknown>;
+  /*
+   * instructions 按官方语义是逐轮参数，不随 previous_response_id 继承。
+   * 快照原样入 prompt 会把上一轮的客户端 system 再灌一遍，和本轮 INSTRUCTIONS: 块里的
+   * 系统级指令并存甚至打架——本轮该守什么规矩，只由本轮请求决定。
+   */
+  delete copy.instructions;
   if (Array.isArray(copy.tools)) {
     copy.tools = copy.tools.filter((item) => {
       const record = asOptionalRecord(item);
@@ -951,7 +1097,11 @@ function contentToTextAndImages(value: unknown, images: GatewayImage[], stripRit
   return parts.join("\n");
 }
 
-function responseInputToTextAndImages(value: unknown, images: GatewayImage[], priorMetaIds?: ReadonlySet<string>): string {
+/**
+ * @param hoistedSystem 传数组即表示「system/developer 条目改由 INSTRUCTIONS 块承载」：
+ *   正文收进该数组、不写进 INPUT:，图片副作用照常收集。不传则一切就地渲染（未注入时的原行为）。
+ */
+function responseInputToTextAndImages(value: unknown, images: GatewayImage[], priorMetaIds?: ReadonlySet<string>, hoistedSystem?: string[]): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
   const metaCallIds = new Set(priorMetaIds);
@@ -961,6 +1111,12 @@ function responseInputToTextAndImages(value: unknown, images: GatewayImage[], pr
     const record = asOptionalRecord(item);
     if (!record) continue;
     if (record.type === "reasoning") continue;
+    // type 省略的 EasyInputMessage 也要认：漏掉的话它会以 JSON 块的形式把客户端 system 留在 INPUT: 里。
+    if (hoistedSystem && (record.type === "message" || record.type === undefined) && isSystemRole(record.role)) {
+      const text = responseContentToText(record.content, images);
+      if (text) hoistedSystem.push(text);
+      continue;
+    }
     if (record.type === "message") {
       const role = stringField(record, "role", "user");
       const text = responseContentToText(record.content, images, role === "assistant");
@@ -986,6 +1142,10 @@ function responseInputToTextAndImages(value: unknown, images: GatewayImage[], pr
     } else parts.push(JSON.stringify(record));
   }
   return parts.join("\n");
+}
+
+function isSystemRole(role: unknown): boolean {
+  return role === "system" || role === "developer";
 }
 
 function responseContentToText(value: unknown, images: GatewayImage[], stripRitual = false): string {

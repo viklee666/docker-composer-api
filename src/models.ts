@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
+import { filterModelsByScope, staticCanonicalModel } from "./routing.js";
 import { getCurrentCursorClientType, runWithCursorClientType } from "./sand-client.js";
-import type { GatewayModel, ModelParameterDefinition, ModelVariantDefinition } from "./types.js";
+import type {
+  CursorClientType,
+  GatewayModel,
+  ModelParameterDefinition,
+  ModelScope,
+  ModelVariantDefinition
+} from "./types.js";
 
 /** 上游不可达且无缓存时的静态兜底列表。 */
 export const MODELS: GatewayModel[] = [
@@ -109,6 +116,14 @@ export async function listAvailableModels(apiKey?: string, forceRefresh = false)
   return cached ? { models: cached.models, source: "cursor" } : fallbackModels();
 }
 
+/**
+ * 按可见范围过滤目录条目，用于 /v1/models 与后台模型选择器。
+ * 只做过滤，不碰抓取与缓存：source 原样带出，让上层仍能区分「上游目录」与「静态兜底」。
+ */
+export function applyModelScope(result: ModelListResult, scope: ModelScope | undefined): ModelListResult {
+  return { models: filterModelsByScope(result.models, scope), source: result.source };
+}
+
 export function openAiModelList(models: ModelEntry[]): Record<string, unknown> {
   return {
     object: "list",
@@ -137,7 +152,7 @@ export function openAiModelObject(model: ModelEntry): Record<string, unknown> {
 export async function getModelCatalogEntry(modelId: string, apiKey?: string): Promise<ModelEntry | undefined> {
   if (!modelId) return undefined;
   const { models } = await listAvailableModels(apiKey);
-  const found = findModel(models, modelId);
+  const found = findModelEntry(models, modelId);
   if (found) return found;
   if (!apiKey) return undefined;
   // 目录刚从上游实时拉取过（不是旧缓存）→ 上游确实没有该模型，立刻再刷一次没有意义。
@@ -147,25 +162,79 @@ export async function getModelCatalogEntry(modelId: string, apiKey?: string): Pr
   if (Date.now() - lastForcedRefreshAt >= FORCED_REFRESH_MIN_INTERVAL_MS) {
     lastForcedRefreshAt = Date.now();
     const refreshed = await listAvailableModels(apiKey, true);
-    return findModel(refreshed.models, modelId);
+    return findModelEntry(refreshed.models, modelId);
   }
   return undefined;
 }
 
-function findModel(models: ModelEntry[], modelId: string): ModelEntry | undefined {
+/** 在一份目录里按 id 或 alias 找条目（大小写不敏感）。 */
+export function findModelEntry(models: ModelEntry[], modelId: string): ModelEntry | undefined {
   const target = modelId.trim().toLowerCase();
   return models.find((model) =>
     model.id.toLowerCase() === target || model.aliases.some((alias) => alias.toLowerCase() === target));
 }
 
+/** 查一份目录要用哪把 key、走哪条通道。目录按 (apiKey, 通道) 分桶缓存，两者必须一起决定。 */
+export interface CatalogueLookup {
+  apiKey?: string;
+  clientType: CursorClientType;
+}
+
+export interface CatalogueResolution {
+  entry?: ModelEntry;
+  /** 只有所有相关目录都成功确认且找到了该模型时才为 true。 */
+  confirmed: boolean;
+}
+
+/**
+ * 在多把 key 的目录里解析同一个模型，别名取并集。
+ *
+ * 只查一把 key 的目录不够：各账号可见的模型与别名本来就不一样，
+ * 拿「随便借来的那把」的目录去做判定，读到的叫法就可能与真正执行的那把 key 对不上——
+ * 授权与执行依据不同一份数据，两层防御会一起失效。并集与「选中哪把 key」无关，
+ * 因此判定结果不再随取用策略、轮询游标漂移。
+ *
+ * 单把 key 拉取失败不该丢掉其它目录已经确认的叫法，但也不能把残缺并集当成完整身份：
+ * 只要任一相关目录失败，`confirmed` 就为 false。目录成功却没有该模型时也不返回 entry，
+ * 让调用方继续把未知模型当成未确认，而不是把「查不到」误当成「没有别名」。
+ * 静态兜底目录（source=fallback）不算确认：那是网关自己的猜测，不是账号的真实目录。
+ */
+export async function findModelAcrossCatalogues(
+  lister: ModelLister,
+  lookups: CatalogueLookup[],
+  modelId: string
+): Promise<CatalogueResolution> {
+  let merged: ModelEntry | undefined;
+  let complete = lookups.length > 0;
+  for (const lookup of lookups) {
+    const listed = await listOneCatalogue(lister, lookup);
+    if (listed?.source !== "cursor") {
+      complete = false;
+      continue;
+    }
+    const found = findModelEntry(listed.models, modelId);
+    if (!found) continue;
+    // 连 canonical id 一起并进别名：同一个模型在别的账号下可能就以某个别名作为 id，
+    // 只留第一份的 id 会把那个叫法丢掉，而丢掉的每个叫法都是黑名单的一个缺口。
+    merged = merged
+      ? { ...merged, aliases: [...new Set([...merged.aliases, found.id, ...found.aliases])] }
+      : found;
+  }
+  return { entry: merged, confirmed: Boolean(merged) && complete };
+}
+
+/** 单把 key 的目录查询：失败一律吞掉。runWithCursorClientType 是同步转发，所以要用 try 而不是 .catch。 */
+async function listOneCatalogue(lister: ModelLister, lookup: CatalogueLookup): Promise<ModelListResult | undefined> {
+  try {
+    return await runWithCursorClientType(lookup.clientType, () => lister(lookup.apiKey));
+  } catch {
+    return undefined;
+  }
+}
+
 export function normalizeModel(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) return "composer-2.5";
-  const normalized = value.trim().toLowerCase();
-  if (["composer-latest", "composer", "composer-2.5", "composer-2-5", "composer-2.5-sdk"].includes(normalized)) {
-    return "composer-2.5";
-  }
-  if (["composer-2.5-fast", "composer-2-5-fast"].includes(normalized)) return "composer-2.5-fast";
-  return value.trim();
+  return staticCanonicalModel(value) ?? value.trim();
 }
 
 function fallbackModels(): ModelListResult {

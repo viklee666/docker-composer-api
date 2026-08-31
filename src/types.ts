@@ -8,6 +8,8 @@ export interface GatewayConfig {
   adminPassword?: string;
   allowDirectCursorKeys: boolean;
   sqlitePath: string;
+  /** 请求历史保留条数上限，0 = 全量保留（默认）。env: REQUEST_LOG_KEEP。 */
+  requestLogKeep: number;
   cursorWorkingDirectory: string;
   requestTimeoutMs: number;
   sdkClientVersion: string;
@@ -21,6 +23,13 @@ export interface GatewayConfig {
   cursorAllowBuiltinTools: boolean;
   /** 强制 Cursor local agent 使用 HTTP/1.1 + SSE（env: CURSOR_SDK_USE_HTTP1_FOR_AGENT）。 */
   cursorSdkUseHttp1ForAgent: boolean;
+  /**
+   * 启动时预热 SDK 本地工作区（env: CURSOR_PREWARM，默认开）。
+   * 预热只是省掉首请求的冷启动，但它会进 SDK 的原生工作区扫描；
+   * 该扫描在部分宿主（实测 Windows + @cursor/sdk 1.0.27）会直接触发 access violation
+   * 把进程打挂——原生崩溃是 JS try/catch 抓不到的，所以必须留一个开关能整块关掉。
+   */
+  cursorPrewarm: boolean;
   /** 单次请求轮换 key 的最大尝试数（env: MAX_KEY_ATTEMPTS）。 */
   maxKeyAttempts: number;
   /** 单次请求软失败（换 key 但不禁用）的最大重试数（env: MAX_TRANSIENT_KEY_ATTEMPTS）。 */
@@ -44,6 +53,62 @@ export interface GatewayConfig {
    * 单个 key 可覆盖（inherit / sdk / sand）。env: SAND_CLIENT_MODE，后台可改。
    */
   sandClientMode: boolean;
+  /** key 取用策略：fill-first（默认，吃满第一个 key 以命中 Cursor 缓存）或 round-robin。 */
+  routingStrategy: RoutingStrategy;
+  /** 会话粘性：同一会话固定复用上次成功的 key，保住上游缓存。env: SESSION_AFFINITY，后台可改。 */
+  sessionAffinity: boolean;
+  /** 会话粘性绑定的存活时长，超时后重新按策略选 key。env: SESSION_AFFINITY_TTL_MS。 */
+  sessionAffinityTtlMs: number;
+  /** 出站代理（http/https/socks5），空表示直连。env: PROXY_URL，后台可改（需重启生效）。 */
+  proxyUrl?: string;
+  /** 默认系统提示词的注入方式。env: SYSTEM_PROMPT_MODE，后台可改。 */
+  systemPromptMode: SystemPromptMode;
+  /** 默认系统提示词正文。env: SYSTEM_PROMPT，后台可改。 */
+  systemPrompt?: string;
+}
+
+/**
+ * 多 key 取用策略。
+ * - fill-first：按 sort_order 取第一个可用 key，吃满为止。Cursor 侧按 key 缓存 prompt，
+ *   换 key 就丢缓存，所以这是默认值。
+ * - round-robin：按 weight 加权轮询，摊平各 key 的用量。
+ */
+export type RoutingStrategy = "fill-first" | "round-robin";
+
+/** 默认系统提示词的注入方式：off 不注入、append 追加在客户端 system 之后、override 覆盖客户端 system。 */
+export type SystemPromptMode = "off" | "append" | "override";
+
+/** 网关默认系统提示词设置。 */
+export interface SystemPromptSettings {
+  mode: SystemPromptMode;
+  text?: string;
+}
+
+/**
+ * 模型可见范围：allowed 非空时只允许其中的模型（白名单），excluded 里的一律拒绝（黑名单优先）。
+ * 两个列表都存模型 id（大小写不敏感），空数组表示不限制。
+ */
+export interface ModelScope {
+  allowed: string[];
+  excluded: string[];
+}
+
+/**
+ * 一个模型的全部叫法：归一化后的请求名 + 目录里的 canonical id + 全部 alias。
+ * 黑白名单两侧写的都可能只是其中一种叫法，只有把请求展开成整组名字，两侧才对称——
+ * 否则用别名请求能绕过按 id 写的黑名单，只写 id 的白名单也会把别名请求误拒。
+ */
+export interface ModelIdentity {
+  /** 归一化后的请求名。目录不可用时它与静态别名组就是身份的全部。 */
+  requested: string;
+  /** 全部叫法，已去空白 + 小写 + 去重。 */
+  names: string[];
+  /**
+   * 所有相关上游目录是否都确认过这组叫法。false 不只表示「没查到」，
+   * 也表示多账号并集中有任一目录失败；残缺的并集对黑名单而言可能漏判，
+   * 判定方必须按 denyRuleUnverifiable 兜底。
+   */
+  confirmed: boolean;
 }
 
 /** 实际发给 Cursor 的 x-cursor-client-type。 */
@@ -86,6 +151,17 @@ export interface AuthContext {
   /** 仅 direct 模式有值；gateway 模式在运行时从密钥池解析。 */
   apiKey?: string;
   ownerHash: string;
+  /** 命中的网关 API 密钥（gateway 模式且用了 gateway_keys 表里的多密钥时有值）。 */
+  gatewayKeyId?: string;
+  gatewayKeyLabel?: string;
+  /**
+   * 该网关密钥允许使用的 Cursor key id；undefined/空表示不限制。
+   * 由 KeyRotatingRunner 在选 key 时求交集。
+   * 只含 `NO_KEY_SENTINEL` 时表示「什么都不许用」（绑定的 key 已被删光），选 key 必然落空 → 403。
+   */
+  allowedCursorKeyIds?: string[];
+  /** 该网关密钥的模型可见范围；undefined 表示不限制。 */
+  modelScope?: ModelScope;
 }
 
 export interface GatewayModel {
@@ -118,15 +194,80 @@ export interface KeyUsageRef {
   keyLabel?: string;
 }
 
+/** 上游真实上报的 token 用量（SDK 的 turn-ended / usage 事件），非估算。 */
+export interface RequestUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+}
+
+/** 上游计费金额，单位为「美分」浮点数（SDK UsageCost 原样口径）。 */
+export interface RequestCost {
+  /** 未打折的模型 token 成本；按请求计价的用量为 0。 */
+  rawCostCents: number;
+  /** 实际扣费金额（含折扣与 Cursor Token Fee）；套餐内 / BYOK / 赠额用量为 0。 */
+  chargedCents: number;
+}
+
+/**
+ * 运行期遥测的可变引出通道，语义同 KeyUsageRef：
+ * 请求侧建一个空对象传进 runner，runner 在跑的过程中把真实下发参数与本次 run 的上游用量写回来，
+ * 收尾时由 finishLog 落进 request_logs。UsageReconciler 回查到的是 agent 累计值，不能覆盖这里的本次用量。
+ */
+export interface RunTelemetryRef {
+  /** 实际下发给 Cursor 的 model id（去掉后缀、走过 alias 解析后的值）。 */
+  upstreamModel?: string;
+  /** 实际下发的 Cursor model.params，用于核对推理强度 / 1M / fast 是否真的生效。 */
+  modelParams?: ModelParameterValue[];
+  /** 本次请求最终使用的通道。 */
+  clientType?: CursorClientType;
+  /** 本次 run 上游上报的真实 token 用量；上游没报时为 undefined（此时日志按 estimatedUsage 兜底）。 */
+  usage?: RequestUsage;
+  /**
+   * 上游没报用量时按字符数算出的估算值，只服务请求日志。
+   * 刻意与 usage 分开：响应体里的用量各协议自有估算口径（openAiUsage / responsesUsage / anthropicUsage），
+   * 把估算值塞进 usage 会让它们改走「拿到真实用量」的分支，凭空多出 cached/reasoning 明细。
+   */
+  estimatedUsage?: RequestUsage;
+  /** 上游计费金额。SDK 侧最终一致，可能在 run 结束后才可查，因此按后台异步补写。 */
+  cost?: RequestCost;
+  agentId?: string;
+  runId?: string;
+}
+
 export interface CursorRunRequest {
   protocol: ProtocolKind;
   /** direct 模式为客户端 key；useKeyPool 时由 KeyRotatingRunner 注入。 */
   apiKey: string;
   useKeyPool: boolean;
   keyUsageRef?: KeyUsageRef;
+  /** 运行期遥测引出通道：实际下发参数与上游 token 用量写回这里，供请求日志落库。 */
+  telemetryRef?: RunTelemetryRef;
+  /**
+   * 本次请求允许使用的 Cursor key id（来自网关密钥的绑定）；undefined/空表示不限制。
+   * 与「key 自身的模型白名单」是两个独立维度，都在选 key 时生效。
+   */
+  allowedKeyIds?: string[];
+  /**
+   * 入站网关密钥的模型可见范围；undefined 表示不限制。
+   * 选 key 时与 key 自身范围求交，这样即使将来新增的入口漏了入口处的校验，
+   * 请求也不会被发到一把超出网关密钥范围的 key 上。
+   */
+  gatewayModelScope?: ModelScope;
   model: string;
+  /** 本次请求模型的全部叫法，由 server 解析一次后下传，免得选 key 时再查一遍目录。 */
+  modelIdentity?: ModelIdentity;
   prompt: string;
   sessionKey: string;
+  /**
+   * 会话粘性的身份，与 sessionKey 分开：只有能认出「这是哪一段对话」时才有值。
+   * 不能拿 sessionKey 兜底——它在没有会话头时会退化成 ownerHash（每个网关请求都一样），
+   * 那样粘性就变成「把整个网关钉死在一把 key 上」，轮询失效、坏 key 也再不会被重试。
+   */
+  stickyKey?: string;
   /** 客户端是否以流式消费本请求（影响 key 轮换重试策略：流式下已发出的 thinking 视为已交付）。 */
   stream?: boolean;
   /** thinking 事件是否会被端点真正转发给客户端（messages 未请求 thinking 时为 false，此时不算已交付产出）。 */
@@ -177,6 +318,11 @@ export type CursorStreamEvent =
 export interface ExecutorLeaseManager {
   warm(apiKey: string, workingDirectory: string): Promise<void>;
   recycle(apiKey: string, workingDirectory: string): Promise<void>;
+  /** 运行期切换传输层或关停时释放全部预热租约。 */
+  releaseAll(options?: { timeoutMs?: number }): Promise<{
+    ok: boolean;
+    failures: readonly string[];
+  }>;
 }
 
 export interface CursorRunner {
@@ -189,6 +335,13 @@ export interface StoredResponse {
   ownerHash: string;
   response: Record<string, unknown>;
   inputItems: unknown[];
+  /**
+   * 这条响应所属对话的粘性身份（conversationSeed 的结果）。
+   * 续聊请求体里只有新一轮输入，system 与第一条 user 都不在，现算必然每轮都变；
+   * 落库后由下一轮继承，整条链才共用同一个身份。纯服务端字段，绝不回显给客户端。
+   * 老库补列前的记录读出来是 undefined，此时退回按请求体现算（认不出就不启用粘性）。
+   */
+  conversationSeed?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -212,6 +365,10 @@ export interface CursorKeyRecord {
   failureCount: number;
   /** 该 key 的通道：跟随全局 / 强制 SDK / 强制 Sand。 */
   clientType: CursorClientTypeSetting;
+  /** 该 key 允许 / 禁止服务的模型；空表示不限制。黑名单优先于白名单。 */
+  modelScope: ModelScope;
+  /** round-robin 的加权份额，越大越常被选中。fill-first 策略下不生效。 */
+  weight: number;
   createdAt: string;
 }
 
@@ -227,7 +384,46 @@ export interface CursorKeyPatch {
   incrementRequestCount?: boolean;
   incrementFailureCount?: boolean;
   clientType?: CursorClientTypeSetting;
+  modelScope?: ModelScope;
+  weight?: number;
 }
+
+/** 对外提供给客户端的网关 API 密钥（不是 Cursor key）。 */
+export interface GatewayKeyRecord {
+  id: string;
+  apiKey: string;
+  label: string;
+  status: CursorKeyStatus;
+  /** env = 由 GATEWAY_API_KEY 播种，manual = 后台添加。 */
+  source: "env" | "manual";
+  /**
+   * 该密钥允许使用的 Cursor key id；空数组表示不限制（可用整个池）。
+   * 绑定的 key 被删除时会自动从这里剔除；剔完为空则写入 `NO_KEY_SENTINEL` 表示「什么都不许用」——
+   * 留成空数组会让权限从「只能用那一把」反向放大成整池可用。
+   * 运维在后台显式清空仍然是「不限制」，那是有意为之。
+   */
+  allowedCursorKeyIds: string[];
+  /** 该密钥的模型可见范围，与 Cursor key 自身的范围叠加生效。 */
+  modelScope: ModelScope;
+  requestCount: number;
+  lastUsedAt?: string;
+  createdAt: string;
+}
+
+export interface GatewayKeyPatch {
+  status?: CursorKeyStatus;
+  label?: string;
+  allowedCursorKeyIds?: string[];
+  modelScope?: ModelScope;
+  lastUsedAt?: string;
+  incrementRequestCount?: boolean;
+}
+
+/**
+ * 请求日志里那三列参数的取值来源。列出来的字段是从「真正下发的 model.params」反解出的**实际生效值**，
+ * 没列出来的只是客户端的请求意图——上游可能压根不支持、也可能被互斥组合改掉了。
+ */
+export type EffectiveParamField = "reasoningEffort" | "maxMode" | "fast";
 
 export interface RequestLogRecord {
   id: string;
@@ -241,6 +437,56 @@ export interface RequestLogRecord {
   durationMs: number;
   stream: boolean;
   error?: string;
+  /** 命中的网关 API 密钥（多密钥模式下用于分账）。 */
+  gatewayKeyId?: string;
+  gatewayKeyLabel?: string;
+  /** 本次请求的思考/推理强度，取值来源见 effectiveParams。 */
+  reasoningEffort?: string;
+  /** 是否开启了 Max Mode / 1M 大上下文，取值来源见 effectiveParams。 */
+  maxMode?: boolean;
+  /** 是否使用了 fast 变体，取值来源见 effectiveParams。 */
+  fast?: boolean;
+  /** 上面三列里哪些是实际生效值；其余是请求意图（未能确认上游最终收到什么）。 */
+  effectiveParams?: EffectiveParamField[];
+  /** 实际使用的通道（sdk / sand）。 */
+  clientType?: CursorClientType;
+  agentMode?: AgentMode;
+  /** 实际下发给 Cursor 的 model.params，JSON 序列化后存库。 */
+  modelParams?: ModelParameterValue[];
+  usage?: RequestUsage;
+  /** usage 的来源：sdk = 上游真实上报，estimated = 按字符数估算。 */
+  usageSource?: "sdk" | "estimated";
+  cost?: RequestCost;
+}
+
+/** 请求日志的分页 + 过滤查询。 */
+export interface RequestLogQuery {
+  limit: number;
+  offset?: number;
+  /** 只看某个 Cursor key。 */
+  keyId?: string;
+  /** 只看某个网关密钥。 */
+  gatewayKeyId?: string;
+  /** 只看某个模型。 */
+  model?: string;
+  /** "success" 只看 <400，"error" 只看 >=400。 */
+  outcome?: "success" | "error";
+  /** ISO 时间下界（含）。 */
+  since?: string;
+}
+
+export interface RequestLogPage {
+  logs: RequestLogRecord[];
+  /** 满足过滤条件的总条数，用于前端分页。 */
+  total: number;
+}
+
+export interface RequestTokenTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
 }
 
 export interface RequestLogStats {
@@ -249,6 +495,18 @@ export interface RequestLogStats {
   errors: number;
   avgDurationMs: number | null;
   last24h: { total: number; errors: number };
+  /** 上游实测用量累计；估算行单列在 estimatedTokens，不与实测混合。 */
+  tokens: RequestTokenTotals;
+  /** 按字符估算的用量累计，供后台明确标注其不确定性。 */
+  estimatedTokens: RequestTokenTotals;
+  cost: { rawCostCents: number; chargedCents: number };
+}
+
+/** 会话粘性绑定：把一个会话固定到某个 Cursor key，保住上游的 prompt 缓存。 */
+export interface SessionBinding {
+  sessionHash: string;
+  keyId: string;
+  updatedAt: string;
 }
 
 export interface StateStore {
@@ -268,10 +526,39 @@ export interface StateStore {
   /** 按给定 id 序列重排取用优先级；未包含的 key 保持相对顺序排在末尾。 */
   reorderCursorKeys(ids: string[]): Promise<void>;
 
+  listGatewayKeys(): Promise<GatewayKeyRecord[]>;
+  getGatewayKeyByValue(apiKey: string): Promise<GatewayKeyRecord | undefined>;
+  insertGatewayKey(record: GatewayKeyRecord): Promise<void>;
+  updateGatewayKey(id: string, patch: GatewayKeyPatch): Promise<boolean>;
+  deleteGatewayKey(id: string): Promise<boolean>;
+
+  /** 读取未过期的会话绑定；过期的视为不存在。 */
+  getSessionBinding(sessionHash: string, ttlMs: number): Promise<SessionBinding | undefined>;
+  saveSessionBinding(sessionHash: string, keyId: string): Promise<void>;
+  deleteSessionBinding(sessionHash: string): Promise<boolean>;
+  /** 清掉超过 ttl 的绑定，避免表无界增长。 */
+  pruneSessionBindings(ttlMs: number): Promise<number>;
+
   getSetting(key: string): Promise<string | undefined>;
   setSetting(key: string, value: string): Promise<void>;
 
   insertRequestLog(record: RequestLogRecord): Promise<void>;
-  listRequestLogs(limit: number): Promise<RequestLogRecord[]>;
+  /** 上游用量/计费是 run 结束后才可查的，按 id 事后补写。 */
+  updateRequestLogUsage(id: string, usage?: RequestUsage, cost?: RequestCost, usageSource?: "sdk" | "estimated"): Promise<boolean>;
+  listRequestLogs(query: RequestLogQuery): Promise<RequestLogPage>;
   requestLogStats(): Promise<RequestLogStats>;
+  /** 清空请求日志（后台手动操作）。 */
+  clearRequestLogs(): Promise<number>;
+
+  /**
+   * 把某个 agent 的上游**累计**金额换算成本次应记的增量，并把基线推进到已记账的位置。
+   * 开着 session resume 时一个 agent 会服务多个请求，累计值直接入账等于把前几次的钱再记一遍。
+   * 基线必须落库：`sdk_sessions` 与 SDK 自带的 agent store 都跨重启存活，重启后同一个 agentId 会继续服务请求。
+   */
+  bookAgentUsageDelta(agentId: string, cumulative: RequestCost): Promise<RequestCost>;
+  /**
+   * 把累计金额的基线推进与对应请求日志的金额写入放进同一个原子操作。
+   * 若本次累计值只是旧副本、没有新增金额，则不向该行写入 0，交给调用方继续轮询。
+   */
+  bookAgentUsageDeltaForRequest(logId: string, agentId: string, cumulative: RequestCost): Promise<RequestCost | undefined>;
 }
