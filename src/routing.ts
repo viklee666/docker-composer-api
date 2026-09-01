@@ -52,7 +52,7 @@ export function conversationSeed(body: unknown): string | undefined {
 }
 
 /** system 文本来自三种协议的所有有效 system/developer 项，不能只取第一条。 */
-function systemSeedText(record: Record<string, unknown>): string {
+export function systemSeedText(record: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const message of messageList(record)) {
     const role = asRecord(message)?.role;

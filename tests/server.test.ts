@@ -44,6 +44,10 @@ const baseConfig: GatewayConfig = {
   requestTimeoutMs: 10_000,
   sdkClientVersion: "sdk-1.0.27",
   cursorSdkDisableSessionResume: true,
+  cursorSdkSessionMode: "stateless",
+  cursorSdkToolHoldTtlMs: 900_000,
+  cursorSdkSessionIdleTtlMs: 3_600_000,
+  cursorSdkMaxLiveSessions: 256,
   cursorSdkUseHttp1ForAgent: false,
   cursorAllowBuiltinTools: false,
   maxKeyAttempts: 10,
@@ -1927,6 +1931,47 @@ test("CursorSdkRunner can disable SDK session resume and avoid persisting remote
   assert.equal(store.sessions.size, 0);
 });
 
+test("CursorSdkRunner forceStateless skips session store and resume for that request", async () => {
+  let createCount = 0;
+  let resumeCount = 0;
+  const factory: AgentFactory = {
+    create: async () => {
+      createCount += 1;
+      return {
+        agentId: `agent-forced-${createCount}`,
+        send: async () => new FakeSdkRun({ waitResult: { status: "finished", result: `fresh ${createCount}` } })
+      };
+    },
+    resume: async () => {
+      resumeCount += 1;
+      throw new Error("resume should not be called when forceStateless is set");
+    }
+  };
+  const store = new MemoryStateStore();
+  const runner = new CursorSdkRunner(store, {
+    defaultWorkingDirectory: "/workspace",
+    sdkClientVersion: "test"
+  }, factory);
+  const input: CursorRunRequest = {
+    protocol: "openai-chat",
+    apiKey: "cursor-key",
+    useKeyPool: false,
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "shared-session",
+    forceStateless: true,
+    workingDirectory: "/workspace",
+    images: [],
+    tools: []
+  };
+
+  assert.equal((await runner.run(input)).text, "fresh 1");
+  assert.equal((await runner.run(input)).text, "fresh 2");
+  assert.equal(createCount, 2);
+  assert.equal(resumeCount, 0);
+  assert.equal(store.sessions.size, 0);
+});
+
 test("anthropic stream emits official event order", async () => {
   const { app } = await createTestApp({ runner: new FakeRunner({ chunks: ["hel", "lo"] }) });
   const response = await app.inject({
@@ -2035,6 +2080,8 @@ test("admin connectivity test can target a specific key instead of the pool head
   assert.equal(res.json().keyLabel, keyB.label);
   // 指定 keyId 时直接用该 key（key-b），而不是密钥池队首（key-a）。
   assert.equal(runner.lastApiKey, "key-b");
+  assert.match(runner.lastInput?.sessionKey ?? "", /^admin-connectivity-test-/);
+  assert.equal(runner.lastInput?.forceStateless, true);
 
   const missing = await app.inject({
     method: "POST",
@@ -2799,12 +2846,11 @@ test("CursorSdkRunner restricts SDK builtin tools: [] without client tools, mcp-
     useKeyPool: false,
     model: "composer-2.5",
     prompt: "hello",
-    sessionKey: "session",
     workingDirectory: "/workspace",
     images: []
   };
-  await runner.run({ ...base, tools: [] });
-  await runner.run({ ...base, tools: [{ name: "get_weather" }] });
+  await runner.run({ ...base, sessionKey: "session-no-tools", tools: [] });
+  await runner.run({ ...base, sessionKey: "session-with-tools", tools: [{ name: "get_weather" }] });
   assert.deepEqual(createOptions[0].tools, []);
   assert.deepEqual(createOptions[1].tools, ["mcp"]);
 });

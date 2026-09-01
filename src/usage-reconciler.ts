@@ -25,6 +25,7 @@ export interface UsageReconcilerOptions {
    * 是否按 agent 记基线、只把增量写进本条日志。默认开（多记一行基线总比重复计费安全）。
    * 关掉 session resume 时每个请求都是全新 agent，增量恒等于累计值，
    * 这时落基线只会让 `agent_usage_baselines` 跟着请求数一起无界增长，所以 index.ts 会显式关掉它。
+   * durable / 旧 resume 必须开：`getUsage` 是 agent 累计值，本条 HTTP 只能记增量，不能把首轮金额再加一遍。
    */
   trackAgentBaseline?: boolean;
 }

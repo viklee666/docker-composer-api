@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, shouldUseDurableHub } from "../src/config.js";
 import { NO_KEY_SENTINEL } from "../src/routing.js";
 import { MemoryStateStore, SqliteStateStore } from "../src/store.js";
 import type { CursorKeyRecord, GatewayKeyRecord, RequestLogRecord } from "../src/types.js";
@@ -262,6 +262,13 @@ test("usage can be backfilled after the request finished and rolls into stats", 
 
   assert.equal(await store.clearRequestLogs(), 2);
   assert.equal((await store.listRequestLogs({ limit: 5 })).total, 0);
+});
+
+test("loadConfig defaults to durable with the session-resume kill switch off", () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.cursorSdkDisableSessionResume, false);
+  assert.equal(defaults.cursorSdkSessionMode, "durable");
+  assert.equal(shouldUseDurableHub(defaults), true);
 });
 
 test("request history keeps everything by default and only trims once REQUEST_LOG_KEEP sets a cap", async () => {

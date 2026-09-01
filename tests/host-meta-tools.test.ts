@@ -56,6 +56,34 @@ test("createSdkCustomTools registers only Read when GetMcpTools is also present"
   assert.deepEqual(Object.keys(customTools), ["Read"]);
 });
 
+const STATELESS_EXECUTE_COPY =
+  "Accepted. The caller will execute this tool and return the result in the next request. End your turn now without calling more tools.";
+
+test("createSdkCustomTools hold:false returns the exact fake-success copy synchronously", () => {
+  const twoArg = createSdkCustomTools([readTool], () => {});
+  assert.ok(twoArg);
+  const twoArgResult = twoArg.Read.execute({ file_path: "README.md" }, { toolCallId: "call_two_arg" });
+  assert.equal(twoArgResult instanceof Promise, false);
+  assert.deepEqual(twoArgResult, {
+    content: [{ type: "text", text: STATELESS_EXECUTE_COPY }]
+  });
+
+  const explicit = createSdkCustomTools([readTool], () => {}, { hold: false });
+  assert.ok(explicit);
+  const explicitResult = explicit.Read.execute({ file_path: "src/index.ts" }, { toolCallId: "call_hold_false" });
+  assert.equal(explicitResult instanceof Promise, false);
+  assert.deepEqual(explicitResult, twoArgResult);
+});
+
+test("createSdkCustomTools hold:true still registers only Read when GetMcpTools is present", () => {
+  const customTools = createSdkCustomTools([getMcpTools, taskTool, readTool], () => {}, {
+    hold: true,
+    onHold: () => {}
+  });
+  assert.ok(customTools);
+  assert.deepEqual(Object.keys(customTools), ["Read"]);
+});
+
 test("matchesClientTool rejects GetMcpTools even when it is in the client tool list", () => {
   // 清单里带着宿主元工具也不能转发，否则外层会再开 MCP 发现 / 子代理。
   assert.equal(

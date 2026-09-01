@@ -1,6 +1,7 @@
 import { createEphemeralAgentStore } from "./agent-store.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, shouldUseDurableHub } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
+import { SessionHub } from "./session-hub.js";
 import { ExecutorWarmPool, type WarmupPlatform } from "./executor-warmup.js";
 import {
   loadAutoDisableKeys,
@@ -127,17 +128,37 @@ const executorLeases = new ExecutorWarmPool({
 // 放掉预热租约让引用计数归零，SDK 才会 dispose 旧执行器，下一个请求拿到的才是新协议的传输层。
 setAgentTransportResetter(() => executorLeases.releaseAll());
 
+// D9：无论 kill switch 还是 durable，都注入一份共享有界内存 store，禁止 omit 后落到 SDK 每 agent SQLite。
+// kill switch 打开：TTL 保持今日 10min（createEphemeralAgentStore 无参默认）。
+// kill switch 关闭（即便 WP7 前有人设 env）：idle TTL 用 cursorSdkSessionIdleTtlMs，仍有界。
+const localAgentStore = createEphemeralAgentStore(
+  config.cursorSdkDisableSessionResume
+    ? undefined
+    : {
+        idleTtlMs: config.cursorSdkSessionIdleTtlMs,
+        maxAgents: config.cursorSdkMaxLiveSessions
+      }
+);
+// 生产默认 durable（kill switch 关 + sessionMode=durable）→ 建 Hub。kill switch 打开则不建。
+const useDurableHub = shouldUseDurableHub(config);
+const sessionHub = useDurableHub
+  ? new SessionHub({
+      holdTtlMs: config.cursorSdkToolHoldTtlMs,
+      idleTtlMs: config.cursorSdkSessionIdleTtlMs,
+      maxLiveSessions: config.cursorSdkMaxLiveSessions,
+      store
+    })
+  : undefined;
+
 const sdkRunner = new CursorSdkRunner(store, {
   defaultWorkingDirectory: config.cursorWorkingDirectory,
   sdkClientVersion: config.sdkClientVersion,
   disableSessionResume: config.cursorSdkDisableSessionResume,
   allowBuiltinTools: config.cursorAllowBuiltinTools,
   executorLeases,
-  // stateless（默认）：agent 记录无需跨请求持久化，共享有界内存 store，
-  // 规避 SDK 默认 SqliteLocalAgentStore 每 agent 泄漏内核句柄的问题。
-  // 开启 session resume 时保留 SDK 默认持久化存储（恢复依赖跨请求/跨重启的记录）。
-  ...(config.cursorSdkDisableSessionResume ? { localAgentStore: createEphemeralAgentStore() } : {}),
-  getModelCatalog: getModelCatalogEntry
+  localAgentStore,
+  getModelCatalog: getModelCatalogEntry,
+  sessionHub
 });
 const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
   maxKeyAttempts: config.maxKeyAttempts,
@@ -152,9 +173,10 @@ const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
  */
 const usageReconciler = new UsageReconciler({
   store,
-  // 金额是整个 agent 的累计值，resume 打开时一个 agent 服务多个请求，必须按基线只记增量。
-  // 关掉 resume 时每个请求都是全新 agent，增量恒等于累计值，落基线只会让那张表跟着请求数一起长。
-  trackAgentBaseline: !config.cursorSdkDisableSessionResume
+  // kill switch 打开：每个请求都是全新 agent，不落基线（今日）。
+  // kill switch 关闭：runner 仍可能跨请求复用 agent（旧 resume，以及 WP3+ durable Hub），必须记增量。
+  // durable 时 shouldUseDurableHub 为 true；它蕴含 kill switch 关闭，与 !disable 一并写明意图。
+  trackAgentBaseline: useDurableHub || !config.cursorSdkDisableSessionResume
 });
 
 const app = createApp({
@@ -170,7 +192,15 @@ const app = createApp({
 await app.listen({ host: config.host, port: config.port });
 console.log(`Docker Composer API listening on http://${config.host}:${config.port}`);
 console.log(`Admin panel available at /admin (${config.adminPassword ? "enabled" : "disabled: set ADMIN_PASSWORD"})`);
-if (config.cursorSdkDisableSessionResume) console.log("Cursor SDK session resume disabled (stateless per request)");
+if (config.cursorSdkDisableSessionResume) {
+  console.log("Cursor SDK kill switch on: session resume disabled (stateless per request: create+full prompt+cancel+dispose)");
+} else if (useDurableHub) {
+  console.log(
+    `Cursor SDK session mode: durable (idle ttl ${Math.round(config.cursorSdkSessionIdleTtlMs / 1000)}s, max ${config.cursorSdkMaxLiveSessions})`
+  );
+} else {
+  console.log("Cursor SDK session mode: stateless (SESSION_MODE=stateless; kill switch off)");
+}
 if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1.1 mode enabled");
 if (config.sandClientMode) console.log("Cursor Sand channel enabled globally (per-key overrides still apply)");
 console.log(
@@ -224,6 +254,14 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
         () => app.close().catch(() => undefined),
         usageReconciler
       );
+      // durable 活句柄必须在放掉执行器租约前后限时 dispose，否则 agent 子进程会泄漏到强杀。
+      if (sessionHub) {
+        console.log(`[shutdown] dropping ${sessionHub.size} durable live session(s)`);
+        await sessionHub.dropAll().catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[shutdown] sessionHub.dropAll failed: ${message.slice(0, 200)}`);
+        });
+      }
       await executorLeases.releaseAll();
       process.exit(0);
     })();

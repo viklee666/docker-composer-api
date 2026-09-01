@@ -629,7 +629,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const keyId = typeof body.keyId === "string" && body.keyId.trim() ? body.keyId.trim() : undefined;
     const keyUsageRef: KeyUsageRef = {};
     const startedAt = Date.now();
-    // 每次测试用唯一 sessionKey，避免复用上次的 SDK agent 会话把坏的 stale 状态带进来。
+    // 每次测试用唯一 sessionKey，并强制本请求 stateless：不得进 Hub / 旧 resume，避免粘到用户会话或坏 agent。
     const run: CursorRunRequest = {
       protocol: "openai-chat",
       apiKey: "",
@@ -638,6 +638,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       model: normalizeModel(body.model),
       prompt: `You are serving a gateway connectivity test. Return only final answer text.\n\nUSER: ${prompt}`,
       sessionKey: `admin-connectivity-test-${globalThis.crypto.randomUUID()}`,
+      forceStateless: true,
       workingDirectory: deps.config.cursorWorkingDirectory,
       images: [],
       tools: [],

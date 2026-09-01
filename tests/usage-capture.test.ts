@@ -379,6 +379,8 @@ test("a failed request-log write does not advance the cost baseline", async () =
 });
 
 test("UsageReconciler books only the increment when one resumed agent serves several requests", async () => {
+  // Durable / 旧 resume：getUsage 是整个 agent 的累计值。第二条 HTTP 只能记增量，
+  // 否则会把第一轮的金额再加一遍。kill-switch 计费见下面显式 trackAgentBaseline:false 的用例。
   const store = new MemoryStateStore();
   const firstUsage: RequestUsage = {
     inputTokens: 10,
@@ -406,6 +408,7 @@ test("UsageReconciler books only the increment when one resumed agent serves sev
   const reconciler = new UsageReconciler({
     store,
     delayMs: 1,
+    trackAgentBaseline: true,
     getUsage: async () => ({ usage: call++ === 0 ? firstUsage : secondUsage, cost: cumulative[call - 1] ?? cumulative[1] })
   });
 

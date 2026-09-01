@@ -856,7 +856,7 @@ function appendToolReminder(transcript: string[], tools: GatewayTool[]): void {
   );
 }
 
-function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
+export function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
   return filterHostMetaTools(value.flatMap((item) => {
@@ -873,7 +873,7 @@ function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
  * 不是 Chat 的嵌套 `{type:"function", function:{...}}`。嵌套写法作为宽容兜底接受（记一次日志），
  * 内置工具（web_search 等）与未知类型不静默丢弃，同样记日志。
  */
-function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[] {
+export function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
   return filterHostMetaTools(value.flatMap((item) => {
@@ -943,7 +943,7 @@ function logOnce(key: string, message: string): void {
   console.warn(message);
 }
 
-function parseAnthropicTools(value: unknown, toolChoice: unknown): GatewayTool[] {
+export function parseAnthropicTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (asOptionalRecord(toolChoice)?.type === "none") return [];
   if (!Array.isArray(value)) return [];
   return filterHostMetaTools(value.flatMap((item) => {
@@ -1075,7 +1075,7 @@ function sanitizePreviousResponseForPrompt(response: Record<string, unknown>): R
   return copy;
 }
 
-function contentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false): string {
+export function contentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false): string {
   if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === null || value === undefined ? "" : JSON.stringify(value);
   const parts: string[] = [];
@@ -1148,7 +1148,7 @@ function isSystemRole(role: unknown): boolean {
   return role === "system" || role === "developer";
 }
 
-function responseContentToText(value: unknown, images: GatewayImage[], stripRitual = false): string {
+export function responseContentToText(value: unknown, images: GatewayImage[], stripRitual = false): string {
   if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
   return value.map((part) => {
@@ -1230,7 +1230,7 @@ function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[],
   return parts.join("\n");
 }
 
-function imageFromUrl(url: string): GatewayImage {
+export function imageFromUrl(url: string): GatewayImage {
   if (url.startsWith("data:")) {
     const match = /^data:([^;,]+);base64,(.+)$/i.exec(url);
     if (match) return { type: "image", source: "base64", mediaType: match[1], data: match[2] };

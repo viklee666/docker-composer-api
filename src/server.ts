@@ -29,6 +29,7 @@ import {
   type ModelLister,
   type ModelListResult
 } from "./models.js";
+import { extractDurableTurn } from "./prompt-delta.js";
 import { conversationSeed, denyRuleUnverifiable, filterModelsByScope, identityAllowed, modelIdentity } from "./routing.js";
 import {
   anthropicMessageObject,
@@ -193,6 +194,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const auth = authFor(deps, request);
     noteGatewayKeyUse(deps, auth);
     const prepared = prepareOpenAiChat(request.body, { systemPrompt: gatewaySystemPrompt(deps.config) });
+    const durableTurn = extractDurableTurn("openai-chat", request.body);
+    const seed = conversationSeed(request.body);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
     const created = nowSeconds();
@@ -203,6 +206,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       auth,
       identity,
       sessionKey: sessionAffinity(request, auth.ownerHash),
+      conversationSeed: seed,
+      durableTurn,
       request
     });
     if (prepared.stream) {
@@ -233,6 +238,11 @@ export function createApp(deps: AppDeps): FastifyInstance {
      * 老库记录（无种子）与 store:false（压根没落库）自然退回按请求体现算，认不出就不启用粘性。
      */
     const seed = previous?.conversationSeed ?? conversationSeed(body);
+    const durableTurn = extractDurableTurn(
+      "openai-responses",
+      body,
+      previous ? { response: previous.response, inputItems: previous.inputItems } : undefined
+    );
     const log = beginLog("/v1/responses", auth, prepared);
     const run = loggedRunRequest(deps, log, {
       prepared,
@@ -241,6 +251,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
       identity,
       sessionKey: sessionAffinity(request, previousResponseId ?? auth.ownerHash),
       conversationSeed: seed,
+      durableTurn,
       request
     });
     if (prepared.stream) {
@@ -313,6 +324,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const auth = authFor(deps, request);
     noteGatewayKeyUse(deps, auth);
     const prepared = prepareAnthropicMessages(request.body, { systemPrompt: gatewaySystemPrompt(deps.config) });
+    const durableTurn = extractDurableTurn("anthropic-messages", request.body);
+    const seed = conversationSeed(request.body);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;
     const log = beginLog("/v1/messages", auth, prepared);
@@ -322,6 +335,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       auth,
       identity,
       sessionKey: sessionAffinity(request, auth.ownerHash),
+      conversationSeed: seed,
+      durableTurn,
       request
     });
     if (prepared.stream) {
@@ -690,6 +705,7 @@ function loggedRunRequest(
     sessionKey: string;
     /** 调用方已经确定的会话身份（Responses 续聊沿用上一轮落库的种子）；不传就按请求体现算。 */
     conversationSeed?: string;
+    durableTurn?: CursorRunRequest["durableTurn"];
     request: FastifyRequest;
   }
 ): CursorRunRequest {
@@ -709,7 +725,9 @@ function loggedRunRequest(
     ...(input.auth.allowedCursorKeyIds?.length ? { allowedKeyIds: input.auth.allowedCursorKeyIds } : {}),
     // 第二道防线：入口已经拦过一次，这里再让选 key 只在网关范围 ∩ key 范围里挑。
     ...(input.auth.modelScope ? { gatewayModelScope: input.auth.modelScope } : {}),
-    ...(stickyKey ? { stickyKey } : {})
+    ...(stickyKey ? { stickyKey } : {}),
+    ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
+    ...(input.durableTurn ? { durableTurn: input.durableTurn } : {})
   };
   log.reasoningEffort = run.reasoningEffort;
   log.maxMode = run.maxMode;

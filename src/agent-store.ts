@@ -7,12 +7,10 @@
  * SDK 自带的 JsonlLocalAgentStore 虽可全局共享，但按行追加 + 更新时全文件重写，
  * 高流量下磁盘无限增长且重写成本随历史线性上升，同样是慢性死亡。
  *
- * 网关默认 stateless（CURSOR_SDK_DISABLE_SESSION_RESUME=true）：agent 记录只在单次请求内有意义，
- * 不需要跨请求/跨重启持久化，因此用进程内 Map 实现全部四个子 store，并做两层回收：
- * 1) 插入新 agent 时先清理闲置超过 IDLE_TTL_MS 的桶（正常请求几秒内结束）；
- * 2) 总量仍超过 MAX_AGENTS 时按 LRU 淘汰最旧的桶（并发请求数远小于该上限，不会误伤在途 agent）。
- *
- * 注意：开启 session resume 时不要使用本 store——恢复依赖跨请求/跨重启的持久化记录。
+ * 网关始终注入这一份共享内存 store（禁止 omit 后落到 SDK 每 agent SQLite）。
+ * kill switch 打开（CURSOR_SDK_DISABLE_SESSION_RESUME=true）：agent 记录只在单次请求内有意义，
+ * idle TTL 用无参默认 10 分钟。durable 默认把 idle TTL 拉长到 CURSOR_SDK_SESSION_IDLE_TTL_MS（60min）。
+ * 两层回收：闲置超时清理 + 超量 LRU。进程重启后内存 checkpoint 丢失，下一请求 fresh create（可接受）。
  */
 
 interface AgentDocument {
@@ -56,13 +54,22 @@ interface RunEventBucket {
 }
 
 /** 同时保留的 agent 桶上限（须远大于网关的实际并发请求数）。 */
-const MAX_AGENTS = 256;
+export const STATELESS_AGENT_STORE_MAX_AGENTS = 256;
 /** 闲置桶回收阈值：stateless 请求几秒内结束，10 分钟足够覆盖最长的流式响应。 */
-const IDLE_TTL_MS = 10 * 60 * 1000;
+export const STATELESS_AGENT_STORE_IDLE_TTL_MS = 10 * 60 * 1000;
 
 export type EphemeralAgentStore = ReturnType<typeof createEphemeralAgentStore>;
 
-export function createEphemeralAgentStore() {
+export interface EphemeralAgentStoreOptions {
+  /** 闲置超过该毫秒数的桶在下次插入时回收。默认 10min（stateless）。 */
+  idleTtlMs?: number;
+  /** 桶数量上限，超出按 LRU 淘汰。默认 256。 */
+  maxAgents?: number;
+}
+
+export function createEphemeralAgentStore(options?: EphemeralAgentStoreOptions) {
+  const idleTtlMs = positiveBound(options?.idleTtlMs, STATELESS_AGENT_STORE_IDLE_TTL_MS);
+  const maxAgents = positiveBound(options?.maxAgents, STATELESS_AGENT_STORE_MAX_AGENTS);
   const buckets = new Map<string, AgentBucket>();
   const runEvents = new Map<string, RunEventBucket>();
   const runToAgent = new Map<string, string>();
@@ -94,16 +101,16 @@ export function createEphemeralAgentStore() {
   const sweep = (): void => {
     const now = Date.now();
     for (const [agentId, bucket] of buckets) {
-      if (now - bucket.touchedAt >= IDLE_TTL_MS) dropAgent(agentId);
+      if (now - bucket.touchedAt >= idleTtlMs) dropAgent(agentId);
     }
-    while (buckets.size >= MAX_AGENTS) {
+    while (buckets.size >= maxAgents) {
       const oldest = buckets.keys().next().value;
       if (oldest === undefined) break;
       dropAgent(oldest);
     }
     // 极端情况下（run 未关联到已知 agent）孤儿事件桶也按同样的闲置阈值回收。
     for (const [runId, bucket] of runEvents) {
-      if (bucket.agentId === undefined && now - bucket.touchedAt >= IDLE_TTL_MS) {
+      if (bucket.agentId === undefined && now - bucket.touchedAt >= idleTtlMs) {
         runEvents.delete(runId);
         runToAgent.delete(runId);
       }
@@ -256,6 +263,10 @@ export function createEphemeralAgentStore() {
   };
 
   return { agents, runs, checkpoints, runEvents: runEventsStore };
+}
+
+function positiveBound(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && (value as number) > 0 ? Math.floor(value as number) : fallback;
 }
 
 function paginate<T>(items: T[], idOf: (item: T) => string, cursor?: string, limit?: number): { items: T[]; nextCursor?: string } {

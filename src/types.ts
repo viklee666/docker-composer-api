@@ -13,8 +13,24 @@ export interface GatewayConfig {
   cursorWorkingDirectory: string;
   requestTimeoutMs: number;
   sdkClientVersion: string;
-  /** 默认禁用 SDK agent resume，避免长期复用同一远端 agent 导致跨请求状态污染/老会话卡死。 */
+  /**
+   * Kill switch：为 true 时强制 `cursorSdkSessionMode=stateless`（每请求 create+全文+假成功+cancel+dispose）。
+   * 默认 false；设 `CURSOR_SDK_DISABLE_SESSION_RESUME=true` 后须重启才会生效（无热切换）。
+   * env: CURSOR_SDK_DISABLE_SESSION_RESUME。
+   */
   cursorSdkDisableSessionResume: boolean;
+  /**
+   * Agent 会话模式。未设置时默认 durable。kill switch 为 true 时强制 stateless，忽略本字段的 env 值。
+   * 显式 `stateless` 仍有效。改 mode 只能改 env 后重启。
+   * env: CURSOR_SDK_SESSION_MODE。
+   */
+  cursorSdkSessionMode: CursorSdkSessionMode;
+  /** 挂起工具 execute 的最长等待（毫秒）。env: CURSOR_SDK_TOOL_HOLD_TTL_MS，默认 15min。 */
+  cursorSdkToolHoldTtlMs: number;
+  /** durable 空闲 agent 回收阈值（毫秒）。env: CURSOR_SDK_SESSION_IDLE_TTL_MS，默认 60min。 */
+  cursorSdkSessionIdleTtlMs: number;
+  /** SessionHub 同时存活的会话上限（LRU）。env: CURSOR_SDK_MAX_LIVE_SESSIONS，默认 256。 */
+  cursorSdkMaxLiveSessions: number;
   /**
    * 是否允许 Cursor agent 在网关容器内使用自己的内置工具（shell/edit/grep 等）。
    * 默认 false：无客户端工具时纯文本模式，有客户端工具时只保留 MCP 元工具通道（customTools 经此暴露），
@@ -66,6 +82,9 @@ export interface GatewayConfig {
   /** 默认系统提示词正文。env: SYSTEM_PROMPT，后台可改。 */
   systemPrompt?: string;
 }
+
+/** Cursor SDK 会话生命周期：durable 复用 agent；stateless 为今日每请求新建。 */
+export type CursorSdkSessionMode = "durable" | "stateless";
 
 /**
  * 多 key 取用策略。
@@ -189,6 +208,24 @@ export interface GatewayToolCall {
   arguments: Record<string, unknown>;
 }
 
+/**
+ * 从客户端全量 history 抽出的本轮增量（server 侧算完再传入 runner；rawBody 不进 runner）。
+ * WP2 的 extractDurableTurn 产出此形状。
+ */
+export interface DurableTurn {
+  kind: "new_user" | "tool_results" | "incompatible" | "empty";
+  userText?: string;
+  images?: GatewayImage[];
+  systemFingerprint: string;
+  toolsFingerprint: string;
+  toolResults?: Array<{ id: string; content: string; isError?: boolean }>;
+  /**
+   * Unhashed client system text (`systemSeedText(body)`). Additive; first durable
+   * send may prefix `SYSTEM:\n{systemText}`. Omitted when empty so WP2 cases stay intact.
+   */
+  systemText?: string;
+}
+
 export interface KeyUsageRef {
   keyId?: string;
   keyLabel?: string;
@@ -268,6 +305,20 @@ export interface CursorRunRequest {
    * 那样粘性就变成「把整个网关钉死在一把 key 上」，轮询失效、坏 key 也再不会被重试。
    */
   stickyKey?: string;
+  /**
+   * 本段对话的稳定种子（显式会话头 / Responses 继承 / conversationSeed(body)）。
+   * 与 stickyKey 同源，但不带 ownerHash 前缀；无识别身份时不要填。
+   */
+  conversationSeed?: string;
+  /**
+   * durable 路径的本轮增量。由 server 从入站 body 算出后传入；rawBody 本身不进 runner。
+   */
+  durableTurn?: DurableTurn;
+  /**
+   * 仅本请求强制走 stateless（跳过 Hub、旧 resume 的 getSession/saveSession，create+全文+cancel+dispose）。
+   * 不改进程级 kill switch。Admin 联通性测试使用，避免粘到用户会话或旧 agent。
+   */
+  forceStateless?: boolean;
   /** 客户端是否以流式消费本请求（影响 key 轮换重试策略：流式下已发出的 thinking 视为已交付）。 */
   stream?: boolean;
   /** thinking 事件是否会被端点真正转发给客户端（messages 未请求 thinking 时为 false，此时不算已交付产出）。 */

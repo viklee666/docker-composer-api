@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { SDKCustomTool, SDKJsonValue } from "@cursor/sdk";
+import type { SDKCustomTool, SDKCustomToolResult, SDKJsonValue } from "@cursor/sdk";
 import type { GatewayTool, GatewayToolCall } from "./types.js";
 
 type JsonRecord = Record<string, SDKJsonValue>;
@@ -79,12 +79,33 @@ const ARG_ALIASES: Record<string, Record<string, string[]>> = {
   }
 };
 
+/**
+ * Stateless `execute` 假成功文案（诱导 agent 停手，随后 cancel）。
+ * `hold: true` 路径禁止返回此字符串；文案本身锁定，cursor-runner 的双参调用依赖它。
+ */
+export const STATELESS_EXECUTE_ACCEPTED_TEXT =
+  "Accepted. The caller will execute this tool and return the result in the next request. End your turn now without calling more tools.";
+
+export type HeldToolResolve = (value: unknown) => void;
+export type HeldToolReject = (reason?: unknown) => void;
+
+export interface CreateSdkCustomToolsOptions {
+  /**
+   * false / 省略：同步返回假成功（今日 stateless，cursor-runner 双参调用）。
+   * true：返回未 settle 的 Promise，经 `onHold` 交给 SessionHub。
+   */
+  hold?: boolean;
+  onHold?: (toolCallId: string, resolve: HeldToolResolve, reject: HeldToolReject) => void;
+}
+
 export function createSdkCustomTools(
   tools: GatewayTool[],
-  onToolCall: (toolCall: GatewayToolCall) => void
+  onToolCall: (toolCall: GatewayToolCall) => void,
+  options?: CreateSdkCustomToolsOptions
 ): Record<string, SDKCustomTool> | undefined {
   const clientTools = filterHostMetaTools(tools);
   if (!clientTools.length) return undefined;
+  const hold = options?.hold === true;
   const customTools: Record<string, SDKCustomTool> = {};
   for (const tool of clientTools) {
     if (!tool.name) continue;
@@ -92,18 +113,28 @@ export function createSdkCustomTools(
       description: tool.description,
       inputSchema: sdkInputSchema(tool.inputSchema),
       execute: (args, context) => {
+        const id = context.toolCallId ?? `call_${randomUUID().replaceAll("-", "")}`;
         onToolCall(normalizeToolCallForClient({
-          id: context.toolCallId ?? `call_${randomUUID().replaceAll("-", "")}`,
+          id,
           name: tool.name,
           arguments: jsonRecordToPlain(args)
         }, clientTools));
+        if (hold) {
+          return new Promise<SDKCustomToolResult>((resolve, reject) => {
+            if (!options?.onHold) {
+              reject(new Error("createSdkCustomTools hold:true requires onHold"));
+              return;
+            }
+            options.onHold(id, (value) => resolve(value as SDKCustomToolResult), reject);
+          });
+        }
         // 必须返回“成功”而非 isError：错误结果会诱导 agent 重试改参数或改用内置工具，
         // 恰好产生外部客户端观察到的“参数错误/重复调用”。网关随后会 cancel 整个 run。
         return {
           content: [
             {
               type: "text",
-              text: "Accepted. The caller will execute this tool and return the result in the next request. End your turn now without calling more tools."
+              text: STATELESS_EXECUTE_ACCEPTED_TEXT
             }
           ]
         };

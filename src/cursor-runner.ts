@@ -4,6 +4,17 @@ import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamA
 import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorClientType, waitForSandClientHook } from "./sand-client.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers } from "./protocol.js";
+import { durableSessionId } from "./durable-id.js";
+import {
+  EventPump,
+  createSessionSlot,
+  durableSlotReplaceReason,
+  recordIssuedToolCalls,
+  touchSlotHistory,
+  type HubPumpItem,
+  type SessionHub,
+  type SessionSlot
+} from "./session-hub.js";
 import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
 import type {
   AgentMode,
@@ -12,12 +23,20 @@ import type {
   CursorRunner,
   CursorStreamEvent,
   ExecutorLeaseManager,
+  GatewayImage,
   GatewayToolCall,
   ModelParameterValue,
   RequestUsage,
   RunTelemetryRef,
   StateStore
 } from "./types.js";
+
+/**
+ * First-send durable instruction. Must stay a module constant: no dates, request ids, or tool name lists.
+ * File-edit guardrail + “use already-registered tools”.
+ */
+export const STABLE_DIRECTIVE =
+  "Do not edit, create, or delete files on this machine, and do not run shell commands here. When a task needs a tool, call one of the already-registered tools through the tool interface; do not claim a registered tool is unavailable.";
 
 /** 解析后可直接发给 SDK 的模型选择 + 会话模式。 */
 interface ResolvedModelRun {
@@ -46,6 +65,7 @@ export interface AgentFactory {
 
 export class CursorSdkRunner implements CursorRunner {
   private readonly sessionLocks = new Map<string, Promise<void>>();
+  private readonly durableRunOrdinals = new Map<string, number>();
 
   constructor(
     private readonly store: StateStore,
@@ -68,6 +88,8 @@ export class CursorSdkRunner implements CursorRunner {
        * 必须释放租约让引用计数归零、SDK dispose 掉它，否则这把 key 之后的每个请求都会秒失败到进程重启。
        */
       executorLeases?: ExecutorLeaseManager;
+      /** WP4 durable Hub。未注入时即使 kill switch 关闭也走今日 streamLocked（旧 resume）。 */
+      sessionHub?: SessionHub;
     },
     private readonly agentFactory?: AgentFactory
   ) {}
@@ -94,11 +116,29 @@ export class CursorSdkRunner implements CursorRunner {
     const id = sessionId(input);
     const clientType = input.clientType ?? getCurrentCursorClientType();
     try {
-      // stateless 模式（默认）下每请求都是独立 fresh agent，没有共享会话状态需要保护；
+      // kill switch 或本请求 forceStateless：每请求独立 fresh agent，没有共享会话状态需要保护；
       // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
       // client-type 必须包住整段 SDK 调用：header 是在 create/send 时写入的。
-      if (this.input.disableSessionResume) {
+      if (usesStatelessPath(input, this.input.disableSessionResume)) {
         yield* iterateWithCursorClientType(clientType, this.streamLocked(input, signal, id));
+        return;
+      }
+      const hub = this.input.sessionHub;
+      // durableSessionId 必须在 KeyRotatingRunner 注入 apiKey 之后算，空 key 会撞槽。
+      const durableId = hub ? durableSessionId({
+        apiKey: input.apiKey,
+        model: input.model,
+        workingDirectory: input.workingDirectory || this.input.defaultWorkingDirectory,
+        stickyKey: input.stickyKey,
+        conversationSeed: input.conversationSeed
+      }) : undefined;
+      if (hub && durableId) {
+        yield* iterateWithCursorClientType(clientType, this.streamDurable(hub, durableId, input, signal));
+        return;
+      }
+      // D4: Hub 在但认不出会话 → 真 stateless（与 kill switch 相同）。禁止用 ownerHash/sessionKey 走旧 resume。
+      if (hub && !durableId) {
+        yield* iterateWithCursorClientType(clientType, this.streamLocked({ ...input, forceStateless: true }, signal, id));
         return;
       }
       yield* iterateWithCursorClientType(clientType, this.withSessionLock(id, () => this.streamLocked(input, signal, id)));
@@ -131,7 +171,7 @@ export class CursorSdkRunner implements CursorRunner {
     // 全部与 abort 竞速：空闲超时或客户端断连时请求一定能收尾，而不是永久悬挂、随流量持续堆积句柄与内存。
     const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
     recordRunTelemetry(input, resolved);
-    const existingAgentId = this.input.disableSessionResume ? undefined : await this.store.getSession(id);
+    const existingAgentId = usesStatelessPath(input, this.input.disableSessionResume) ? undefined : await this.store.getSession(id);
     let resumedAgent: AgentLike | undefined;
     if (existingAgentId && typeof factory.resume === "function") {
       try {
@@ -201,6 +241,650 @@ export class CursorSdkRunner implements CursorRunner {
       release();
       if (this.sessionLocks.get(id) === current) this.sessionLocks.delete(id);
     }
+  }
+
+  /**
+   * Durable sibling of streamLocked. Kill switch / no Hub / unidentifiable session never enter here.
+   * Path A (WP0 pass): held execute, same Run, no cancel/wait/dispose on tool HTTP.
+   * Path B (D18 marker + no pending execute): cancel that Run, keep agent, next tool_result is a short send.
+   */
+  private async *streamDurable(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined
+  ): AsyncIterable<CursorStreamEvent> {
+    const release = await hub.acquire(sessionId, signal);
+    try {
+      yield* this.runDurableLocked(hub, sessionId, input, signal);
+    } finally {
+      const slot = hub.get(sessionId);
+      if (slot?.state === "running" && slot.pending.size > 0) {
+        hub.beginAwaitingTools(sessionId);
+      } else if (slot?.state === "running") {
+        await this.dropDurableSession(hub, sessionId).catch(() => undefined);
+      }
+      release();
+    }
+  }
+
+  private async *runDurableLocked(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined
+  ): AsyncIterable<CursorStreamEvent> {
+    const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
+    recordRunTelemetry(input, resolved);
+
+    const turn = input.durableTurn;
+
+    if (turn?.kind === "empty") {
+      throw new ApiError("Empty durable turn: the last user message is unchanged.", 400, "invalid_request_error");
+    }
+
+    let slot = await this.ensureDurableSlot(hub, sessionId, input, resolved, signal, turn);
+
+    if (
+      turn?.kind === "new_user"
+      && slot.lastUserText !== undefined
+      && turn.userText === slot.lastUserText
+      && !turn.images?.length
+    ) {
+      throw new ApiError("Empty durable turn: the last user message is unchanged.", 400, "invalid_request_error");
+    }
+
+    const sendRecoverable = async (
+      spec: { kind: "new_user" | "tool_results"; message: unknown; firstSend: boolean }
+    ): Promise<void> => {
+      try {
+        await this.durableSend(hub, slot, sessionId, input, resolved, signal, spec);
+      } catch (error) {
+        if (isActiveRunError(error) || isRetryableStaleSessionError(error)) {
+          const reason = isActiveRunError(error) ? "busy" : "stale";
+          console.error(`[durable] drop+create ${reason} session=${sessionId.slice(0, 12)}`);
+          await this.dropDurableSession(hub, sessionId);
+          slot = await this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
+          const recovered = spec.kind === "new_user"
+            ? {
+              kind: "new_user" as const,
+              firstSend: true,
+              message: sdkTextMessage(formatDurableUserMessage({
+                firstSend: true,
+                userText: turn?.userText ?? "",
+                systemText: turn?.systemText
+              }), turn?.images)
+            }
+            : spec;
+          await this.durableSend(hub, slot, sessionId, input, resolved, signal, recovered);
+          return;
+        }
+        const keyError = keySemanticApiError(input.model, error);
+        if (keyError) throw keyError;
+        throw error;
+      }
+    };
+
+    if (turn?.kind === "tool_results") {
+      let resolvedAny = false;
+      for (const result of turn.toolResults ?? []) {
+        const sdkResult = {
+          content: [{ type: "text", text: result.content }],
+          ...(result.isError ? { isError: true } : {})
+        };
+        if (hub.resolvePending(sessionId, result.id, sdkResult)) {
+          resolvedAny = true;
+          console.error(`[durable] resolve execute id=${result.id}`);
+        }
+      }
+      if (!resolvedAny) {
+        const text = formatPathBToolResults(turn.toolResults ?? []);
+        await sendRecoverable({ kind: "tool_results", message: text, firstSend: false });
+      } else if ((hub.get(sessionId)?.pending.size ?? 0) === 0) {
+        // Path A HTTP2: same Run continues; leave awaiting_tools only while execute is still held.
+        hub.markRunning(sessionId);
+      }
+      slot = hub.get(sessionId) ?? slot;
+      yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+      return;
+    }
+
+    if (slot.state === "awaiting_tools") {
+      console.error(`[durable] user cancelled pending tools session=${sessionId.slice(0, 12)}`);
+      for (const id of [...slot.pending.keys()]) {
+        hub.rejectPending(sessionId, id, new Error("user cancelled tools"));
+      }
+      await withCleanupTimeout(slot.run?.cancel?.().catch(() => undefined));
+      if (slot.waitPromise) await withCleanupTimeout(slot.waitPromise.catch(() => undefined));
+      slot.run = undefined;
+      slot.waitPromise = undefined;
+      slot.runId = undefined;
+    }
+
+    const firstSend = slot.lastUserText === undefined && !slot.resumed;
+    const userText = turn?.userText ?? "";
+    const text = formatDurableUserMessage({
+      firstSend,
+      userText,
+      systemText: turn?.systemText
+    });
+    await sendRecoverable({
+      kind: "new_user",
+      message: sdkTextMessage(text, turn?.images),
+      firstSend
+    });
+    slot = hub.get(sessionId) ?? slot;
+    touchSlotHistory(slot, userText);
+    yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+  }
+
+  private async ensureDurableSlot(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    resolved: ResolvedModelRun,
+    signal: AbortSignal | undefined,
+    turn: CursorRunRequest["durableTurn"]
+  ): Promise<SessionSlot> {
+    let slot = hub.get(sessionId);
+    const replaceReason = durableSlotReplaceReason(slot, {
+      kind: turn?.kind,
+      apiKey: input.apiKey,
+      model: input.model,
+      systemFingerprint: turn?.systemFingerprint,
+      toolsFingerprint: turn?.toolsFingerprint,
+      toolResults: turn?.toolResults,
+      prompt: input.prompt
+    });
+    if (slot && replaceReason) {
+      console.error(`[durable] drop+create ${replaceReason} session=${sessionId.slice(0, 12)}`);
+      await this.dropDurableSession(hub, sessionId);
+      slot = undefined;
+    }
+    if (slot) return slot;
+
+    const existingAgentId = await this.store.getSession(sessionId);
+    if (existingAgentId && !replaceReason) {
+      const resumed = await this.tryResumeDurableSlot(
+        hub,
+        sessionId,
+        input,
+        resolved,
+        signal,
+        turn,
+        existingAgentId
+      );
+      if (resumed) return resumed;
+    }
+
+    // Restart leftover: no live handle, tool_results, nowhere to resume → do not poison a new agent.
+    if (turn?.kind === "tool_results" && !replaceReason) {
+      throw new ApiError("No durable session is awaiting tool results.", 400, "invalid_request_error");
+    }
+
+    return this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
+  }
+
+  private async tryResumeDurableSlot(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    resolved: ResolvedModelRun,
+    signal: AbortSignal | undefined,
+    turn: CursorRunRequest["durableTurn"],
+    agentId: string
+  ): Promise<SessionSlot | undefined> {
+    const factory = this.agentFactory ?? await this.loadAgentFactory();
+    if (typeof factory.resume !== "function") {
+      await this.store.deleteSession(sessionId).catch(() => undefined);
+      return undefined;
+    }
+    const customTools = this.durableCustomTools(hub, sessionId, input);
+    try {
+      const agent = await raceCreateAgent(
+        factory.resume(agentId, this.agentOptions(input, resolved, customTools)),
+        signal
+      );
+      // Restart cannot restore in-memory pending executes. Resume is always idle.
+      const slot = createSessionSlot({
+        agent,
+        agentId: agent.agentId ?? agentId,
+        apiKey: input.apiKey,
+        model: input.model,
+        toolsFingerprint: turn?.toolsFingerprint ?? "",
+        systemFingerprint: turn?.systemFingerprint ?? "",
+        state: "idle",
+        resumed: true
+      });
+      hub.put(sessionId, slot);
+      if (slot.agentId && slot.agentId !== agentId) {
+        await this.store.saveSession(sessionId, slot.agentId);
+      }
+      console.error(
+        `[durable] resume agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
+      );
+      return slot;
+    } catch (error) {
+      const keyError = keySemanticApiError(input.model, error);
+      if (keyError) throw keyError;
+      console.error(
+        `[durable] resume failed, dropping mapping session=${sessionId.slice(0, 12)}: ${errorMessage(error).slice(0, 200)}`
+      );
+      await this.store.deleteSession(sessionId).catch(() => undefined);
+      return undefined;
+    }
+  }
+
+  private async createDurableSlot(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    resolved: ResolvedModelRun,
+    signal: AbortSignal | undefined,
+    turn: CursorRunRequest["durableTurn"]
+  ): Promise<SessionSlot> {
+    const factory = this.agentFactory ?? await this.loadAgentFactory();
+    const customTools = this.durableCustomTools(hub, sessionId, input);
+    const agent = await raceCreateAgent(
+      factory.create(this.agentOptions(input, resolved, customTools)),
+      signal
+    ).catch((error) => {
+      throw keySemanticApiError(input.model, error) ?? modelUnavailableError(error) ?? error;
+    });
+    const slot = createSessionSlot({
+      agent,
+      agentId: agent.agentId ?? "",
+      apiKey: input.apiKey,
+      model: input.model,
+      toolsFingerprint: turn?.toolsFingerprint ?? "",
+      systemFingerprint: turn?.systemFingerprint ?? "",
+      state: "running"
+    });
+    hub.put(sessionId, slot);
+    if (agent.agentId) await this.store.saveSession(sessionId, agent.agentId);
+    console.error(
+      `[durable] create agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
+    );
+    return slot;
+  }
+
+  /** create/resume register customTools; later send omits them (whole-table replace). */
+  private durableCustomTools(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest
+  ): ReturnType<typeof createSdkCustomTools> {
+    const toolNames = new Map<string, string>();
+    return createSdkCustomTools(input.tools, (toolCall) => {
+      toolNames.set(toolCall.id, toolCall.name);
+      hub.get(sessionId)?.pump.push({
+        kind: "captured",
+        id: toolCall.id,
+        name: toolCall.name,
+        args: toolCall.arguments
+      });
+    }, {
+      hold: true,
+      onHold: (toolCallId, resolve, reject) => {
+        hub.registerHold(sessionId, toolCallId, toolNames.get(toolCallId) ?? "tool", resolve, reject);
+      }
+    });
+  }
+
+  private async dropDurableSession(hub: SessionHub, sessionId: string): Promise<void> {
+    this.durableRunOrdinals.delete(sessionId);
+    await hub.drop(sessionId).catch(() => undefined);
+    await this.store.deleteSession(sessionId).catch(() => undefined);
+  }
+
+  private async durableSend(
+    hub: SessionHub,
+    slot: SessionSlot,
+    sessionId: string,
+    input: CursorRunRequest,
+    resolved: ResolvedModelRun,
+    signal: AbortSignal | undefined,
+    spec: { kind: "new_user" | "tool_results"; message: unknown; firstSend: boolean }
+  ): Promise<RunLike> {
+    const ordinal = this.nextDurableOrdinal(sessionId);
+    const preview = typeof spec.message === "string" ? spec.message : String(asRecord(spec.message)?.text ?? "");
+    console.error(
+      `[durable] send ${spec.firstSend ? "first" : "follow-up"} session=${sessionId.slice(0, 12)} chars=${preview.length}`
+    );
+    hub.markRunning(sessionId);
+    hub.attachPump(sessionId, new EventPump());
+    const onDelta = (args: { update: unknown }) => {
+      if (args?.update !== undefined) slot.pump.push({ kind: "event", event: args.update });
+    };
+    const agent = slot.agent as AgentLike;
+    const run = await raceSendRun(agent.send(spec.message, {
+      model: resolved.model,
+      idempotencyKey: durableIdempotencyKey(sessionId, ordinal, spec.kind),
+      onDelta,
+      ...(resolved.mode ? { mode: resolved.mode } : {})
+    }), signal).catch((error) => {
+      const keyError = keySemanticApiError(input.model, error);
+      if (keyError) throw keyError;
+      throw error;
+    });
+    slot.run = run;
+    slot.runId = run.id;
+    const waitPromise = run.wait();
+    slot.waitPromise = waitPromise;
+    void waitPromise.catch(() => undefined);
+    void (async () => {
+      try {
+        for await (const event of run.stream()) slot.pump.push({ kind: "event", event });
+        slot.pump.push({ kind: "end" });
+      } catch (error) {
+        slot.pump.push({ kind: "end", error });
+      }
+    })();
+    if (input.telemetryRef) {
+      if (slot.agent.agentId) input.telemetryRef.agentId = slot.agent.agentId;
+      if (run.id) input.telemetryRef.runId = run.id;
+    }
+    return run;
+  }
+
+  private nextDurableOrdinal(sessionId: string): number {
+    const next = (this.durableRunOrdinals.get(sessionId) ?? 0) + 1;
+    this.durableRunOrdinals.set(sessionId, next);
+    return next;
+  }
+
+  private async *consumeDurablePump(
+    hub: SessionHub,
+    sessionId: string,
+    slot: SessionSlot,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined
+  ): AsyncIterable<CursorStreamEvent> {
+    const usageLedger = new TurnUsageLedger();
+    const capturedToolCalls: GatewayToolCall[] = [];
+    const textParts: string[] = [];
+    const keepThinking = !input.stream;
+    const thinkingParts: string[] = [];
+    const toolCalls: GatewayToolCall[] = [];
+    const streamErrorDetails: string[] = [];
+    const filter = input.tools.length ? new ToolMarkerFilter() : undefined;
+    let textSource: "none" | "delta" | "message" = "none";
+    let thinkingSource: "none" | "delta" | "message" = "none";
+    let streamError: unknown;
+    let streamHadItems = false;
+    let pathB = false;
+
+    const parkPathB = (): void => {
+      recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+      hub.markIdle(sessionId);
+    };
+
+    const pathBDone = (): CursorStreamEvent => ({
+      type: "done",
+      result: {
+        text: textParts.join("").trim(),
+        toolCalls: [...toolCalls],
+        ...(thinkingParts.length ? { reasoningText: thinkingParts.join("") } : {}),
+        agentId: slot.agentId || slot.agent.agentId,
+        runId: slot.runId ?? slot.run?.id
+      }
+    });
+
+    const keepDeclaredOnly = (calls: GatewayToolCall[]): GatewayToolCall[] => calls.filter((toolCall) => {
+      if (input.tools.length && matchesClientTool(toolCall, input.tools)) return true;
+      logDeduped(
+        `unmatched\0${input.model}\0${toolCall.name}`,
+        `[tool-compat] model="${input.model}" dropped tool call "${toolCall.name}" not declared by the client`
+      );
+      return false;
+    });
+
+    function* emitTextChunk(chunk: string): Generator<CursorStreamEvent> {
+      if (!chunk) return;
+      if (!filter) {
+        textParts.push(chunk);
+        yield { type: "text", text: chunk };
+        return;
+      }
+      const safe = filter.push(chunk);
+      if (safe) {
+        textParts.push(safe);
+        yield { type: "text", text: safe };
+      }
+      const markerCalls = keepDeclaredOnly(filter.takeToolCalls());
+      if (markerCalls.length && slot.pending.size === 0) {
+        pathB = true;
+        const start = toolCalls.length;
+        for (const toolCall of normalizeToolCallsForClient(markerCalls, input.tools)) {
+          pushToolCall(toolCalls, toolCall);
+        }
+        // Mark idle before yielding so a client disconnect during/after tool_call cannot drop the agent.
+        parkPathB();
+        for (const toolCall of toolCalls.slice(start)) {
+          yield { type: "tool_call", toolCall };
+        }
+        return;
+      }
+      if (markerCalls.length) {
+        const held = filter.takeHeldText();
+        if (held) {
+          textParts.push(held);
+          yield { type: "text", text: held };
+        }
+      }
+    }
+
+    function* applyEvent(event: unknown): Generator<CursorStreamEvent> {
+      const record = asRecord(event);
+      const type = typeof record?.type === "string" ? record.type : "";
+      if (type === "text-delta" || type === "thinking-delta" || type === "turn-ended") {
+        streamHadItems = true;
+        if (type === "text-delta" && typeof record?.text === "string" && record.text && textSource !== "message") {
+          textSource = "delta";
+          yield* emitTextChunk(record.text);
+        } else if (type === "thinking-delta" && typeof record?.text === "string" && record.text && thinkingSource !== "message") {
+          thinkingSource = "delta";
+          if (keepThinking) thinkingParts.push(record.text);
+          yield { type: "thinking", text: record.text };
+        } else if (type === "turn-ended") {
+          const turnUsage = parseSdkUsage(record);
+          if (turnUsage) {
+            usageLedger.addDeltaTurn(turnUsage);
+            publishUsageTotal(usageLedger, input.telemetryRef);
+          }
+        }
+        return;
+      }
+      streamHadItems = true;
+      captureUsageFromSdkEvent(event, input.telemetryRef, usageLedger);
+      const thinking = thinkingFromSdkEvent(event);
+      if (thinking && thinkingSource !== "delta") {
+        thinkingSource = "message";
+        if (keepThinking) thinkingParts.push(thinking);
+        yield { type: "thinking", text: thinking };
+      }
+      const text = textFromSdkEvent(event);
+      if (text && textSource !== "delta") {
+        textSource = "message";
+        yield* emitTextChunk(text);
+      }
+      const errorDetail = errorDetailFromSdkEvent(event);
+      if (errorDetail) streamErrorDetails.push(errorDetail);
+      const eventToolCalls = keepDeclaredOnly(toolCallsFromSdkEvent(event))
+        .map((toolCall) => normalizeToolCallForClient(toolCall, input.tools));
+      for (const toolCall of eventToolCalls) {
+        pushToolCall(toolCalls, toolCall);
+        yield { type: "tool_call", toolCall };
+      }
+    }
+
+    const parkHeld = async function* (): AsyncIterable<CursorStreamEvent> {
+      await hub.settleParallelTools();
+      for (;;) {
+        const extra = slot.pump.poll();
+        if (!extra) break;
+        if (extra.kind === "captured") {
+          pushToolCall(capturedToolCalls, {
+            id: extra.id,
+            name: extra.name,
+            arguments: extra.args ?? {}
+          });
+        } else if (extra.kind === "event") {
+          yield* applyEvent(extra.event);
+        }
+      }
+      for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
+        const declared = keepDeclaredOnly([toolCall]);
+        if (!declared.length) continue;
+        const normalized = normalizeToolCallForClient(declared[0], input.tools);
+        pushToolCall(toolCalls, normalized);
+        yield { type: "tool_call", toolCall: normalized };
+      }
+      recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+      hub.beginAwaitingTools(sessionId);
+      yield {
+        type: "done",
+        result: {
+          text: textParts.join("").trim(),
+          toolCalls: [...toolCalls],
+          ...(thinkingParts.length ? { reasoningText: thinkingParts.join("") } : {}),
+          agentId: slot.agentId || slot.agent.agentId,
+          runId: slot.runId ?? slot.run?.id
+        }
+      };
+    };
+
+    for (;;) {
+      const item = await nextHubItem(slot.pump, signal);
+      if (item.kind === "http-abort") {
+        // Held execute: this HTTP is supposed to end with tool_calls. Do not drop the slot.
+        if (slot.pending.size > 0) {
+          yield* parkHeld();
+          return;
+        }
+        // Path B: tools already on the wire. Keep the agent idle; do not 499-drop.
+        if (pathB && toolCalls.length) {
+          parkPathB();
+          yield pathBDone();
+          return;
+        }
+        throw new ApiError("Request was aborted.", 499, "request_aborted");
+      }
+      if (item.kind === "captured") {
+        streamHadItems = true;
+        pushToolCall(capturedToolCalls, {
+          id: item.id,
+          name: item.name,
+          arguments: item.args ?? {}
+        });
+      } else if (item.kind === "event") {
+        yield* applyEvent(item.event);
+      } else if (item.kind === "end") {
+        streamError = item.error;
+        break;
+      }
+
+      if (pathB) {
+        await withCleanupTimeout(slot.run?.cancel?.().catch(() => undefined));
+        break;
+      }
+
+      if (slot.pending.size > 0) {
+        yield* parkHeld();
+        return;
+      }
+    }
+
+    // Path B marker: tools already yielded. Skip wait on the cancelled run so HTTP abort
+    // cannot 499 while state is still running (that would drop the agent in streamDurable finally).
+    if (pathB) {
+      parkPathB();
+      yield pathBDone();
+      return;
+    }
+
+    if (streamError && (signal?.aborted || !capturedToolCalls.length)) throw streamError;
+
+    if (filter && !toolCalls.length && !capturedToolCalls.length) {
+      const rest = filter.flush();
+      if (rest) {
+        textParts.push(rest);
+        yield { type: "text", text: rest };
+      }
+    }
+
+    for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
+      const declared = keepDeclaredOnly([toolCall]);
+      if (!declared.length) continue;
+      const normalized = normalizeToolCallForClient(declared[0], input.tools);
+      pushToolCall(toolCalls, normalized);
+      yield { type: "tool_call", toolCall: normalized };
+    }
+
+    if (slot.pending.size > 0) {
+      yield* parkHeld();
+      return;
+    }
+
+    let waitError: unknown;
+    let waited: unknown;
+    try {
+      waited = await raceWithAbort(slot.waitPromise ?? slot.run?.wait() ?? Promise.resolve(undefined), signal);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "request_aborted") {
+        if (pathB && toolCalls.length) {
+          parkPathB();
+          yield pathBDone();
+          return;
+        }
+        throw error;
+      }
+      waitError = error;
+    }
+
+    const waitedText = resultText(waited);
+    if (!streamHadItems && !toolCalls.length && !textParts.length && waitedText && !isRitualAssistantText(waitedText)) {
+      const parsed = input.tools.length ? parseToolMarkers(waitedText) : { text: waitedText, toolCalls: [] };
+      const declared = keepDeclaredOnly(parsed.toolCalls);
+      if (declared.length) {
+        pathB = true;
+        const start = toolCalls.length;
+        for (const toolCall of normalizeToolCallsForClient(declared, input.tools)) {
+          pushToolCall(toolCalls, toolCall);
+        }
+        parkPathB();
+        for (const toolCall of toolCalls.slice(start)) {
+          yield { type: "tool_call", toolCall };
+        }
+      }
+      if (parsed.text && !declared.length) {
+        textParts.push(parsed.text);
+        yield { type: "text", text: parsed.text };
+      }
+    }
+
+    const terminalStatus = runStatus(waited);
+    if (!textParts.length && !toolCalls.length && (terminalStatus === "error" || terminalStatus === "cancelled")) {
+      throw upstreamRunError(input.model, uniqueJoined([...streamErrorDetails, runErrorDetail(waited)]));
+    }
+    if (!textParts.length && !toolCalls.length && waited === undefined && waitError) {
+      const keyError = keySemanticApiError(input.model, waitError);
+      if (keyError) throw keyError;
+      throw upstreamRunError(input.model, uniqueJoined([...streamErrorDetails, errorMessage(waitError)]));
+    }
+
+    recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+    hub.markIdle(sessionId);
+    yield {
+      type: "done",
+      result: {
+        text: textParts.join("").trim(),
+        toolCalls: [...toolCalls],
+        ...(thinkingParts.length ? { reasoningText: thinkingParts.join("") } : {}),
+        agentId: slot.agentId || slot.agent.agentId,
+        runId: slot.runId ?? slot.run?.id
+      }
+    };
   }
 
   private async *runWithAgent(
@@ -462,7 +1146,7 @@ export class CursorSdkRunner implements CursorRunner {
         agentId: agent.agentId,
         runId: run.id
       };
-      if (!this.input.disableSessionResume && agent.agentId) await this.store.saveSession(id, agent.agentId);
+      if (!usesStatelessPath(input, this.input.disableSessionResume) && agent.agentId) await this.store.saveSession(id, agent.agentId);
       yield { type: "done", result };
       finishedNormally = true;
     } finally {
@@ -523,7 +1207,11 @@ export class CursorSdkRunner implements CursorRunner {
     return Agent as AgentFactory;
   }
 
-  private agentOptions(input: CursorRunRequest, resolved: ResolvedModelRun): Record<string, unknown> {
+  private agentOptions(
+    input: CursorRunRequest,
+    resolved: ResolvedModelRun,
+    customTools?: ReturnType<typeof createSdkCustomTools>
+  ): Record<string, unknown> {
     return {
       apiKey: input.apiKey,
       model: resolved.model,
@@ -533,7 +1221,8 @@ export class CursorSdkRunner implements CursorRunner {
       local: {
         cwd: input.workingDirectory || this.input.defaultWorkingDirectory,
         settingSources: [],
-        ...(this.input.localAgentStore ? { store: this.input.localAgentStore } : {})
+        ...(this.input.localAgentStore ? { store: this.input.localAgentStore } : {}),
+        ...(customTools ? { customTools } : {})
       },
       clientVersion: this.input.sdkClientVersion,
       // SDK >=1.0.27 的内置工具限制：无客户端工具 → []（纯文本，agent 不能动网关容器的文件/命令）；
@@ -545,13 +1234,7 @@ export class CursorSdkRunner implements CursorRunner {
   }
 
   private sdkMessage(input: CursorRunRequest): unknown {
-    if (!input.images.length) return input.prompt;
-    return {
-      text: input.prompt,
-      images: input.images.map((image) => image.source === "url"
-        ? { url: image.data }
-        : { data: image.data, mimeType: image.mediaType ?? "image/png" })
-    };
+    return sdkTextMessage(input.prompt, input.images);
   }
 }
 
@@ -753,6 +1436,70 @@ function sessionId(input: CursorRunRequest): string {
   return createHash("sha256")
     .update([input.apiKey, input.model, input.sessionKey, input.workingDirectory ?? ""].join("\0"))
     .digest("hex");
+}
+
+/** 进程级 kill switch 或单请求 forceStateless：跳过 Hub 与旧 resume 的 get/save。 */
+function usesStatelessPath(input: CursorRunRequest, disableSessionResume?: boolean): boolean {
+  return Boolean(disableSessionResume || input.forceStateless);
+}
+
+function durableIdempotencyKey(sessionId: string, runOrdinal: number, kind: string): string {
+  return createHash("sha256").update(`${sessionId}:${runOrdinal}:${kind}`).digest("hex");
+}
+
+function formatDurableUserMessage(input: { firstSend: boolean; userText: string; systemText?: string }): string {
+  const parts: string[] = [];
+  if (input.firstSend) {
+    parts.push(STABLE_DIRECTIVE);
+    const system = input.systemText?.trim();
+    if (system) parts.push(`SYSTEM:\n${system}`);
+  }
+  if (input.userText) parts.push(input.userText);
+  return parts.join("\n\n");
+}
+
+function formatPathBToolResults(results: Array<{ id: string; content: string; isError?: boolean }>): string {
+  return results.map((result) => {
+    const tag = result.isError ? "TOOL RESULT ERROR" : "TOOL RESULT";
+    return `${tag} (${result.id}):\n${result.content}`;
+  }).join("\n\n");
+}
+
+function sdkTextMessage(text: string, images?: GatewayImage[]): unknown {
+  if (!images?.length) return text;
+  return {
+    text,
+    images: images.map((image) => image.source === "url"
+      ? { url: image.data }
+      : { data: image.data, mimeType: image.mediaType ?? "image/png" })
+  };
+}
+
+type DurablePumpItem = HubPumpItem | { kind: "http-abort" };
+
+function nextHubItem(pump: EventPump, signal?: AbortSignal): Promise<DurablePumpItem> {
+  if (signal?.aborted) return Promise.resolve({ kind: "http-abort" });
+  if (!signal) return pump.next();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (item: DurablePumpItem): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(item);
+    };
+    const onAbort = (): void => finish({ kind: "http-abort" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    void pump.next().then(
+      (item) => finish(item),
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 /** 从消息级 SDK 事件里提取思考文本（onDelta 不可用时的兜底通道）。 */
@@ -1092,12 +1839,15 @@ function keySemanticApiError(model: string, error: unknown): ApiError | undefine
 }
 
 function isRetryableStaleSessionError(error: unknown): boolean {
-  return error instanceof ApiError && error.statusCode === 502 && error.code === "upstream_run_failed";
+  if (error instanceof ApiError && error.statusCode === 502 && error.code === "upstream_run_failed") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /stale session|session not found|session expired|unknown agent/i.test(message);
 }
 
 function isActiveRunError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /already has active run|agent is busy|AgentBusyError/i.test(message);
+  return /already has active run|agent is busy|AgentBusyError/i.test(message)
+    || /\b(CREATING|RUNNING)\b/.test(message);
 }
 
 export function toolCallsFromSdkEvent(event: unknown): GatewayToolCall[] {

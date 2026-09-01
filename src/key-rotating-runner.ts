@@ -38,6 +38,8 @@ export interface KeyRotatingOptions {
  * - 未被禁用的失败算软失败：累计到上限或所有 key 都软失败时，透出真实上游错误而不是笼统的"无有效 key"；
  * - 确实把 key 全禁完/池里没有可用 key 时才返回 429 insufficient_quota，
  *   模型范围与密钥授权造成的落空按 403 表达（见 noKeyError）。
+ * - durable 续聊（`durableTurn` + 已有 session_binding）：禁止换 key。401/auth → 502，不试下一把
+ *  （换 key 会丢掉 held execute / 打爆前缀缓存）。首轮尚无绑定，仍允许轮换，成功后再 bindSession。
  */
 export class KeyRotatingRunner implements CursorRunner {
   private readonly maxKeyAttempts: number;
@@ -104,6 +106,10 @@ export class KeyRotatingRunner implements CursorRunner {
     // 会话粘性的绑定键只认 stickyKey：认不出是哪段对话就不参与粘性，也不写绑定。
     // 这里绝不能拿 sessionKey 兜底——它在没有会话头时会退化成所有请求共享的 ownerHash。
     const sessionHash = input.stickyKey ? sessionBindingHash(input.stickyKey) : undefined;
+    // durable 续聊：有 durableTurn 且 stickyKey 已有绑定 → 钉死那一把。不要按 Hub 的
+    // durableSessionId 反查（那哈希含 apiKey，先有 key 才能算，鸡生蛋）。
+    // 无绑定的首轮仍走下面的轮换，成功后既有 bindSession 会钉上。
+    const pinnedKeyId = await this.pinnedDurableKeyId(input, sessionHash);
     // 最近一次软失败（换过 key 但没禁用）的错误；所有 key 都软失败时透出它而非误报额度耗尽。
     let softError: unknown;
     let softCount = 0;
@@ -112,14 +118,20 @@ export class KeyRotatingRunner implements CursorRunner {
         model: input.model,
         modelIdentity: input.modelIdentity,
         gatewayModelScope: input.gatewayModelScope,
-        allowedKeyIds: input.allowedKeyIds,
-        sessionHash
+        allowedKeyIds: pinnedKeyId ? [pinnedKeyId] : input.allowedKeyIds,
+        // 钉死后续不能把 sessionHash 交给 selectKey：粘性回落会在绑定 key 已试过/禁用时
+        // 删绑定并改选下一把，正好丢掉 held execute。
+        sessionHash: pinnedKeyId ? undefined : sessionHash
       }, attempted.size < this.maxKeyAttempts);
       if (!("key" in selection)) {
+        if (pinnedKeyId) throw pinnedKeyUnavailable();
         if (softError) throw softError;
         throw noKeyError(selection.reason, input.model);
       }
       const key = selection.key;
+      if (pinnedKeyId && key.id !== pinnedKeyId) {
+        throw pinnedKeyUnavailable();
+      }
       if (attempted.size >= this.maxKeyAttempts) {
         if (softError) throw softError;
         throw new ApiError(
@@ -167,6 +179,11 @@ export class KeyRotatingRunner implements CursorRunner {
         const failure = classifyKeyFailure(error);
         // 是否禁用由 key 池的自动禁用策略决定（可关闭，也可要求连续失败若干次）。
         const disabled = failure ? await this.pool.reportFailure(key.id, failure, errorMessage(error)) : false;
+        if (pinnedKeyId) {
+          // 钉死后任何失败都不换 key：auth/quota 也会 502，而不是试下一把把 execute 弄丢。
+          if (signal?.aborted) throw error;
+          throw pinnedKeyFailure(error, failure);
+        }
         if (failure && !disabled) {
           // 该 key 仍留在池里：记下错误后换下一个 key，全部软失败时把它透出去。
           softError = error;
@@ -178,6 +195,22 @@ export class KeyRotatingRunner implements CursorRunner {
         if (!disabled && softCount >= this.maxTransientAttempts) throw error;
       }
     }
+  }
+
+  /**
+   * durable 续聊且 stickyKey 已有未过期绑定时返回被钉死的 key id。
+   * 网关密钥绑定若不含这把 key，也当作不可用（不能改选其它 key）。
+   */
+  private async pinnedDurableKeyId(input: CursorRunRequest, sessionHash: string | undefined): Promise<string | undefined> {
+    if (!input.durableTurn || !sessionHash) return undefined;
+    const bound = await this.pool.getSessionBinding(sessionHash, this.routingPolicy().sessionAffinityTtlMs);
+    const pinnedKeyId = bound?.keyId;
+    if (!pinnedKeyId) return undefined;
+    const allowed = (input.allowedKeyIds ?? []).filter(Boolean);
+    if (allowed.length && !allowed.includes(pinnedKeyId)) {
+      throw pinnedKeyUnavailable();
+    }
+    return pinnedKeyId;
   }
 }
 
@@ -239,4 +272,23 @@ function runIdentity(input: CursorRunRequest): ModelIdentity {
 
 function positiveIntOr(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function pinnedKeyUnavailable(): ApiError {
+  return new ApiError(
+    "Pinned Cursor API key is unavailable for this durable session.",
+    502,
+    "upstream_run_failed"
+  );
+}
+
+/** durable 钉 key 后的 auth/quota 失败改成 502，避免客户端以为换 key / 换凭证还能续上同一条 Run。 */
+function pinnedKeyFailure(error: unknown, failure: ReturnType<typeof classifyKeyFailure>): unknown {
+  if (failure !== "auth" && failure !== "quota") return error;
+  if (error instanceof ApiError && error.statusCode === 502 && error.code === "upstream_run_failed") return error;
+  return new ApiError(
+    `Pinned Cursor API key failed for this durable session: ${errorMessage(error)}`.slice(0, 400),
+    502,
+    "upstream_run_failed"
+  );
 }

@@ -1,10 +1,20 @@
 import { DEFAULT_AUTO_DISABLE_THRESHOLD } from "./key-pool.js";
 import { parseModelParamsSpec } from "./model-params.js";
 import { DEFAULT_REQUEST_LOG_KEEP } from "./store.js";
-import type { AgentMode, GatewayConfig, RoutingStrategy, SystemPromptMode } from "./types.js";
+import type { AgentMode, CursorSdkSessionMode, GatewayConfig, RoutingStrategy, SystemPromptMode } from "./types.js";
+
+/** 挂起工具 execute 的默认等待（15min）。env: CURSOR_SDK_TOOL_HOLD_TTL_MS。 */
+export const DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS = 900_000;
+/** durable 空闲 agent 默认回收阈值（60min）。env: CURSOR_SDK_SESSION_IDLE_TTL_MS。 */
+export const DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS = 3_600_000;
+/** SessionHub / 共享内存 store 默认同时存活会话上限。env: CURSOR_SDK_MAX_LIVE_SESSIONS。 */
+export const DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS = 256;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const gatewayApiKey = optionalString(env.GATEWAY_API_KEY);
+  // 默认 false：新部署走 durable。true 是 kill switch，重启后回到今日 create+全文+假成功+cancel+dispose。
+  const cursorSdkDisableSessionResume = booleanValue(env.CURSOR_SDK_DISABLE_SESSION_RESUME, false);
+  const requestedSessionMode = parseSessionMode(env.CURSOR_SDK_SESSION_MODE);
   return {
     host: stringValue(env.HOST, "0.0.0.0"),
     port: integerValue(env.PORT, 8787),
@@ -17,7 +27,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     cursorWorkingDirectory: stringValue(env.CURSOR_WORKING_DIRECTORY, process.cwd()),
     requestTimeoutMs: integerValue(env.REQUEST_TIMEOUT_MS, 180_000),
     sdkClientVersion: stringValue(env.CURSOR_SDK_CLIENT_VERSION, "sdk-1.0.27"),
-    cursorSdkDisableSessionResume: booleanValue(env.CURSOR_SDK_DISABLE_SESSION_RESUME, true),
+    cursorSdkDisableSessionResume,
+    // kill switch 打开时强制 stateless，即使 env 写了 durable。
+    cursorSdkSessionMode: cursorSdkDisableSessionResume ? "stateless" : requestedSessionMode,
+    cursorSdkToolHoldTtlMs: integerValue(env.CURSOR_SDK_TOOL_HOLD_TTL_MS, DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS),
+    cursorSdkSessionIdleTtlMs: integerValue(env.CURSOR_SDK_SESSION_IDLE_TTL_MS, DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS),
+    cursorSdkMaxLiveSessions: integerValue(env.CURSOR_SDK_MAX_LIVE_SESSIONS, DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS),
     cursorSdkUseHttp1ForAgent: booleanValue(env.CURSOR_SDK_USE_HTTP1_FOR_AGENT, false),
     cursorPrewarm: booleanValue(env.CURSOR_PREWARM, true),
     cursorAllowBuiltinTools: booleanValue(env.CURSOR_ALLOW_BUILTIN_TOOLS, false),
@@ -54,6 +69,22 @@ export function readCursorSdkUseHttp1Preference(env: NodeJS.ProcessEnv = process
 
 function parseRoutingStrategy(value: string | undefined): RoutingStrategy {
   return value?.trim().toLowerCase() === "round-robin" ? "round-robin" : "fill-first";
+}
+
+/**
+ * 未设置或取值非法时按 durable。显式 `stateless` 仍有效。
+ * kill switch 的覆盖在 loadConfig 里做，这里只解析 env 字面量。
+ */
+function parseSessionMode(value: string | undefined): CursorSdkSessionMode {
+  return value?.trim().toLowerCase() === "stateless" ? "stateless" : "durable";
+}
+
+/**
+ * WP3/WP4 接线：是否应构建 SessionHub。
+ * kill switch 打开 → false（今日路径）。只有 kill switch 关闭且 mode=durable 才 true。
+ */
+export function shouldUseDurableHub(config: Pick<GatewayConfig, "cursorSdkDisableSessionResume" | "cursorSdkSessionMode">): boolean {
+  return !config.cursorSdkDisableSessionResume && config.cursorSdkSessionMode === "durable";
 }
 
 /** 未设置或取值非法时按 off 处理：不注入默认系统提示词，保持既有行为。 */

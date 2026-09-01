@@ -16,6 +16,7 @@ import type {
   ModelIdentity,
   ModelScope,
   RoutingStrategy,
+  SessionBinding,
   StateStore
 } from "./types.js";
 
@@ -284,6 +285,16 @@ export class CursorKeyPool {
     if (this.bindCount % SESSION_BINDING_PRUNE_EVERY !== 0) return;
     // 过期绑定清理属于后台维护，失败不该冒泡影响正在收尾的请求。
     await this.store.pruneSessionBindings(this.routing.sessionAffinityTtlMs).catch(() => 0);
+  }
+
+  /**
+   * 只读会话绑定。durable 续聊用它判断是否已钉死 Cursor key。
+   * 与 selectKey 的粘性回落不同：这里在绑定失效时**不会**删绑定、也不会改选其它 key
+   *（换 key 会丢掉 held execute / 打爆前缀缓存）。
+   */
+  async getSessionBinding(sessionHash: string, ttlMs?: number): Promise<SessionBinding | undefined> {
+    if (!sessionHash) return undefined;
+    return this.store.getSessionBinding(sessionHash, ttlMs ?? this.routing.sessionAffinityTtlMs);
   }
 
   async setModelScope(id: string, scope: ModelScope): Promise<boolean> {
