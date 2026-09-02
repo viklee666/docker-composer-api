@@ -3,7 +3,8 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
 import { createCursorApiKey } from "./cursor-account.js";
-import { cursorTokenType } from "./cursor-connect/credentials.js";
+import { cursorTokenType, SAND_CLIENT_TYPE } from "./cursor-connect/credentials.js";
+import { CONNECT_MODEL_PREFIX, selectProvider } from "./cursor-connect/router.js";
 import { CursorConnectService, connectSettings } from "./cursor-connect/service.js";
 import type { CcCredential } from "./cursor-connect/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
@@ -808,13 +809,25 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const keyId = typeof body.keyId === "string" && body.keyId.trim() ? body.keyId.trim() : undefined;
     const keyUsageRef: KeyUsageRef = {};
     const startedAt = Date.now();
+    const requestedModel = normalizeModel(body.model);
+    // 后台测试必须自己选路：它不经过 server.ts 的 loggedRunRequest，
+    // 不写 provider 的话即使用了 connect/ 前缀也还是打到 SDK。
+    const route = adminTestRoute(body, requestedModel);
+    if (route.provider === "connect" && keyId) {
+      throw new ApiError(
+        "Connect 路线不使用 Cursor Key 池，请去掉 keyId。",
+        400,
+        "invalid_request_error",
+        "keyId"
+      );
+    }
     // 每次测试用唯一 sessionKey，并强制本请求 stateless：不得进 Hub / 旧 resume，避免粘到用户会话或坏 agent。
     const run: CursorRunRequest = {
       protocol: "openai-chat",
       apiKey: "",
-      useKeyPool: true,
+      useKeyPool: route.provider !== "connect",
       keyUsageRef,
-      model: normalizeModel(body.model),
+      model: route.model,
       prompt: `You are serving a gateway connectivity test. Return only final answer text.\n\nUSER: ${prompt}`,
       sessionKey: `admin-connectivity-test-${globalThis.crypto.randomUUID()}`,
       forceStateless: true,
@@ -826,8 +839,23 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       maxMode: deps.config.cursorMaxMode,
       fast: deps.config.cursorFast,
       modelParams: deps.config.cursorModelParams,
-      mode: deps.config.cursorAgentMode
+      mode: deps.config.cursorAgentMode,
+      provider: route.provider
     };
+    if (route.provider === "connect") {
+      const connect = deps.connect;
+      if (!connect?.available) {
+        const error = connect?.status().reason ?? "这个网关没有装载 Cursor Connect 路线。";
+        logTest(deps, startedAt, run.model, keyUsageRef, 503, error, { clientType: SAND_CLIENT_TYPE });
+        return {
+          ok: false,
+          provider: "connect",
+          error,
+          keyLabel: null,
+          durationMs: Date.now() - startedAt
+        };
+      }
+    }
     // 指定 keyId 时只验证该 key（绕过密钥池轮换），便于逐个定位到底是哪个 key 不可用。
     if (keyId) {
       const target = (await deps.keyPool.list()).find((key) => key.id === keyId);
@@ -839,14 +867,17 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.config.requestTimeoutMs);
+    const runner = route.provider === "connect" && deps.connect ? deps.connect : deps.runner;
+    const logClientType = route.provider === "connect" ? SAND_CLIENT_TYPE : undefined;
     try {
       // 与 abort 竞速：上游完全无视 signal 挂死时，联通性测试也必须在超时后返回而非悬挂。
-      const output = await raceWithAbort(deps.runner.run(run, controller.signal), controller.signal);
+      const output = await raceWithAbort(runner.run(run, controller.signal), controller.signal);
       // 指定 key 的测试绕过了密钥池，成功也要回写健康状态，否则后台会一直挂着早已恢复的失败计数与红字。
       if (keyId) await deps.keyPool.recordSuccess(keyId);
-      logTest(deps, startedAt, run.model, keyUsageRef, 200);
+      logTest(deps, startedAt, run.model, keyUsageRef, 200, undefined, { clientType: logClientType });
       return {
         ok: true,
+        provider: route.provider,
         text: output.text,
         keyLabel: keyUsageRef.keyLabel ?? null,
         durationMs: Date.now() - startedAt
@@ -855,9 +886,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       const normalized = normalizeError(error);
       // 人工点的诊断按 transient 记：只留错误痕迹，不计入自动禁用（否则一顿测试就能把 key 测没）。
       if (keyId) await deps.keyPool.reportFailure(keyId, "transient", errorMessage(error));
-      logTest(deps, startedAt, run.model, keyUsageRef, normalized.statusCode, errorMessage(error));
+      logTest(deps, startedAt, run.model, keyUsageRef, normalized.statusCode, errorMessage(error), {
+        clientType: logClientType
+      });
       return {
         ok: false,
+        provider: route.provider,
         error: normalized.message,
         keyLabel: keyUsageRef.keyLabel ?? null,
         durationMs: Date.now() - startedAt
@@ -866,6 +900,23 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       clearTimeout(timer);
     }
   });
+}
+
+/**
+ * 后台测试的选路。可用性故意当成 true：不可用时由 handler 返回 ok:false，
+ * 而不是 selectProvider 那种静默回落 SDK——否则点 Connect 测通了其实走的还是密钥池。
+ */
+function adminTestRoute(body: Record<string, unknown>, model: string): { provider: "sdk" | "connect"; model: string } {
+  const selection = selectProvider({
+    model,
+    keySetting: typeof body.provider === "string" ? body.provider : undefined,
+    connectAvailable: true,
+    defaultProvider: "sdk"
+  });
+  return {
+    provider: selection.provider,
+    model: selection.model ?? (model.toLowerCase().startsWith(CONNECT_MODEL_PREFIX) ? model.slice(CONNECT_MODEL_PREFIX.length) : model)
+  };
 }
 
 function requireAdmin(request: FastifyRequest, deps: AppDeps): void {
@@ -1036,7 +1087,15 @@ function publicGatewayKey(record: GatewayKeyRecord, options: { reveal?: boolean 
   };
 }
 
-function logTest(deps: AppDeps, startedAt: number, model: string, keyUsageRef: KeyUsageRef, status: number, error?: string): void {
+function logTest(
+  deps: AppDeps,
+  startedAt: number,
+  model: string,
+  keyUsageRef: KeyUsageRef,
+  status: number,
+  error?: string,
+  extra: { clientType?: CursorClientType } = {}
+): void {
   void deps.store
     .insertRequestLog({
       id: globalThis.crypto.randomUUID().replaceAll("-", ""),
@@ -1049,7 +1108,8 @@ function logTest(deps: AppDeps, startedAt: number, model: string, keyUsageRef: K
       status,
       durationMs: Date.now() - startedAt,
       stream: false,
-      error: error ? error.slice(0, 500) : undefined
+      error: error ? error.slice(0, 500) : undefined,
+      ...(extra.clientType ? { clientType: extra.clientType } : {})
     })
     .catch(() => undefined);
 }

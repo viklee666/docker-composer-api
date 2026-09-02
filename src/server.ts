@@ -3,7 +3,7 @@ import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { registerAdminRoutes } from "./admin.js";
 import { authenticate, explicitSessionId, extractToken, sessionAffinity } from "./auth.js";
 import { registerConnectRoutes } from "./cursor-connect/routes.js";
-import { selectProvider } from "./cursor-connect/router.js";
+import { CONNECT_MODEL_PREFIX, selectProvider } from "./cursor-connect/router.js";
 import type { CursorConnectService } from "./cursor-connect/service.js";
 import {
   anthropicError,
@@ -188,6 +188,15 @@ export function createApp(deps: AppDeps): FastifyInstance {
   app.get("/v1/models", async (request) => {
     const { models } = await listModels(deps, request);
     return openAiModelList(models);
+  });
+
+  // `connect/grok-4.6` 这种 id 含斜杠，普通 `:id` 匹配不到。单独挂一条，否则目录里看得见、点进去 404。
+  app.get("/v1/models/connect/:id", async (request) => {
+    const id = `${CONNECT_MODEL_PREFIX}${routeParam(request.params, "id")}`;
+    const { models } = await listModels(deps, request);
+    const found = models.find((model) => model.id === id || model.aliases.includes(id));
+    if (!found) throw new ApiError(`Model '${id}' not found.`, 404, "not_found", "model");
+    return openAiModelObject(found);
   });
 
   app.get("/v1/models/:id", async (request) => {
@@ -414,7 +423,39 @@ async function listModels(deps: AppDeps, request: Parameters<typeof authenticate
     }
   }
   const listed = await runWithCursorClientType(source.clientType, () => lister(source.apiKey));
-  return filterListedModels(deps, listed, auth);
+  return withConnectModels(deps, await filterListedModels(deps, listed, auth), auth);
+}
+
+/**
+ * Connect 可用时，把目录里的模型以 `connect/{id}` 并进 /v1/models。
+ * 前缀既是选路开关，也避免和 SDK 同名模型撞车。
+ * 过滤只看入站网关密钥范围：Connect 走自己的凭据，不受 Cursor Key 池白名单约束。
+ */
+async function withConnectModels(
+  deps: AppDeps,
+  listed: ModelListResult,
+  auth?: AuthContext
+): Promise<ModelListResult> {
+  if (!deps.connect?.available) return listed;
+  try {
+    const extra = await deps.connect.listModels();
+    const mapped = extra.flatMap((model) => {
+      const id = model.id?.trim();
+      if (!id) return [];
+      return [{
+        id: `${CONNECT_MODEL_PREFIX}${id}`,
+        name: model.displayName ? `${model.displayName} (Connect)` : `${id} (Connect)`,
+        aliases: [] as string[],
+        ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+        ...(model.variants?.length ? { variants: model.variants } : {})
+      }];
+    });
+    const visible = filterModelsByScope(mapped, auth?.modelScope);
+    if (!visible.length) return listed;
+    return { models: [...listed.models, ...visible], source: listed.source };
+  } catch {
+    return listed;
+  }
 }
 
 /**

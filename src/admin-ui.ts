@@ -86,7 +86,7 @@ td.mono,.mono{font-family:var(--mono);font-size:12px}
 .spacer{flex:1}
 .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent-2));
   display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#06101f;flex-shrink:0}
-#test-result{margin-top:12px;background:#0d1322;border:1px solid var(--border);border-radius:9px;
+#test-result,#cc-chat-result{margin-top:12px;background:#0d1322;border:1px solid var(--border);border-radius:9px;
   padding:12px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all}
 .table-scroll{overflow-x:auto}
 /*
@@ -389,6 +389,21 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
           <div class="panel">
             <div class="head">
+              <h2>对话测试</h2>
+              <span class="hint">真正打 <code>InferenceService/Stream</code>，会消耗额度。上面凭据行的「测试」只探 AvailableModels，不能证明聊天可用。</span>
+            </div>
+            <div class="body">
+              <div class="row">
+                <select id="cc-test-model" style="min-width:200px" title="来自 Connect 目录；目录还没拉到时默认 grok-4.6"></select>
+                <input id="cc-test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
+                <button class="primary" id="btn-cc-chat">发送测试</button>
+              </div>
+              <div id="cc-chat-result" class="hidden"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="head">
               <h2>运行设置</h2>
               <span class="hint">这些值来自环境变量，改完需要重启进程。这里只做回显，避免后台改了却与实际出站不一致。</span>
             </div>
@@ -573,13 +588,18 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
         <section id="sec-diagnostics" class="hidden" data-section="diagnostics">
           <div class="panel">
-            <div class="head"><h2>联通性测试</h2><span class="hint">下方按钮走密钥池（测当前队首可用 key）；逐个验证某个 key 请用 Key 池表格每行的「测试」按钮。均会真实消耗额度</span></div>
+            <div class="head"><h2>联通性测试</h2><span class="hint">会真实消耗额度。逐个验证某把 Cursor Key 请用 Key 池表格每行的「测试」</span></div>
             <div class="body">
               <div class="row">
+                <select id="test-provider" style="min-width:160px" title="SDK 走密钥池；Connect 走 Connect 凭据">
+                  <option value="sdk">SDK（密钥池）</option>
+                  <option value="connect">Connect</option>
+                </select>
                 <select id="test-model" style="min-width:180px"></select>
                 <input id="test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
                 <button class="primary" id="btn-test">发送测试</button>
               </div>
+              <p class="note" id="test-route-hint" style="margin-top:10px">下方按钮走密钥池（测当前队首可用 key）。</p>
               <div id="test-result" class="hidden"></div>
             </div>
           </div>
@@ -669,6 +689,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   var lastOverview = null;
   var lastProxy = null;
   var modelCatalog = [];
+  var connectCatalog = [];
   var autoDisableThreshold = 1;
   var sandClientMode = false;
   var gwPoolEnabled = false;
@@ -791,6 +812,14 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   function modelIds(){
     return modelCatalog.map(function(m){ return m.id; });
   }
+  function connectModelIds(){
+    var ids = connectCatalog.map(function(m){ return m.id; });
+    return ids.length ? ids : ['grok-4.6'];
+  }
+  function testProvider(){
+    var sel = $('test-provider');
+    return sel && sel.value === 'connect' ? 'connect' : 'sdk';
+  }
   function fillSelect(select, ids, emptyLabel){
     if (!select) return;
     var current = select.value;
@@ -815,9 +844,26 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }
   }
   function fillModelSelects(){
-    var ids = modelIds();
-    fillSelect($('test-model'), ids, null);
-    fillSelect($('log-model'), ids, '全部模型');
+    if (testProvider() === 'connect') fillSelect($('test-model'), connectModelIds(), null);
+    else fillSelect($('test-model'), modelIds(), null);
+    fillSelect($('log-model'), modelIds(), '全部模型');
+  }
+  function fillCcChatModels(){
+    var sel = $('cc-test-model');
+    if (!sel) return;
+    var before = sel.value;
+    fillSelect(sel, connectModelIds(), null);
+    if (before) return;
+    connectCatalog.forEach(function(m){
+      if (m.defaultOn) sel.value = m.id;
+    });
+  }
+  function updateTestRouteHint(){
+    var hint = $('test-route-hint');
+    if (!hint) return;
+    hint.textContent = testProvider() === 'connect'
+      ? '走 Connect 凭据（InferenceService/Stream），不经过 Cursor Key 池。请先在 Connect 凭据页拉好 token。'
+      : '下方按钮走密钥池（测当前队首可用 key）。';
   }
   function setModelCatalog(data){
     var list = (data && data.models) ? data.models : [];
@@ -877,6 +923,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       renderConnectSettings(data.settings || {});
       renderConnectCredentials(data.credentials || []);
       fillCcKeySelect(Array.isArray(data.cursorKeys) ? data.cursorKeys : lastKeys);
+      if (data.status && data.status.available) loadConnectModels(false);
+      else fillCcChatModels();
     }).catch(function(err){
       $('connect-status-title').textContent = '读取失败';
       $('connect-status-detail').textContent = err.message;
@@ -909,7 +957,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }
     if (status.reason) bits.push(status.reason);
     if (data.settings && data.settings.defaultProvider === 'connect') bits.push('已设为默认 provider');
-    else bits.push('默认仍走 SDK 路线；单请求可用 x-gateway-provider: connect 或模型名前缀 connect/ 指定');
+    else bits.push('默认仍走 SDK 路线；本页「对话测试」或联通性测试里选 Connect，即可实际发请求');
     $('connect-status-detail').textContent = bits.join('；');
   }
 
@@ -956,6 +1004,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('cc-models-hint').textContent = '正在拉取…';
     api('GET', '/admin/api/connect/models' + (force ? '?refresh=true' : '')).then(function(data){
       var models = data.models || [];
+      connectCatalog = models;
       $('cc-models-empty').classList.toggle('hidden', models.length > 0);
       $('cc-models-hint').textContent = models.length + ' 个模型' + (force ? '（已强制刷新）' : '');
       $('cc-models-body').innerHTML = models.map(function(model){
@@ -979,8 +1028,11 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           '<td>' + state + '</td>' +
           '</tr>';
       }).join('');
+      fillCcChatModels();
+      if (testProvider() === 'connect') fillModelSelects();
     }).catch(function(err){
       $('cc-models-hint').textContent = '拉取失败：' + err.message;
+      fillCcChatModels();
     });
   }
 
@@ -1343,7 +1395,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var original = button.textContent;
     button.disabled = true;
     button.textContent = '测试中…';
-    api('POST', '/admin/api/test', { keyId: id, model: $('test-model').value, prompt: $('test-prompt').value })
+    api('POST', '/admin/api/test', {
+      keyId: id,
+      provider: 'sdk',
+      model: testProvider() === 'connect' ? (modelIds()[0] || 'composer-2.5') : $('test-model').value,
+      prompt: $('test-prompt').value
+    })
       .then(function(data){
         if (data.ok) {
           toast('✔ key 可用（' + (data.durationMs / 1000).toFixed(1) + 's，' + (data.keyLabel || '-') + '）');
@@ -1873,6 +1930,15 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('btn-cc-models').addEventListener('click', function(){ loadConnectModels(false); });
   $('btn-cc-models-refresh').addEventListener('click', function(){ loadConnectModels(true); });
   $('btn-cc-runs').addEventListener('click', loadConnectRuns);
+  $('btn-cc-chat').addEventListener('click', function(){
+    runAdminChatTest({
+      button: $('btn-cc-chat'),
+      result: $('cc-chat-result'),
+      provider: 'connect',
+      model: $('cc-test-model').value,
+      prompt: $('cc-test-prompt').value
+    });
+  });
 
   $('cc-body').addEventListener('click', function(event){
     var target = event.target;
@@ -2266,30 +2332,55 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     });
   });
 
-  $('btn-test').addEventListener('click', function(){
-    var button = $('btn-test');
-    var result = $('test-result');
+  function runAdminChatTest(opts){
+    var button = opts.button;
+    var result = opts.result;
+    var original = button.textContent;
     button.disabled = true;
     button.textContent = '测试中…';
     result.classList.remove('hidden');
     result.textContent = '请求中，请稍候（首次冷启动可能需 20s+）…';
     api('POST', '/admin/api/test', {
-      model: $('test-model').value,
-      prompt: $('test-prompt').value
+      provider: opts.provider,
+      model: opts.model,
+      prompt: opts.prompt
     }).then(function(data){
+      var route = data.provider === 'connect' ? 'Connect' : 'SDK';
       if (data.ok) {
-        result.textContent = '✔ 成功（' + (data.durationMs / 1000).toFixed(1) + 's，key：' + (data.keyLabel || '-') + '）\\n' + data.text;
+        result.textContent = '✔ ' + route + ' 成功（' + (data.durationMs / 1000).toFixed(1) + 's'
+          + (data.keyLabel ? '，key：' + data.keyLabel : '') + '）\\n' + data.text;
       } else {
-        result.textContent = '✘ 失败（' + (data.durationMs / 1000).toFixed(1) + 's，key：' + (data.keyLabel || '-') + '）\\n' + data.error;
+        result.textContent = '✘ ' + route + ' 失败（' + (data.durationMs / 1000).toFixed(1) + 's'
+          + (data.keyLabel ? '，key：' + data.keyLabel : '') + '）\\n' + data.error;
       }
       loadAll();
+      if (currentSection === 'connect') loadConnect();
     }).catch(function(err){
       result.textContent = '✘ 请求失败：' + err.message;
     }).finally(function(){
       button.disabled = false;
-      button.textContent = '发送测试';
+      button.textContent = original;
+    });
+  }
+
+  $('test-provider').addEventListener('change', function(){
+    updateTestRouteHint();
+    if (testProvider() === 'connect' && !connectCatalog.length) loadConnectModels(false);
+    fillModelSelects();
+  });
+
+  $('btn-test').addEventListener('click', function(){
+    runAdminChatTest({
+      button: $('btn-test'),
+      result: $('test-result'),
+      provider: testProvider(),
+      model: $('test-model').value,
+      prompt: $('test-prompt').value
     });
   });
+
+  fillCcChatModels();
+  updateTestRouteHint();
 
   if (token) {
     api('POST', '/admin/api/login').then(function(){

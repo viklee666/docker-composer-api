@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.js";
 import { CursorKeyPool } from "../src/key-pool.js";
+import type { ModelLister } from "../src/models.js";
 import { createApp } from "../src/server.js";
 import { MemoryStateStore } from "../src/store.js";
-import type { CursorRunRequest, CursorRunResult, CursorRunner, CursorStreamEvent, GatewayConfig } from "../src/types.js";
+import type { CursorRunResult, CursorRunner, CursorStreamEvent, GatewayConfig } from "../src/types.js";
 import { encodeEnvelope } from "../src/cursor-connect/envelope.js";
+import { ProviderRoutingRunner } from "../src/cursor-connect/routing-runner.js";
 import { CursorConnectService } from "../src/cursor-connect/service.js";
 import { CursorConnectStore } from "../src/cursor-connect/store.js";
 import {
@@ -13,6 +15,10 @@ import {
   AvailableModelsResponse_AvailableModel,
   AvailableModelsResponse_DegradationStatus
 } from "../src/cursor-connect/proto/available_models_pb.js";
+import {
+  InferenceStreamResponse,
+  InferenceTextStreamPart
+} from "../src/cursor-connect/proto/inference_pb.js";
 
 const ADMIN_PASSWORD = "admin-secret";
 const GATEWAY_KEY = "gw-key";
@@ -31,7 +37,7 @@ function jwt(payload: Record<string, unknown>): string {
   return `${encode({ alg: "none" })}.${encode(payload)}.sig`;
 }
 
-/** 一元上游桩：AvailableModels 的请求与响应都是裸 protobuf；兑换接口走 JSON。 */
+/** 一元上游桩：AvailableModels 的请求与响应都是裸 protobuf；兑换接口走 JSON；Stream 回一段 pong。 */
 function connectFetch(
   models: AvailableModelsResponse_AvailableModel[],
   exchange: {
@@ -40,14 +46,16 @@ function connectFetch(
     status?: number;
     body?: unknown;
     calls?: Array<{ url: string; authorization: string; body: string }>;
+    streamCalls?: string[];
   } = {}
 ) {
   const session = exchange.accessToken ?? jwt({ type: "session", sub: "acct" });
   const refresh = exchange.refreshToken ?? "refresh-token";
   return async (url: string, init?: RequestInit): Promise<Response> => {
-    if (String(url).includes("/auth/exchange_user_api_key")) {
+    const href = String(url);
+    if (href.includes("/auth/exchange_user_api_key")) {
       exchange.calls?.push({
-        url: String(url),
+        url: href,
         authorization: String((init?.headers as Record<string, string> | undefined)?.authorization ?? ""),
         body: String(init?.body ?? "")
       });
@@ -57,7 +65,30 @@ function connectFetch(
       }
       return Response.json({ accessToken: session, refreshToken: refresh });
     }
-    return new Response(new AvailableModelsResponse({ models }).toBinary(), { status: 200 });
+    if (href.includes("AvailableModels")) {
+      return new Response(new AvailableModelsResponse({ models }).toBinary(), { status: 200 });
+    }
+    if (href.includes("InferenceService/Stream")) {
+      exchange.streamCalls?.push(href);
+      const frames = [
+        encodeEnvelope(
+          new InferenceStreamResponse({
+            response: { case: "textPart", value: new InferenceTextStreamPart({ text: "pong" }) }
+          }).toBinary()
+        ),
+        encodeEnvelope(new TextEncoder().encode("{}"), { endStream: true })
+      ];
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const frame of frames) controller.enqueue(frame);
+            controller.close();
+          }
+        }),
+        { status: 200 }
+      );
+    }
+    return new Response(`unexpected connect url: ${href}`, { status: 500 });
   };
 }
 
@@ -66,6 +97,7 @@ async function buildApp(
     withCredential?: boolean;
     config?: Partial<GatewayConfig>;
     exchange?: Parameters<typeof connectFetch>[1];
+    modelLister?: ModelLister;
   } = {}
 ) {
   const store = new MemoryStateStore();
@@ -98,7 +130,14 @@ async function buildApp(
     )
   });
 
-  const app = createApp({ config, store, runner: new StubRunner(), keyPool, connect });
+  const app = createApp({
+    config,
+    store,
+    runner: new ProviderRoutingRunner({ sdk: new StubRunner(), connect }),
+    keyPool,
+    connect,
+    ...(options.modelLister ? { modelLister: options.modelLister } : {})
+  });
   return { app, connect, connectStore, keyPool };
 }
 
@@ -469,8 +508,6 @@ test("connect endpoints report 503 when the route is not configured at all", asy
 
 test("provider selection routes by header and model prefix without touching the SDK path", async () => {
   const { app } = await buildApp({ withCredential: true });
-  // Connect 路线的推理走真实 transport，这里只验证选路命中：Connect 出站会失败，
-  // 但失败来自上游而不是「路由没生效」。SDK 路线的 stub 一定返回 "sdk"。
   const viaSdk = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
@@ -479,5 +516,108 @@ test("provider selection routes by header and model prefix without touching the 
   });
   assert.equal(viaSdk.statusCode, 200);
   assert.equal((viaSdk.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content, "sdk");
+  await app.close();
+});
+
+test("the admin connectivity test can send a real Connect chat", async () => {
+  const { app } = await buildApp({ withCredential: true });
+  const viaProvider = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminAuth,
+    payload: { provider: "connect", model: "grok-4.6", prompt: "ping" }
+  });
+  assert.equal(viaProvider.statusCode, 200);
+  assert.equal(viaProvider.json().ok, true);
+  assert.equal(viaProvider.json().provider, "connect");
+  assert.equal(viaProvider.json().text, "pong");
+
+  const viaPrefix = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminAuth,
+    payload: { model: "connect/grok-4.6", prompt: "ping" }
+  });
+  assert.equal(viaPrefix.statusCode, 200);
+  assert.equal(viaPrefix.json().ok, true);
+  assert.equal(viaPrefix.json().provider, "connect");
+  assert.equal(viaPrefix.json().text, "pong");
+
+  const sdk = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminAuth,
+    payload: { model: "composer-2.5" }
+  });
+  assert.equal(sdk.statusCode, 200);
+  assert.equal(sdk.json().ok, true);
+  assert.equal(sdk.json().provider, "sdk");
+  assert.equal(sdk.json().text, "sdk");
+  await app.close();
+});
+
+test("the admin Connect test does not silently fall back to the SDK pool", async () => {
+  const { app } = await buildApp();
+  const missing = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminAuth,
+    payload: { provider: "connect", model: "grok-4.6" }
+  });
+  assert.equal(missing.statusCode, 200);
+  assert.equal(missing.json().ok, false);
+  assert.equal(missing.json().provider, "connect");
+  assert.match(String(missing.json().error), /凭据/);
+
+  const mixed = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminAuth,
+    payload: { provider: "connect", model: "grok-4.6", keyId: "any" }
+  });
+  assert.equal(mixed.statusCode, 400);
+  await app.close();
+});
+
+test("GET /v1/models exposes Connect entries under the connect/ prefix", async () => {
+  const { app } = await buildApp({
+    withCredential: true,
+    modelLister: async () => ({
+      models: [{ id: "composer-2.5", name: "Composer", aliases: [] }],
+      source: "cursor"
+    })
+  });
+  const listed = await app.inject({ method: "GET", url: "/v1/models", headers: apiAuth });
+  assert.equal(listed.statusCode, 200);
+  const ids = (listed.json() as { data: Array<{ id: string }> }).data.map((model) => model.id);
+  assert.ok(ids.includes("composer-2.5"));
+  assert.ok(ids.includes("connect/grok-4.6"), "Connect 模型必须以 connect/ 前缀出现在目录里");
+  assert.ok(!ids.includes("connect/gone"), "DISABLED 的 Connect 模型不能出现在目录里");
+
+  const byId = await app.inject({ method: "GET", url: "/v1/models/connect/grok-4.6", headers: apiAuth });
+  assert.equal(byId.statusCode, 200);
+  assert.equal((byId.json() as { id: string }).id, "connect/grok-4.6");
+  await app.close();
+});
+
+test("a client can chat through Connect by selecting a connect/ model", async () => {
+  const { app } = await buildApp({
+    withCredential: true,
+    modelLister: async () => ({
+      models: [{ id: "composer-2.5", name: "Composer", aliases: [] }],
+      source: "cursor"
+    })
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: apiAuth,
+    payload: { model: "connect/grok-4.6", messages: [{ role: "user", content: "hi" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    (response.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content,
+    "pong"
+  );
   await app.close();
 });
