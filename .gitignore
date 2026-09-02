@@ -37,3 +37,8 @@ data/
 
 # 本地探测输出
 logs/
+
+# docs 只跟踪后台截图；计划、进度、descriptor 留在本地
+docs/*
+!docs/images/
+!docs/images/**
