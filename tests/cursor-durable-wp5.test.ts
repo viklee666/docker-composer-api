@@ -38,7 +38,7 @@ test("historyChecksum is stable for issued ids + lastUserText", () => {
   assert.notEqual(historyChecksum(["a"], "hello"), historyChecksum(["a"], "hello!"));
 });
 
-test("durableSlotReplaceReason: fingerprints / model / apiKey / incompatible kind", () => {
+test("durableSlotReplaceReason: incompatible / apiKey / model / toolsFingerprint; systemFingerprint does not replace", () => {
   const slot = createSessionSlot({
     agent: dummyAgent(),
     agentId: "agent-1",
@@ -54,7 +54,7 @@ test("durableSlotReplaceReason: fingerprints / model / apiKey / incompatible kin
     apiKey: "key-a",
     model: "composer-2.5",
     systemFingerprint: "sys-2"
-  }), "systemFingerprint");
+  }), undefined);
   assert.equal(durableSlotReplaceReason(slot, {
     apiKey: "key-a",
     model: "composer-2.5",

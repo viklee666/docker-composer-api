@@ -10,6 +10,7 @@ import {
   selectProvider
 } from "./cursor-connect/router.js";
 import type { CursorConnectService } from "./cursor-connect/service.js";
+import { durableIdentity } from "./durable-id.js";
 import {
   anthropicError,
   anthropicErrorType,
@@ -39,7 +40,7 @@ import {
   type ModelListResult
 } from "./models.js";
 import { extractDurableTurn } from "./prompt-delta.js";
-import { conversationSeed, denyRuleUnverifiable, filterModelsByScope, identityAllowed, modelIdentity } from "./routing.js";
+import { denyRuleUnverifiable, filterModelsByScope, identityAllowed, modelIdentity } from "./routing.js";
 import {
   anthropicMessageObject,
   anthropicCompletionChars,
@@ -161,7 +162,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     reply
       .header("access-control-allow-origin", "*")
       .header("access-control-allow-methods", "GET,POST,DELETE,OPTIONS")
-      .header("access-control-allow-headers", "authorization,x-api-key,content-type,anthropic-version,anthropic-beta,x-session-affinity,x-opencode-session-id,x-opencode-session,anthropic-session-id,x-cursor-reasoning-effort,x-cursor-max-mode,x-cursor-fast,x-cursor-mode,x-cursor-model-params")
+      .header("access-control-allow-headers", "authorization,x-api-key,content-type,anthropic-version,anthropic-beta,x-session-affinity,x-opencode-session-id,x-opencode-session,anthropic-session-id,x-claude-code-session-id,x-session-id,session-id,session_id,conversation_id,x-codex-window-id,x-codex-turn-metadata,x-cursor-reasoning-effort,x-cursor-max-mode,x-cursor-fast,x-cursor-mode,x-cursor-model-params")
       .header("access-control-max-age", "86400");
     // Anthropic 在所有响应（含成功与流式）上都带 request-id；错误体里复用同一个值。
     if (request.url.startsWith("/v1/messages")) {
@@ -220,7 +221,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const prepared = prepareOpenAiChat(request.body, { systemPrompt: promptSettings });
     // slotHints 要等选 key 之后才能算 durableSessionId；指纹 / lastUserText 由 runner 对齐。
     const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings);
-    const seed = conversationSeed(request.body);
+    const seed = durableIdentity({ headers: request.headers, body: request.body, protocol: "openai-chat", ownerHash: auth.ownerHash });
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
     const created = nowSeconds();
@@ -237,8 +238,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      // 可能在首个 Cursor 事件前就返回：协议生成器会立刻写出握手，避免 CPA/Claude Code 因无响应头断成 499。
-      const events = await openRunnerStream(deps, log, run, abort);
+      // 立刻提交 SSE：协议生成器先写出握手，第一次拉 events 才 runner.stream（Agent.create 在握手之后）。
+      const events = deferRunnerStream(deps, run, abort.signal);
       return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run, (result) => ({
@@ -264,7 +265,13 @@ export function createApp(deps: AppDeps): FastifyInstance {
      * 每条记录只存直接父节点，但每一轮都把继承来的种子再写回自己那行，第三轮往后照样对得上。
      * 老库记录（无种子）与 store:false（压根没落库）自然退回按请求体现算，认不出就不启用粘性。
      */
-    const seed = previous?.conversationSeed ?? conversationSeed(body);
+    const seed = durableIdentity({
+      headers: request.headers,
+      body,
+      protocol: "openai-responses",
+      ownerHash: auth.ownerHash,
+      conversationSeed: previous?.conversationSeed
+    });
     const durableTurn = extractDurableTurn(
       "openai-responses",
       body,
@@ -285,7 +292,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      const events = await openRunnerStream(deps, log, run, abort);
+      const events = deferRunnerStream(deps, run, abort.signal);
       return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, conversationSeed: seed, auth, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run, (result) => {
@@ -355,7 +362,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const promptSettings = gatewaySystemPrompt(deps.config);
     const prepared = prepareAnthropicMessages(request.body, { systemPrompt: promptSettings });
     const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings);
-    const seed = conversationSeed(request.body);
+    const seed = durableIdentity({ headers: request.headers, body: request.body, protocol: "anthropic-messages", ownerHash: auth.ownerHash });
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;
     const log = beginLog("/v1/messages", auth, prepared);
@@ -371,7 +378,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
-      const events = await openRunnerStream(deps, log, run, abort);
+      const events = deferRunnerStream(deps, run, abort.signal);
       return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, events, deps, log, signal: abort.signal }))));
     }
     const output = await runLogged(deps, log, run, (result) => ({
@@ -837,7 +844,7 @@ function loggedRunRequest(
     ...(input.auth.modelScope ? { gatewayModelScope: input.auth.modelScope } : {}),
     ...(stickyKey ? { stickyKey } : {}),
     ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
-    reuseDurableAgent: canReuseDurableAgent(input.protocol, input.request, input.conversationSeed),
+    reuseDurableAgent: canReuseDurableAgent(input.conversationSeed),
     ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
     provider: selection.provider,
     // `connect/xxx` 只是选路命名空间，不是模型名的一部分。
@@ -861,36 +868,25 @@ function inboundProtocolOf(protocol: CursorRunRequest["protocol"]): "openai-chat
 }
 
 /**
- * 会话粘性的身份。三级来源，都认不出就返回 undefined（此时不启用粘性）：
+ * 会话粘性的身份。认不出就返回 undefined（此时不启用粘性）：
  * 1. 客户端显式给的会话头；
- * 2. 调用方给的 seed（Responses 续聊从上一轮记录里继承来的那个）；
- * 3. 请求体里这段对话的稳定前缀（system + 第一条 user 消息）——同一段对话每轮都算出同一个值。
+ * 2. 调用方给的 seed（durableIdentity 瀑布：显式头 / Responses 继承 / CPA DeriveID）。
  *
  * 绝不能退回 ownerHash：网关模式下它对所有请求都是同一个值，拿它绑定等于把整个网关
  * 钉死在一把 key 上，轮询失效，出错的 key 也永远不会再被这个调用方重试。
+ * 绝不能再末档 conversationSeed(body)：那条路径没有 protocol/scope，会与瀑布口径分叉。
  * 身份里带上 ownerHash 前缀是为了隔离不同入站密钥，避免两家客户端共用一条绑定。
  */
 function stickyKeyFor(request: FastifyRequest, auth: AuthContext, seed?: string): string | undefined {
-  const explicit = explicitSessionId(request);
-  const identity = explicit ?? seed ?? conversationSeed(request.body);
+  const identity = explicitSessionId(request) ?? seed;
   return identity ? `${auth.ownerHash}:${identity}` : undefined;
 }
 
 /**
- * 本地 Agent 复用必须有「这段对话」的硬身份，不能用 system+首条 user 的哈希冒充。
- * 那个哈希对 OpenAI Chat / Anthropic Messages 几乎每次都有值，互不相干的「hello」会挤进
- * 同一把 Hub 锁；前一个 create/send 还没结束，后一个就卡在 acquire 上，客户端一断就是 499。
- * 后台联通性测试 forceStateless，所以测得通、外部一打就 499。
- *
- * 允许进 Hub 的只有：显式会话头，或 Responses 链上网关自己签发的 previous_response_id / 落库 seed。
+ * 有瀑布 identity 进 Hub；重叠由 Hub tryAcquire 改 stateless，不再靠「Chat 无头永不进 Hub」止血。
  */
-function canReuseDurableAgent(
-  protocol: CursorRunRequest["protocol"],
-  request: FastifyRequest,
-  seed?: string
-): boolean {
-  if (explicitSessionId(request)) return true;
-  return protocol === "openai-responses" && Boolean(seed);
+function canReuseDurableAgent(seed?: string): boolean {
+  return Boolean(seed);
 }
 
 /**
@@ -1063,77 +1059,33 @@ async function* withStreamAbort(abort: { touch: () => void; done: () => void }, 
 }
 
 /**
- * 等首个上游事件太久才提交 SSE 时，Claude Code / CLIProxyAPI 会按 TTFB 断连，
- * 网关日志就是 499；后台联通性测试是非流式，所以测得通、真实客户端一打就断。
- * 短窗口内失败仍走 HTTP 错误信封（401/402/504），超时后先让协议生成器发出握手事件。
+ * 旧 openRunnerStream 预取窗口（毫秒）。提交 SSE 不再预取；测试仍 import 此常量。
  */
 export const STREAM_OPEN_KEEPALIVE_MS = 150;
-const STREAM_OPEN_KEEPALIVE = Symbol("stream-open-keepalive");
 
 /**
- * 提交 SSE 响应前预取 runner 的第一个事件：上游即时失败（无效 key、额度耗尽、模型不可用等）
- * 必须走正常的 HTTP 错误信封，而不是 200 + 流内错误——SDK 的重试/错误处理依赖真实状态码。
- * 成功后把首事件塞回流，交给各端点的 SSE 生成器继续消费。
- * 若首事件迟迟不来，到期返回一个仍在等待的 iterable，好让 message_start / role chunk
- * 立刻下发，避免中间层把「还没响应头」当成上游挂死。
+ * 延迟启动 runner.stream：第一次 [Symbol.asyncIterator]()/next() 才 create。
+ * 握手已在各协议生成器的 for-await events 之前 yield，所以 SSE 能先于 Agent.create 出门。
  */
-async function openRunnerStream(
+function deferRunnerStream(
   deps: AppDeps,
-  log: RequestLog,
-  run: Parameters<CursorRunner["run"]>[0],
-  abort: { signal: AbortSignal; done: () => void }
-): Promise<AsyncIterable<CursorStreamEvent>> {
-  const iterator = deps.runner.stream(run, abort.signal)[Symbol.asyncIterator]();
-  const firstPromise = raceWithAbort(iterator.next(), abort.signal);
-  let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
-  const keepalive = new Promise<typeof STREAM_OPEN_KEEPALIVE>((resolve) => {
-    keepaliveTimer = setTimeout(() => resolve(STREAM_OPEN_KEEPALIVE), STREAM_OPEN_KEEPALIVE_MS);
-  });
-  try {
-    // 与 abort 竞速：上游完全无视 signal 挂死时，空闲超时/断连仍能把请求收尾。
-    const winner = await Promise.race([firstPromise, keepalive]);
-    if (keepaliveTimer) clearTimeout(keepaliveTimer);
-    if (winner === STREAM_OPEN_KEEPALIVE) {
-      // 生成器还没拉 next() 时 firstPromise 可能先失败：先接住，避免 unhandledRejection。
-      firstPromise.catch(() => undefined);
-      return attachFirstEvent(iterator, abort.signal, firstPromise);
-    }
-    return attachFirstEvent(iterator, abort.signal, winner);
-  } catch (error) {
-    if (keepaliveTimer) clearTimeout(keepaliveTimer);
-    abort.done();
-    const normalized = normalizeError(error);
-    // runner 把 abort 一律表达成内部 499；预取阶段命中空闲超时时还原成对客户端有意义的 504。
-    const resolved = normalized.statusCode === 499 && abort.signal.aborted && abort.signal.reason instanceof ApiError
-      ? abort.signal.reason
-      : normalized;
-    finishLog(deps, log, resolved.statusCode, errorMessage(error));
-    throw resolved;
-  }
-}
-
-function attachFirstEvent(
-  iterator: AsyncIterator<CursorStreamEvent>,
-  signal: AbortSignal,
-  first: IteratorResult<CursorStreamEvent> | Promise<IteratorResult<CursorStreamEvent>>
+  run: Parameters<CursorRunner["stream"]>[0],
+  signal: AbortSignal
 ): AsyncIterable<CursorStreamEvent> {
   return {
     [Symbol.asyncIterator]() {
-      let deliveredFirst = false;
+      let inner: AsyncIterator<CursorStreamEvent> | undefined;
+      const events = (): AsyncIterator<CursorStreamEvent> => {
+        inner ??= deps.runner.stream(run, signal)[Symbol.asyncIterator]();
+        return inner;
+      };
       return {
         next(): Promise<IteratorResult<CursorStreamEvent>> {
-          if (!deliveredFirst) {
-            deliveredFirst = true;
-            return Promise.resolve(first);
-          }
-          // 流中途同样竞速：读事件被无视 signal 的上游挂住时，abort 会以 499 打断，
-          // 由 SSE 生成器的 catch 按语义转成流内 504/断连收尾。
-          return raceWithAbort(iterator.next(), signal);
+          // 与 abort 竞速：上游无视 signal 挂死时，空闲超时仍能打断 for-await，生成器收成流内 504。
+          return raceWithAbort(events().next(), signal);
         },
         return(value?: unknown): Promise<IteratorResult<CursorStreamEvent>> {
-          deliveredFirst = true;
-          void Promise.resolve(first).catch(() => undefined);
-          return iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined });
+          return inner?.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined });
         }
       };
     }

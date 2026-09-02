@@ -347,8 +347,7 @@ export interface CursorRunRequest {
   /**
    * 是否把本请求送进 SessionHub 复用本地 Agent。
    * false：即使有 conversationSeed / stickyKey 也走 stateless（create + 全文）。
-   * Chat / Messages 只靠 system+首条 user 哈希认「同一段对话」会把互不相干的外部请求
-   * 撞进同一把锁，前一个还在跑时后一个排队，客户端一断就是日志里的 499。
+   * Chat / Messages 有瀑布 identity 也会进 Hub；重叠由 Hub tryAcquire 改 stateless。
    * 未设时保持旧行为（有 seed/sticky 就进 Hub），给直接调 runner 的单测用。
    */
   reuseDurableAgent?: boolean;

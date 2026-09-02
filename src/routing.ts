@@ -29,24 +29,31 @@ const SESSION_HASH_LENGTH = 32;
  */
 const SEED_SEGMENT_LENGTH = 4000;
 
+/** 第 3 级 identity：每条 instruction 只取前 50 个 Unicode 码点（CPA 口径）。 */
+const INSTRUCTION_RUNE_LIMIT = 50;
+
+type ConversationProtocol = "openai-chat" | "anthropic-messages" | "openai-responses";
+
 /**
- * 从请求体推导「这是哪一段对话」，用于客户端不发 session 头时的粘性身份。
+ * 从请求体推导「这是哪一段对话」，用于客户端不发 session 头时的粘性身份（第 3 级）。
  *
- * 取会话的稳定身份部分（全部 system/developer 文本 + 第一条 user 消息），刻意不含后续普通轮次：
- * 同一段对话追加 user/assistant 轮次时值不变，换一条有效系统约束就换一个值。
- * 也刻意不含 assistant 回复——含了的话第一轮与第二轮身份不同，还得再补一层继承逻辑。
- *
- * 认不出对话（没有任何 user 文本）时返回 undefined，此时调用方应当不启用粘性，
- * 而不是退回一个所有请求共享的常量。
+ * 按协议只取 instruction（各 50 rune）+ 完整第一条 user，再混入 callerScope。
+ * 同一段对话追加轮次时值不变；instruction 后半变化也不变；首条 user 不同则不同。
+ * 认不出对话（没有任何 user 文本）时返回 undefined。
  */
-export function conversationSeed(body: unknown): string | undefined {
+export function conversationSeed(
+  body: unknown,
+  protocol?: ConversationProtocol,
+  callerScope?: string
+): string | undefined {
   const record = asRecord(body);
   if (!record) return undefined;
-  const system = systemSeedText(record);
-  const user = truncate(firstUserSeedText(record));
+  const resolved = protocol ?? inferConversationProtocol(record);
+  const instruction = instructionSeedText(record, resolved);
+  const user = firstUserSeedText(record, resolved);
   if (!user) return undefined;
   return createHash("sha256")
-    .update(`sys:${system}\nusr:${user}`)
+    .update(`sys:${instruction}\nusr:${user}\nscope:${callerScope ?? ""}`)
     .digest("hex")
     .slice(0, SESSION_HASH_LENGTH);
 }
@@ -79,19 +86,51 @@ export function systemSeedText(record: Record<string, unknown>): string {
   return parts.join("\n");
 }
 
-function firstUserSeedText(record: Record<string, unknown>): string {
+function instructionSeedText(record: Record<string, unknown>, protocol: ConversationProtocol): string {
+  const parts: string[] = [];
+  if (protocol === "openai-responses") {
+    if (typeof record.instructions === "string") {
+      const text = truncateRunes(record.instructions);
+      if (text) parts.push(text);
+    }
+    return parts.join("\n");
+  }
+  if (protocol === "anthropic-messages" && record.system !== undefined) {
+    const text = truncateRunes(contentText(record.system));
+    if (text) parts.push(text);
+  }
+  for (const message of messageList(record)) {
+    const role = asRecord(message)?.role;
+    if (role === "user") break;
+    if (role === "system" || role === "developer") {
+      const text = truncateRunes(contentText(asRecord(message)?.content));
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function inferConversationProtocol(record: Record<string, unknown>): ConversationProtocol {
+  if (record.input !== undefined || typeof record.instructions === "string") return "openai-responses";
+  if (record.system !== undefined) return "anthropic-messages";
+  return "openai-chat";
+}
+
+function firstUserSeedText(record: Record<string, unknown>, protocol: ConversationProtocol): string {
+  if (protocol === "openai-responses") {
+    const input = record.input;
+    if (typeof input === "string") return input;
+    if (Array.isArray(input)) {
+      const item = input.find((entry) => {
+        const role = asRecord(entry)?.role;
+        return role === undefined || role === "user";
+      });
+      if (item) return contentText(asRecord(item)?.content ?? asRecord(item)?.text);
+    }
+    return "";
+  }
   const fromMessages = messageList(record).find((message) => asRecord(message)?.role === "user");
   if (fromMessages) return contentText(asRecord(fromMessages)?.content);
-  // Responses 端点：input 既可能是纯字符串，也可能是 item 数组。
-  const input = record.input;
-  if (typeof input === "string") return input;
-  if (Array.isArray(input)) {
-    const item = input.find((entry) => {
-      const role = asRecord(entry)?.role;
-      return role === undefined || role === "user";
-    });
-    if (item) return contentText(asRecord(item)?.content ?? asRecord(item)?.text);
-  }
   return "";
 }
 
@@ -120,6 +159,10 @@ function contentText(content: unknown): string {
 
 function truncate(value: string): string {
   return value.trim().slice(0, SEED_SEGMENT_LENGTH);
+}
+
+function truncateRunes(value: string): string {
+  return [...value.trim()].slice(0, INSTRUCTION_RUNE_LIMIT).join("");
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

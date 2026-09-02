@@ -236,20 +236,29 @@ export class CursorSdkRunner implements CursorRunner {
    */
   private async *streamDurable(
     hub: SessionHub,
-    sessionId: string,
+    durableId: string,
     input: CursorRunRequest,
     signal: AbortSignal | undefined
   ): AsyncIterable<CursorStreamEvent> {
-    const release = await hub.acquire(sessionId, signal);
+    const slot = hub.get(durableId);
+    const handshakeEmitted = slot != null && (slot.state === "idle" || slot.state === "awaiting_tools" || slot.pending.size > 0);
+    const mayWait = input.durableTurn?.kind === "tool_results" && handshakeEmitted;
+    const release = mayWait
+      ? await hub.acquire(durableId, signal)
+      : await hub.tryAcquire(durableId);
+    if (!release) {
+      yield* this.streamLocked({ ...input, forceStateless: true }, signal, sessionId(input));
+      return;
+    }
     try {
-      yield* this.runDurableLocked(hub, sessionId, input, signal);
+      yield* this.runDurableLocked(hub, durableId, input, signal);
     } finally {
       try {
-        const slot = hub.get(sessionId);
+        const slot = hub.get(durableId);
         if (slot?.state === "running" && slot.pending.size > 0) {
-          hub.beginAwaitingTools(sessionId);
+          hub.beginAwaitingTools(durableId);
         } else if (slot?.state === "running") {
-          await this.dropDurableSession(hub, sessionId).catch(() => undefined);
+          await this.dropDurableSession(hub, durableId).catch(() => undefined);
         }
       } finally {
         release();

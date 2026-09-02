@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FastifyRequest } from "fastify";
+import { explicitSessionIdFromHeaders } from "./durable-id.js";
 import { ApiError } from "./errors.js";
 import type { AuthContext, GatewayConfig, GatewayKeyRecord } from "./types.js";
 
@@ -111,12 +112,7 @@ export function sessionAffinity(request: FastifyRequest, fallback: string): stri
  * （网关模式下是所有请求共享的 ownerHash），用它做绑定等于把整个网关钉死在一把 key 上。
  */
 export function explicitSessionId(request: FastifyRequest): string | undefined {
-  return (
-    headerString(request, "x-session-affinity") ??
-    headerString(request, "x-opencode-session-id") ??
-    headerString(request, "x-opencode-session") ??
-    headerString(request, "anthropic-session-id")
-  );
+  return explicitSessionIdFromHeaders(request.headers);
 }
 
 export function sha256(value: string): string {

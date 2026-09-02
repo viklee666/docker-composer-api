@@ -167,6 +167,39 @@ test("acquire serializes the same session; release lets the waiter proceed", asy
   assert.deepEqual(order, [1, 2]);
 });
 
+test("tryAcquire on an idle session returns a release function", async () => {
+  const hub = new SessionHub();
+  const release = await hub.tryAcquire("sess-try-idle");
+  assert.equal(typeof release, "function");
+  assert.ok(release);
+  release();
+});
+
+test("tryAcquire is undefined while locked and does not enqueue", async () => {
+  const hub = new SessionHub();
+  const release1 = await hub.acquire("sess-try-busy");
+  assert.equal(await hub.tryAcquire("sess-try-busy"), undefined);
+  await delay(20);
+  assert.equal(await hub.tryAcquire("sess-try-busy"), undefined);
+
+  let waiterGotLock = false;
+  const waiter = hub.acquire("sess-try-busy").then((release2) => {
+    waiterGotLock = true;
+    release2();
+  });
+  await delay(20);
+  assert.equal(waiterGotLock, false);
+
+  hub.release(release1);
+  await waiter;
+  assert.equal(waiterGotLock, true);
+
+  const release3 = await hub.tryAcquire("sess-try-busy");
+  assert.equal(typeof release3, "function");
+  assert.ok(release3);
+  release3();
+});
+
 test("acquire abort while waiting does not drop an awaiting_tools slot", async () => {
   const hub = new SessionHub();
   const sessionId = "sess-abort-lock";

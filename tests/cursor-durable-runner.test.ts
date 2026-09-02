@@ -429,6 +429,80 @@ test("inferred conversationSeed does not enter the Hub when reuseDurableAgent is
   await hub.dropAll();
 });
 
+test("overlapping new_user on a locked Hub is stateless flatten, not 499", { timeout: 5_000 }, async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const store = new MemoryStateStore();
+  let createCount = 0;
+  let firstAgent: TrackingAgent | undefined;
+  let secondAgent: TrackingAgent | undefined;
+  let resolveHang = (): void => undefined;
+  const hang = new Promise<void>((resolve) => {
+    resolveHang = resolve;
+  });
+  let firstCreateStarted!: () => void;
+  const firstCreate = new Promise<void>((resolve) => {
+    firstCreateStarted = resolve;
+  });
+  const factory: AgentFactory = {
+    create: async () => {
+      createCount += 1;
+      if (createCount === 1) {
+        firstCreateStarted();
+        await hang;
+        firstAgent = new TrackingAgent("agent-overlap-1");
+        return firstAgent;
+      }
+      secondAgent = new TrackingAgent("agent-overlap-2");
+      return secondAgent;
+    },
+    resume: async () => {
+      throw new Error("overlapping new_user fallback must not resume");
+    }
+  };
+  const runner = durableRunner(hub, factory, store);
+  const flatten = "Conversation:\nUSER: hello";
+  const seed = "seed-overlap-new-user";
+  const sessionId = durableSessionId({
+    apiKey: "cursor-key",
+    model: "composer-2.5",
+    workingDirectory: "/workspace",
+    conversationSeed: seed
+  });
+  assert.ok(sessionId);
+
+  const first = runner.run(baseRun({
+    prompt: flatten,
+    conversationSeed: seed,
+    durableTurn: userTurn("hello")
+  }));
+  try {
+    await firstCreate;
+    const second = await runner.run(baseRun({
+      prompt: flatten,
+      conversationSeed: seed,
+      durableTurn: userTurn("hello")
+    }));
+    assert.equal(createCount, 2);
+    assert.ok(secondAgent);
+    assert.equal(sendText(secondAgent.sends[0]), flatten);
+    assert.equal(secondAgent.disposed, true);
+    assert.equal(firstAgent === undefined, true);
+    assert.equal(second.text, "reply 1");
+
+    resolveHang();
+    const firstResult = await first;
+    assert.ok(firstAgent);
+    assert.equal(firstResult.agentId, "agent-overlap-1");
+    assert.equal(firstAgent.disposed, false);
+    assert.equal(hub.get(sessionId)?.agentId, "agent-overlap-1");
+    assert.equal(hub.get(sessionId)?.agent, firstAgent);
+  } finally {
+    resolveHang();
+    await first.catch(() => undefined);
+    await hub.dropAll();
+  }
+});
+
 test("durable path B: marker tool_call then tool_result is a short send, same agent", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const agent = new MarkerAgent();
@@ -525,7 +599,7 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   assert.equal(capture.last?.durableTurn?.userText, "hello chat");
   assert.ok(capture.last?.conversationSeed);
   assert.ok(capture.last?.stickyKey);
-  assert.equal(capture.last?.reuseDurableAgent, false);
+  assert.equal(capture.last?.reuseDurableAgent, true);
 
   const chatSession = await app.inject({
     method: "POST",
@@ -558,7 +632,7 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   assert.equal(capture.last?.durableTurn?.kind, "new_user");
   assert.equal(capture.last?.durableTurn?.userText, "hello messages");
   assert.ok(capture.last?.conversationSeed);
-  assert.equal(capture.last?.reuseDurableAgent, false);
+  assert.equal(capture.last?.reuseDurableAgent, true);
 
   const messagesSession = await app.inject({
     method: "POST",

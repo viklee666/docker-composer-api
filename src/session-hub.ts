@@ -205,13 +205,13 @@ export type DurableReplaceReason =
   | "incompatible"
   | "model"
   | "apiKey"
-  | "systemFingerprint"
   | "toolsFingerprint"
   | "history";
 
 /**
- * Why this inbound turn cannot reuse the live slot. `incompatible` / model / apiKey /
- * fingerprint / rewritten history → caller must drop+create (D11). Undefined = keep slot.
+ * 本轮为何不能复用 live slot。`incompatible` / model / apiKey / toolsFingerprint /
+ * rewritten history → 调用方 drop+create（D11）。undefined = 留槽。
+ * systemFingerprint 变化不换槽。
  */
 export function durableSlotReplaceReason(
   slot: SessionSlot | undefined,
@@ -229,9 +229,6 @@ export function durableSlotReplaceReason(
   if (!slot) return undefined;
   if (input.apiKey !== undefined && slot.apiKey !== input.apiKey) return "apiKey";
   if (input.model !== undefined && slot.model !== input.model) return "model";
-  if (slot.systemFingerprint && input.systemFingerprint && slot.systemFingerprint !== input.systemFingerprint) {
-    return "systemFingerprint";
-  }
   if (slot.toolsFingerprint && input.toolsFingerprint && slot.toolsFingerprint !== input.toolsFingerprint) {
     return "toolsFingerprint";
   }
@@ -337,21 +334,7 @@ export class SessionHub {
     await this.sweep();
     if (signal?.aborted) throw abortError(signal);
 
-    let unlock!: () => void;
-    const held = new Promise<void>((resolve) => {
-      unlock = resolve;
-    });
-    const previous = this.lockTails.get(sessionId) ?? Promise.resolve();
-    const tail = previous.catch(() => undefined).then(() => held);
-    this.lockTails.set(sessionId, tail);
-
-    let released = false;
-    const release = (): void => {
-      if (released) return;
-      released = true;
-      unlock();
-      if (this.lockTails.get(sessionId) === tail) this.lockTails.delete(sessionId);
-    };
+    const { previous, release } = this.bindLock(sessionId);
 
     try {
       await this.waitForPrevious(previous, signal);
@@ -363,6 +346,20 @@ export class SessionHub {
       release();
       throw abortError(signal);
     }
+    this.touch(sessionId);
+    return release;
+  }
+
+  /**
+   * 非阻塞互斥。已有 lockTails 则立刻 undefined：不 sweep、不 set、不 touch、不挂 waiter。
+   * 空闲则先 sweep（与 acquire 开头相同），再检查 has；仍空则 bindLock + touch，马上返回 release，
+   * 不等待前一位。重叠 POST 探测走这里；可短等路径仍用 acquire。
+   */
+  async tryAcquire(sessionId: string): Promise<(() => void) | undefined> {
+    if (this.lockTails.has(sessionId)) return undefined;
+    await this.sweep();
+    if (this.lockTails.has(sessionId)) return undefined;
+    const { release } = this.bindLock(sessionId);
     this.touch(sessionId);
     return release;
   }
@@ -570,6 +567,26 @@ export class SessionHub {
         // best-effort
       }
     }
+  }
+
+  /** 登记 held / release / lockTails；不等待前一位。acquire 与 tryAcquire 共用。 */
+  private bindLock(sessionId: string): { previous: Promise<void>; release: () => void } {
+    let unlock!: () => void;
+    const held = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    const previous = this.lockTails.get(sessionId) ?? Promise.resolve();
+    const tail = previous.catch(() => undefined).then(() => held);
+    this.lockTails.set(sessionId, tail);
+
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      unlock();
+      if (this.lockTails.get(sessionId) === tail) this.lockTails.delete(sessionId);
+    };
+    return { previous, release };
   }
 
   private async waitForPrevious(previous: Promise<void>, signal?: AbortSignal): Promise<void> {

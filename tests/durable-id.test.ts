@@ -7,7 +7,12 @@ import {
   loadConfig,
   shouldUseDurableHub
 } from "../src/config.js";
-import { durableIdentity, durableSessionId } from "../src/durable-id.js";
+import {
+  durableIdentity,
+  durableSessionId,
+  normalizeExplicitId,
+  resolveConversationIdentity
+} from "../src/durable-id.js";
 
 test("loadConfig defaults to durable with the session-resume kill switch off", () => {
   const config = loadConfig({});
@@ -180,4 +185,120 @@ test("durableSessionId mixes apiKey and model so different slots do not collide"
   assert.ok(left && right && otherModel);
   assert.notEqual(left, right);
   assert.notEqual(left, otherModel);
+});
+
+test("durableSessionId accepts the expanded explicit session headers", () => {
+  const keys = {
+    apiKey: "k",
+    model: "composer-2.5"
+  };
+  const rows = [
+    { headers: { "x-claude-code-session-id": "claude-code-sess-1" } },
+    { headers: { "x-session-id": "x-session-id-value-1" } },
+    { headers: { "session-id": "session-id-value-1" } },
+    { headers: { session_id: "session_id-value-1" } },
+    { headers: { conversation_id: "conversation-id-value-1" } },
+    { headers: { "x-codex-window-id": "codex-window-1" } },
+    { headers: { "x-codex-turn-metadata": JSON.stringify({ prompt_cache_key: "codex-pck-1" }) } },
+    { headers: { "x-codex-turn-metadata": JSON.stringify({ window_id: "codex-meta-window-1" }) } }
+  ];
+  const ids = rows.map((row) => durableSessionId({ ...keys, headers: row.headers }));
+  for (const [index, id] of ids.entries()) {
+    assert.ok(id, `header row ${index}`);
+  }
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("durableSessionId accepts explicit session fields on the body", () => {
+  const keys = {
+    apiKey: "k",
+    model: "composer-2.5"
+  };
+  const bodies = [
+    { session_id: "body-session-id-1" },
+    { sessionId: "body-sessionId-1" },
+    { conversation_id: "body-conversation-id-1" },
+    { prompt_cache_key: "body-pck-1" },
+    { conversation: "body-conversation-string-1" },
+    { conversation: { id: "body-conversation-object-1" } },
+    { client_metadata: { "x-codex-window-id": "body-codex-window-1" } },
+    { metadata: { user_id: JSON.stringify({ session_id: "11111111-1111-4111-8111-111111111111" }) } },
+    { metadata: { user_id: "claude-user_session_22222222-2222-4222-8222-222222222222" } }
+  ];
+  const ids = bodies.map((body) => durableSessionId({ ...keys, body }));
+  for (const [index, id] of ids.entries()) {
+    assert.ok(id, `body row ${index}`);
+  }
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("normalizeExplicitId trims, rejects empty control and oversized values, and keeps a UUID", () => {
+  const uuid = "550e8400-e29b-41d4-a716-446655440000";
+  const rows: Array<[string, string, string | undefined]> = [
+    ["control", "sess\nid", undefined],
+    ["trim", "  trimmed-session-id  ", "trimmed-session-id"],
+    ["empty", "", undefined],
+    ["oversize", "a".repeat(257), undefined],
+    ["uuid", uuid, uuid]
+  ];
+  for (const [name, value, expected] of rows) {
+    assert.equal(normalizeExplicitId(value), expected, name);
+    assert.equal(durableIdentity({ headers: { "x-session-affinity": value } }), expected, name);
+  }
+});
+
+test("x-client-request-id alone is not an identity and does not block L3 derive", () => {
+  const headers = { "x-client-request-id": "req-every-turn-1" };
+  assert.equal(durableIdentity({ headers }), undefined);
+  assert.equal(durableSessionId({ headers, apiKey: "k", model: "composer-2.5" }), undefined);
+
+  const body = { messages: [{ role: "user", content: "Explain closures." }] };
+  const derived = durableIdentity({ headers, body });
+  assert.ok(derived);
+  assert.equal(derived, durableIdentity({ body }));
+  assert.ok(durableSessionId({ headers, body, apiKey: "k", model: "composer-2.5" }));
+});
+
+test("explicit header identity wins over an explicit body field", () => {
+  const headers = { "x-session-affinity": "header-session-aaa" };
+  const body = { session_id: "body-session-bbb" };
+  const both = durableIdentity({ headers, body });
+  const headerOnly = durableIdentity({ headers });
+  const bodyOnly = durableIdentity({ body });
+  assert.ok(both && headerOnly && bodyOnly);
+  assert.equal(both, headerOnly);
+  assert.notEqual(both, bodyOnly);
+});
+
+test("stickyKey equal to ownerHash is not a Hub key while ownerHash still scopes L3 identity", () => {
+  const owner = "owner-hash-shared-by-every-gateway-request";
+  assert.equal(
+    durableSessionId({
+      ownerHash: owner,
+      stickyKey: owner,
+      apiKey: "k",
+      model: "composer-2.5",
+      workingDirectory: "/w"
+    }),
+    undefined
+  );
+  assert.equal(durableIdentity({ ownerHash: owner, stickyKey: owner }), undefined);
+
+  const body = { messages: [{ role: "user", content: "Explain closures." }] };
+  const scopedA = durableIdentity({ body, ownerHash: "owner-hash-a" });
+  const scopedB = durableIdentity({ body, ownerHash: "owner-hash-b" });
+  assert.ok(scopedA && scopedB);
+  assert.notEqual(scopedA, scopedB);
+});
+
+test("resolveConversationIdentity matches durableIdentity for the same input", () => {
+  const inputs = [
+    { headers: { "anthropic-session-id": "sess-alias-1" } },
+    { body: { messages: [{ role: "user", content: "Explain closures." }] } },
+    { conversationSeed: "seed-from-alias" },
+    { ownerHash: "owner-only" }
+  ];
+  for (const input of inputs) {
+    assert.equal(resolveConversationIdentity(input), durableIdentity(input));
+  }
 });

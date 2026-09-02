@@ -618,6 +618,18 @@ test("conversationSeed stays stable as a conversation grows", () => {
   assert.ok(seed, "a conversation with a user message must be identifiable");
   // 这是整个粘性机制的前提：同一段对话越聊越长，身份也必须不变。
   assert.equal(conversationSeed(turn3), seed);
+  // 第一条 user 之后再插入的 system/developer 也不得改 seed，否则续聊补约束会拆槽。
+  const laterInstructions = {
+    messages: [
+      { role: "system", content: "You are helpful." },
+      { role: "user", content: "Explain closures." },
+      { role: "assistant", content: "A closure captures its lexical scope." },
+      { role: "developer", content: "Prefer short examples." },
+      { role: "system", content: "Stay in the same conversation." },
+      { role: "user", content: "Now show me an example." }
+    ]
+  };
+  assert.equal(conversationSeed(laterInstructions), seed);
 });
 
 test("conversationSeed separates different conversations and unidentifiable ones", () => {
@@ -640,16 +652,15 @@ test("conversationSeed separates different conversations and unidentifiable ones
   assert.equal(conversationSeed("not an object"), undefined);
 });
 
-test("conversationSeed separates conversations that only differ past the old 200-char window", () => {
-  // agent 类客户端共用一份几 KB 的 system prompt、第一条 user 又都套同一段模板，
-  // 截断窗口太短会让这些互不相干的会话撞成同一个身份，粘性反而把它们钉到同一把 key 上。
+test("conversationSeed ignores top-level instruction changes past 50 runes but keeps the full first user message", () => {
+  // 说明书只取前 50 rune：长 preamble 尾部的仓库名不得拆成两段对话。
   const preamble = "You are a meticulous coding agent working inside a large monorepo. ".repeat(6);
   const alpha = conversationSeed({ system: `${preamble}Repository: alpha.`, messages: [{ role: "user", content: "Explain closures." }] });
   const beta = conversationSeed({ system: `${preamble}Repository: beta.`, messages: [{ role: "user", content: "Explain closures." }] });
   assert.ok(alpha && beta);
-  assert.notEqual(alpha, beta);
+  assert.equal(alpha, beta);
 
-  // 第一条 user 消息同理：共享一大段模板前缀，实质诉求在后面。
+  // 第一条 user 仍是全文：共享模板前缀、实质诉求在尾部时必须分开。
   const task = "Review the attached module and report any correctness issues you find. ".repeat(5);
   const readAlpha = conversationSeed({ messages: [{ role: "user", content: `${task}File: alpha.ts` }] });
   const readBeta = conversationSeed({ messages: [{ role: "user", content: `${task}File: beta.ts` }] });
@@ -657,9 +668,9 @@ test("conversationSeed separates conversations that only differ past the old 200
   assert.notEqual(readAlpha, readBeta);
 });
 
-test("conversationSeed is still a bounded prefix, not the whole conversation", () => {
-  // 截断窗口放大了，但仍然是前缀：这才是「同一段对话越聊越长、身份不变」的保证，改成全量就破了。
-  const beyondWindow = "x".repeat(4200);
+test("conversationSeed is still a bounded 50-rune instruction prefix, not the whole conversation", () => {
+  // 第 51 个码点之后的 system 变化必须同 seed，否则日期/git 行会拆槽。
+  const beyondWindow = "x".repeat(50);
   assert.equal(
     conversationSeed({ system: `${beyondWindow}A`, messages: [{ role: "user", content: "hi" }] }),
     conversationSeed({ system: `${beyondWindow}B`, messages: [{ role: "user", content: "hi" }] })
@@ -729,7 +740,68 @@ test("conversationSeed includes every effective system instruction", () => {
       { type: "message", role: "user", content: [{ type: "input_text", text: "Explain closures." }] }
     ]
   };
-  assert.notEqual(conversationSeed(firstResponsesSystem), conversationSeed(differentResponsesSystem));
+  assert.equal(
+    conversationSeed(firstResponsesSystem),
+    conversationSeed(differentResponsesSystem),
+    "Responses L3 ignores developer/system items inside input"
+  );
+});
+
+test("conversationSeed ignores top-level system on Chat bodies", () => {
+  const messages = [
+    { role: "system", content: "You are helpful." },
+    { role: "developer", content: "Use concise answers." },
+    { role: "user", content: "Explain closures." }
+  ];
+  const withPersonaA = conversationSeed({ system: "Top-level persona A.", messages }, "openai-chat");
+  const withPersonaB = conversationSeed({ system: "Top-level persona B.", messages }, "openai-chat");
+  assert.ok(withPersonaA && withPersonaB);
+  assert.equal(withPersonaA, withPersonaB);
+});
+
+test("conversationSeed matches inferred and explicit protocol on clean shapes", () => {
+  const groups = [
+    {
+      protocol: "openai-chat" as const,
+      body: {
+        messages: [
+          { role: "system", content: "You are helpful." },
+          { role: "user", content: "Explain closures." }
+        ]
+      }
+    },
+    {
+      protocol: "anthropic-messages" as const,
+      body: {
+        system: "You are helpful.",
+        messages: [{ role: "user", content: "Explain closures." }]
+      }
+    },
+    {
+      protocol: "openai-responses" as const,
+      body: { instructions: "You are helpful.", input: "Explain closures." }
+    }
+  ];
+  for (const { protocol, body } of groups) {
+    const inferred = conversationSeed(body);
+    const explicit = conversationSeed(body, protocol);
+    assert.ok(inferred && explicit, protocol);
+    assert.equal(inferred, explicit, protocol);
+  }
+});
+
+test("conversationSeed mixes callerScope and treats omitted scope like empty string", () => {
+  const body = {
+    messages: [
+      { role: "system", content: "You are helpful." },
+      { role: "user", content: "Explain closures." }
+    ]
+  };
+  const scopedA = conversationSeed(body, "openai-chat", "caller-scope-a");
+  const scopedB = conversationSeed(body, "openai-chat", "caller-scope-b");
+  assert.ok(scopedA && scopedB);
+  assert.notEqual(scopedA, scopedB);
+  assert.equal(conversationSeed(body), conversationSeed(body, undefined, ""));
 });
 
 test("session stickiness only engages when the conversation is identifiable", async () => {

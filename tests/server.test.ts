@@ -5158,8 +5158,8 @@ test("anthropic responses always carry a request-id header", async () => {
   assert.notEqual(streamed.headers["request-id"], ok.headers["request-id"]);
 });
 
-test("idle timeout before the first upstream event returns a plain HTTP 504", { timeout: 5000 }, async () => {
-  // 首个事件都没等到就超时：SSE 尚未提交，必须是真正的 HTTP 错误信封，而不是 200 + 流内错误。
+test("idle timeout before the first upstream event surfaces as a 504 timeout error event", { timeout: 5000 }, async () => {
+  // 握手已先出门：首个上游事件都没等到就超时，也是 200 + 流内 504（对齐中途超时），不再是裸 HTTP 504。
   const { app } = await createTestApp({
     runner: new FakeRunner({ hangUntilAborted: true }),
     config: { requestTimeoutMs: 20 }
@@ -5170,9 +5170,10 @@ test("idle timeout before the first upstream event returns a plain HTTP 504", { 
     headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
     payload: { model: "composer-2.5", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "Hello" }] }
   });
-  assert.equal(response.statusCode, 504);
-  assert.equal(response.json().type, "error");
-  assert.equal(response.json().error.type, "timeout_error");
+  assert.equal(response.statusCode, 200);
+  const last = sseFrames(response.body).at(-1)?.data as { type: string; error: { type: string } };
+  assert.equal(last.type, "error");
+  assert.equal(last.error.type, "timeout_error");
 
   const chat = await createTestApp({
     runner: new FakeRunner({ hangUntilAborted: true }),
@@ -5184,9 +5185,10 @@ test("idle timeout before the first upstream event returns a plain HTTP 504", { 
     headers: { authorization: "Bearer gateway-key" },
     payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
   });
-  assert.equal(chatResponse.statusCode, 504);
-  assert.equal(chatResponse.json().error.type, "server_error");
-  assert.equal(chatResponse.json().error.code, "timeout_error");
+  assert.equal(chatResponse.statusCode, 200);
+  const chatLast = sseFrames(chatResponse.body).at(-1)?.data as { error: { type: string; code: string } };
+  assert.equal(chatLast.error.code, "timeout_error");
+  assert.equal(chatLast.error.type, "server_error");
 });
 
 test("mid-stream idle timeouts surface as a 504 timeout error event", { timeout: 5000 }, async () => {
@@ -5225,7 +5227,7 @@ test("mid-stream idle timeouts surface as a 504 timeout error event", { timeout:
 
 test("requests still time out when the upstream ignores abort signals entirely", { timeout: 5000 }, async () => {
   // 模拟 SDK 传输层挂死：既不产出事件、也永远不 settle、更不感知 abort signal。
-  // 这类挂死曾让请求永久悬挂堆积（表现为服务器"卡死"），请求级竞速必须兜底成 504。
+  // 流式握手已出门：挂死以流内 504 收场。非流式仍是裸 HTTP 504。
   const streaming = await createTestApp({
     runner: new FakeRunner({ hangIgnoringAbort: true }),
     config: { requestTimeoutMs: 20 }
@@ -5236,8 +5238,10 @@ test("requests still time out when the upstream ignores abort signals entirely",
     headers: { authorization: "Bearer gateway-key" },
     payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hello" }] }
   });
-  assert.equal(streamResponse.statusCode, 504);
-  assert.equal(streamResponse.json().error.code, "timeout_error");
+  assert.equal(streamResponse.statusCode, 200);
+  const streamLast = sseFrames(streamResponse.body).at(-1)?.data as { error: { type: string; code: string } };
+  assert.equal(streamLast.error.code, "timeout_error");
+  assert.equal(streamLast.error.type, "server_error");
 
   const blocking = await createTestApp({
     runner: new FakeRunner({ hangIgnoringAbort: true }),
@@ -5271,7 +5275,8 @@ test("mid-stream hangs that ignore abort still end with an in-stream 504 error e
   assert.equal(last.error.type, "server_error");
 });
 
-test("upstream failure before the first event returns a plain HTTP error on all stream endpoints", async () => {
+test("upstream failure before the first event surfaces as an in-stream error on all stream endpoints", async () => {
+  // 握手已先于 runner.stream 出门：首 yield 前的 401 也是 200 SSE + 流内 error，不再是裸 HTTP 401。
   for (const [url, headers, payload] of [
     ["/v1/chat/completions", { authorization: "Bearer direct-cursor-key" }, { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hi" }] }],
     ["/v1/responses", { authorization: "Bearer direct-cursor-key" }, { model: "composer-2.5", stream: true, input: "Hi" }],
@@ -5281,12 +5286,23 @@ test("upstream failure before the first event returns a plain HTTP error on all 
     runner.failWith.set("direct-cursor-key", new ApiError("Invalid API key provided", 401, "unauthorized"));
     const { app } = await createTestApp({ runner });
     const response = await app.inject({ method: "POST", url, headers: { ...headers }, payload });
-    assert.equal(response.statusCode, 401, `${url} must fail with a real HTTP status`);
-    assert.match(response.headers["content-type"] as string, /application\/json/, `${url} must not commit an SSE response`);
+    assert.equal(response.statusCode, 200, `${url} must commit SSE before the upstream failure`);
+    assert.match(response.headers["content-type"] as string, /text\/event-stream/);
+    const last = sseFrames(response.body).at(-1)?.data as { type?: string; error?: { type: string; message: string }; code?: string };
+    if (url === "/v1/messages") {
+      assert.equal(last.type, "error");
+      assert.equal(last.error?.type, "authentication_error");
+    } else if (url === "/v1/chat/completions") {
+      assert.equal(last.error?.type, "authentication_error");
+    } else {
+      assert.equal(last.type, "error");
+      assert.equal(last.code, "unauthorized");
+    }
   }
 });
 
 test("slow first upstream events still flush the SSE handshake so proxies do not TTFB-abort", { timeout: 5000 }, async () => {
+  // delayFirstEvent 模拟 Agent.create TTFB：握手必须已经是 frames[0]，不能等首个上游事件。
   const delay = STREAM_OPEN_KEEPALIVE_MS + 80;
   const { app } = await createTestApp({
     runner: new FakeRunner({ chunks: ["pong"], delayFirstEventMs: delay })
