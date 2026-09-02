@@ -237,6 +237,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     if (prepared.stream) {
       const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      // 可能在首个 Cursor 事件前就返回：协议生成器会立刻写出握手，避免 CPA/Claude Code 因无响应头断成 499。
       const events = await openRunnerStream(deps, log, run, abort);
       return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, events, deps, log, signal: abort.signal }))));
     }
@@ -1062,9 +1063,19 @@ async function* withStreamAbort(abort: { touch: () => void; done: () => void }, 
 }
 
 /**
+ * 等首个上游事件太久才提交 SSE 时，Claude Code / CLIProxyAPI 会按 TTFB 断连，
+ * 网关日志就是 499；后台联通性测试是非流式，所以测得通、真实客户端一打就断。
+ * 短窗口内失败仍走 HTTP 错误信封（401/402/504），超时后先让协议生成器发出握手事件。
+ */
+export const STREAM_OPEN_KEEPALIVE_MS = 150;
+const STREAM_OPEN_KEEPALIVE = Symbol("stream-open-keepalive");
+
+/**
  * 提交 SSE 响应前预取 runner 的第一个事件：上游即时失败（无效 key、额度耗尽、模型不可用等）
  * 必须走正常的 HTTP 错误信封，而不是 200 + 流内错误——SDK 的重试/错误处理依赖真实状态码。
  * 成功后把首事件塞回流，交给各端点的 SSE 生成器继续消费。
+ * 若首事件迟迟不来，到期返回一个仍在等待的 iterable，好让 message_start / role chunk
+ * 立刻下发，避免中间层把「还没响应头」当成上游挂死。
  */
 async function openRunnerStream(
   deps: AppDeps,
@@ -1073,11 +1084,23 @@ async function openRunnerStream(
   abort: { signal: AbortSignal; done: () => void }
 ): Promise<AsyncIterable<CursorStreamEvent>> {
   const iterator = deps.runner.stream(run, abort.signal)[Symbol.asyncIterator]();
-  let first: IteratorResult<CursorStreamEvent>;
+  const firstPromise = raceWithAbort(iterator.next(), abort.signal);
+  let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
+  const keepalive = new Promise<typeof STREAM_OPEN_KEEPALIVE>((resolve) => {
+    keepaliveTimer = setTimeout(() => resolve(STREAM_OPEN_KEEPALIVE), STREAM_OPEN_KEEPALIVE_MS);
+  });
   try {
     // 与 abort 竞速：上游完全无视 signal 挂死时，空闲超时/断连仍能把请求收尾。
-    first = await raceWithAbort(iterator.next(), abort.signal);
+    const winner = await Promise.race([firstPromise, keepalive]);
+    if (keepaliveTimer) clearTimeout(keepaliveTimer);
+    if (winner === STREAM_OPEN_KEEPALIVE) {
+      // 生成器还没拉 next() 时 firstPromise 可能先失败：先接住，避免 unhandledRejection。
+      firstPromise.catch(() => undefined);
+      return attachFirstEvent(iterator, abort.signal, firstPromise);
+    }
+    return attachFirstEvent(iterator, abort.signal, winner);
   } catch (error) {
+    if (keepaliveTimer) clearTimeout(keepaliveTimer);
     abort.done();
     const normalized = normalizeError(error);
     // runner 把 abort 一律表达成内部 499；预取阶段命中空闲超时时还原成对客户端有意义的 504。
@@ -1087,6 +1110,13 @@ async function openRunnerStream(
     finishLog(deps, log, resolved.statusCode, errorMessage(error));
     throw resolved;
   }
+}
+
+function attachFirstEvent(
+  iterator: AsyncIterator<CursorStreamEvent>,
+  signal: AbortSignal,
+  first: IteratorResult<CursorStreamEvent> | Promise<IteratorResult<CursorStreamEvent>>
+): AsyncIterable<CursorStreamEvent> {
   return {
     [Symbol.asyncIterator]() {
       let deliveredFirst = false;
@@ -1098,10 +1128,11 @@ async function openRunnerStream(
           }
           // 流中途同样竞速：读事件被无视 signal 的上游挂住时，abort 会以 499 打断，
           // 由 SSE 生成器的 catch 按语义转成流内 504/断连收尾。
-          return raceWithAbort(iterator.next(), abort.signal);
+          return raceWithAbort(iterator.next(), signal);
         },
         return(value?: unknown): Promise<IteratorResult<CursorStreamEvent>> {
           deliveredFirst = true;
+          void Promise.resolve(first).catch(() => undefined);
           return iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined });
         }
       };

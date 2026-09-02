@@ -15,7 +15,7 @@ import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/mo
 import type { ModelLister } from "../src/models.js";
 import { parseToolMarkers } from "../src/protocol.js";
 import { sessionBindingHash } from "../src/routing.js";
-import { createApp } from "../src/server.js";
+import { createApp, STREAM_OPEN_KEEPALIVE_MS } from "../src/server.js";
 import { MemoryStateStore, SqliteStateStore } from "../src/store.js";
 import { normalizeToolCallForClient } from "../src/tool-compat.js";
 import { UsageReconciler } from "../src/usage-reconciler.js";
@@ -3994,6 +3994,8 @@ class FakeRunner implements CursorRunner {
     hangAfterChunksIgnoringAbort?: boolean;
     /** 覆盖写回 telemetryRef 的遥测（实测用量、真正下发的 model.params 等）。 */
     telemetry?: Partial<RunTelemetryRef>;
+    /** 首个 yield 前等待，模拟 Cursor Agent.create 的 TTFB。 */
+    delayFirstEventMs?: number;
   } = {}) {}
 
   async run(input: CursorRunRequest): Promise<CursorRunResult> {
@@ -4018,6 +4020,9 @@ class FakeRunner implements CursorRunner {
     this.seen.push(input.apiKey);
     this.maybeFail(input);
     this.noteTelemetry(input);
+    if (this.output.delayFirstEventMs) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this.output.delayFirstEventMs));
+    }
     if (this.output.hangIgnoringAbort) await new Promise(() => undefined);
     if (this.output.hangUntilAborted) await abortedPromise(signal);
     const thinkingChunks = this.output.thinking ?? (this.output.reasoningText ? [this.output.reasoningText] : []);
@@ -5279,6 +5284,60 @@ test("upstream failure before the first event returns a plain HTTP error on all 
     assert.equal(response.statusCode, 401, `${url} must fail with a real HTTP status`);
     assert.match(response.headers["content-type"] as string, /application\/json/, `${url} must not commit an SSE response`);
   }
+});
+
+test("slow first upstream events still flush the SSE handshake so proxies do not TTFB-abort", { timeout: 5000 }, async () => {
+  const delay = STREAM_OPEN_KEEPALIVE_MS + 80;
+  const { app } = await createTestApp({
+    runner: new FakeRunner({ chunks: ["pong"], delayFirstEventMs: delay })
+  });
+  const messages = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 64, stream: true, messages: [{ role: "user", content: "Hi" }] }
+  });
+  assert.equal(messages.statusCode, 200);
+  assert.match(messages.headers["content-type"] as string, /text\/event-stream/);
+  const frames = sseFrames(messages.body);
+  assert.equal(frames[0]?.event, "message_start");
+  assert.match(messages.body, /"text_delta","text":"pong"/);
+
+  const chat = await createTestApp({
+    runner: new FakeRunner({ chunks: ["pong"], delayFirstEventMs: delay })
+  });
+  const chatResponse = await chat.app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model: "composer-2.5", stream: true, messages: [{ role: "user", content: "Hi" }] }
+  });
+  assert.equal(chatResponse.statusCode, 200);
+  const chatFrames = sseFrames(chatResponse.body);
+  assert.deepEqual((chatFrames[0]?.data as { choices: { delta: unknown }[] }).choices[0].delta, { role: "assistant" });
+  assert.match(chatResponse.body, /"content":"pong"/);
+});
+
+test("failures after the SSE handshake has been flushed surface as in-stream errors", { timeout: 5000 }, async () => {
+  const runner: CursorRunner = {
+    run: async () => ({ text: "", toolCalls: [] }),
+    stream: async function* (): AsyncIterable<CursorStreamEvent> {
+      await new Promise((resolve) => setTimeout(resolve, STREAM_OPEN_KEEPALIVE_MS + 80));
+      throw new ApiError("Invalid API key provided", 401, "unauthorized");
+    }
+  };
+  const { app } = await createTestApp({ runner: runner as unknown as FakeRunner });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "direct-cursor-key", "anthropic-version": "2023-06-01" },
+    payload: { model: "composer-2.5", max_tokens: 64, stream: true, messages: [{ role: "user", content: "Hi" }] }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.headers["content-type"] as string, /text\/event-stream/);
+  const last = sseFrames(response.body).at(-1)?.data as { type: string; error: { type: string; message: string } };
+  assert.equal(last.type, "error");
+  assert.equal(last.error.type, "authentication_error");
 });
 
 test("responses stream synthesizes lifecycle events when the runner only reports via done", async () => {
