@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.js";
+import { GatewayKeyPool } from "../src/gateway-key-pool.js";
 import { CursorKeyPool } from "../src/key-pool.js";
 import type { ModelLister } from "../src/models.js";
 import { createApp } from "../src/server.js";
@@ -47,6 +48,7 @@ function connectFetch(
     body?: unknown;
     calls?: Array<{ url: string; authorization: string; body: string }>;
     streamCalls?: string[];
+    failCatalog?: boolean;
   } = {}
 ) {
   const session = exchange.accessToken ?? jwt({ type: "session", sub: "acct" });
@@ -66,6 +68,7 @@ function connectFetch(
       return Response.json({ accessToken: session, refreshToken: refresh });
     }
     if (href.includes("AvailableModels")) {
+      if (exchange.failCatalog) return new Response("nope", { status: 500 });
       return new Response(new AvailableModelsResponse({ models }).toBinary(), { status: 200 });
     }
     if (href.includes("InferenceService/Stream")) {
@@ -98,6 +101,7 @@ async function buildApp(
     config?: Partial<GatewayConfig>;
     exchange?: Parameters<typeof connectFetch>[1];
     modelLister?: ModelLister;
+    gatewayKeyPool?: GatewayKeyPool;
   } = {}
 ) {
   const store = new MemoryStateStore();
@@ -136,7 +140,8 @@ async function buildApp(
     runner: new ProviderRoutingRunner({ sdk: new StubRunner(), connect }),
     keyPool,
     connect,
-    ...(options.modelLister ? { modelLister: options.modelLister } : {})
+    ...(options.modelLister ? { modelLister: options.modelLister } : {}),
+    ...(options.gatewayKeyPool ? { gatewayKeyPool: options.gatewayKeyPool } : {})
   });
   return { app, connect, connectStore, keyPool };
 }
@@ -589,14 +594,39 @@ test("GET /v1/models exposes Connect entries under the connect/ prefix", async (
   });
   const listed = await app.inject({ method: "GET", url: "/v1/models", headers: apiAuth });
   assert.equal(listed.statusCode, 200);
+  const data = (listed.json() as { data: Array<{ id: string; gateway_provider?: string; owned_by?: string; name?: string }> }).data;
+  const byId = Object.fromEntries(data.map((model) => [model.id, model]));
+  assert.ok(byId["composer-2.5"]);
+  assert.equal(byId["composer-2.5"].gateway_provider, "sdk");
+  assert.equal(byId["composer-2.5"].owned_by, "cursor");
+  assert.ok(byId["connect/composer-2.5"], "SDK 目录里的模型必须镜像成 connect/ 前缀，客户端才能选路");
+  assert.equal(byId["connect/composer-2.5"].gateway_provider, "connect");
+  assert.equal(byId["connect/composer-2.5"].owned_by, "cursor-connect");
+  assert.ok(byId["connect/grok-4.6"], "Connect 目录里的模型必须以 connect/ 前缀出现");
+  assert.equal(byId["connect/grok-4.6"].gateway_provider, "connect");
+  assert.ok(!byId["connect/gone"], "DISABLED 的 Connect 模型不能出现在目录里");
+
+  const fetched = await app.inject({ method: "GET", url: "/v1/models/connect/grok-4.6", headers: apiAuth });
+  assert.equal(fetched.statusCode, 200);
+  assert.equal((fetched.json() as { id: string; gateway_provider: string }).id, "connect/grok-4.6");
+  assert.equal((fetched.json() as { gateway_provider: string }).gateway_provider, "connect");
+  await app.close();
+});
+
+test("GET /v1/models still exposes connect/ clones when the Connect catalog is empty", async () => {
+  const { app } = await buildApp({
+    withCredential: true,
+    exchange: { failCatalog: true },
+    modelLister: async () => ({
+      models: [{ id: "composer-2.5", name: "Composer", aliases: [] }],
+      source: "cursor"
+    })
+  });
+  const listed = await app.inject({ method: "GET", url: "/v1/models", headers: apiAuth });
+  assert.equal(listed.statusCode, 200);
   const ids = (listed.json() as { data: Array<{ id: string }> }).data.map((model) => model.id);
   assert.ok(ids.includes("composer-2.5"));
-  assert.ok(ids.includes("connect/grok-4.6"), "Connect 模型必须以 connect/ 前缀出现在目录里");
-  assert.ok(!ids.includes("connect/gone"), "DISABLED 的 Connect 模型不能出现在目录里");
-
-  const byId = await app.inject({ method: "GET", url: "/v1/models/connect/grok-4.6", headers: apiAuth });
-  assert.equal(byId.statusCode, 200);
-  assert.equal((byId.json() as { id: string }).id, "connect/grok-4.6");
+  assert.ok(ids.includes("connect/composer-2.5"), "AvailableModels 失败时也要用 SDK 目录镜像出 connect/ 前缀");
   await app.close();
 });
 
@@ -617,6 +647,50 @@ test("a client can chat through Connect by selecting a connect/ model", async ()
   assert.equal(response.statusCode, 200);
   assert.equal(
     (response.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content,
+    "pong"
+  );
+  await app.close();
+});
+
+test("an SDK-only gateway key whitelist still lists and serves connect/ models", async () => {
+  const inbound = "gateway-scoped-key-01";
+  const gwStore = new MemoryStateStore();
+  const gatewayKeyPool = new GatewayKeyPool(gwStore);
+  await gatewayKeyPool.seedFromEnv(inbound);
+  const [gw] = await gatewayKeyPool.list();
+  assert.ok(gw);
+  await gatewayKeyPool.update(gw.id, { modelScope: { allowed: ["composer-2.5"], excluded: [] } });
+
+  const { app } = await buildApp({
+    withCredential: true,
+    gatewayKeyPool,
+    config: { gatewayApiKey: inbound },
+    modelLister: async () => ({
+      models: [
+        { id: "composer-2.5", name: "Composer", aliases: [] },
+        { id: "grok-4.6", name: "Grok", aliases: [] }
+      ],
+      source: "cursor"
+    })
+  });
+  const auth = { authorization: `Bearer ${inbound}` };
+  const listed = await app.inject({ method: "GET", url: "/v1/models", headers: auth });
+  assert.equal(listed.statusCode, 200);
+  const ids = (listed.json() as { data: Array<{ id: string }> }).data.map((model) => model.id);
+  assert.ok(ids.includes("composer-2.5"));
+  assert.ok(!ids.includes("grok-4.6"), "SDK 白名单仍要挡住密钥池里的 grok");
+  assert.ok(ids.includes("connect/grok-4.6"), "Connect 目录不能被 SDK 白名单吃掉");
+  assert.ok(ids.includes("connect/composer-2.5"));
+
+  const chat = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "connect/grok-4.6", messages: [{ role: "user", content: "hi" }] }
+  });
+  assert.equal(chat.statusCode, 200);
+  assert.equal(
+    (chat.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content,
     "pong"
   );
   await app.close();

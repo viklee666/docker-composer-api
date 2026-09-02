@@ -197,6 +197,8 @@ export {
   CONNECT_MODEL_PREFIX,
   PROVIDER_HEADER,
   ProviderRouter,
+  connectModelScope,
+  isConnectModelId,
   selectProvider,
   type ProviderId,
   type ProviderSelection

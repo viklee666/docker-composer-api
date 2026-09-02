@@ -35,7 +35,7 @@ import {
   nextDeliveryState,
   resumeDecision
 } from "../src/cursor-connect/background-worker.js";
-import { ProviderRouter, selectProvider } from "../src/cursor-connect/router.js";
+import { ProviderRouter, connectModelScope, isConnectModelId, selectProvider } from "../src/cursor-connect/router.js";
 import { InferenceMessageRole } from "../src/cursor-connect/proto/inference_pb.js";
 import {
   InferenceExtendedUsageInfo,
@@ -1657,6 +1657,20 @@ test("delivery state advances only on real upstream content", () => {
 });
 
 /* ------------------------------------------------------------ P6 选路 */
+
+test("Connect model ids are a separate scope namespace from SDK names", () => {
+  assert.equal(isConnectModelId("connect/grok-4.6"), true);
+  assert.equal(isConnectModelId("grok-4.6"), false);
+  assert.equal(
+    connectModelScope({ allowed: ["composer-2.5", "grok-4.6"], excluded: [] }),
+    undefined,
+    "只有 SDK 名字的白名单不能变成 Connect 过滤"
+  );
+  assert.deepEqual(
+    connectModelScope({ allowed: ["composer-2.5", "connect/grok-4.6"], excluded: ["connect/gone"] }),
+    { allowed: ["connect/grok-4.6"], excluded: ["connect/gone"] }
+  );
+});
 
 test("provider selection follows header, then model prefix, then key setting", () => {
   assert.equal(selectProvider({ headers: { "X-Gateway-Provider": "connect" } }).provider, "connect");

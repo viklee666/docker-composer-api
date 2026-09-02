@@ -24,6 +24,8 @@ export interface ModelEntry {
   parameters?: ModelParameterDefinition[];
   /** 该模型的预设参数组合（官方文档：可直接拷进 model.params），用于 Max Mode 等 variant 级映射兜底。 */
   variants?: ModelVariantDefinition[];
+  /** 缺省即 SDK 密钥池。Connect 条目必须显式标出，否则 /v1/models 分不清会走哪条路。 */
+  provider?: "sdk" | "connect";
 }
 
 export interface ModelListResult {
@@ -132,13 +134,16 @@ export function openAiModelList(models: ModelEntry[]): Record<string, unknown> {
 }
 
 export function openAiModelObject(model: ModelEntry): Record<string, unknown> {
+  const provider = model.provider === "connect" ? "connect" : "sdk";
   return {
     id: model.id,
     object: "model",
     created: 0,
-    owned_by: "cursor",
+    owned_by: provider === "connect" ? "cursor-connect" : "cursor",
     name: model.name,
     aliases: model.aliases,
+    // 非 OpenAI 标准字段：客户端只看 id 时用 connect/ 前缀选路；看元数据时用这个字段。
+    gateway_provider: provider,
     // 非 OpenAI 标准字段：暴露 Cursor 的参数定义与预设组合，方便客户端发现可用的 model_params。
     ...(model.parameters?.length ? { cursor_parameters: model.parameters } : {}),
     ...(model.variants?.length ? { cursor_variants: model.variants } : {})

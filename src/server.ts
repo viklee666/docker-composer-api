@@ -3,7 +3,12 @@ import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { registerAdminRoutes } from "./admin.js";
 import { authenticate, explicitSessionId, extractToken, sessionAffinity } from "./auth.js";
 import { registerConnectRoutes } from "./cursor-connect/routes.js";
-import { CONNECT_MODEL_PREFIX, selectProvider } from "./cursor-connect/router.js";
+import {
+  CONNECT_MODEL_PREFIX,
+  connectModelScope,
+  isConnectModelId,
+  selectProvider
+} from "./cursor-connect/router.js";
 import type { CursorConnectService } from "./cursor-connect/service.js";
 import {
   anthropicError,
@@ -29,6 +34,7 @@ import {
   openAiModelList,
   openAiModelObject,
   type CatalogueLookup,
+  type ModelEntry,
   type ModelLister,
   type ModelListResult
 } from "./models.js";
@@ -427,9 +433,10 @@ async function listModels(deps: AppDeps, request: Parameters<typeof authenticate
 }
 
 /**
- * Connect 可用时，把目录里的模型以 `connect/{id}` 并进 /v1/models。
- * 前缀既是选路开关，也避免和 SDK 同名模型撞车。
- * 过滤只看入站网关密钥范围：Connect 走自己的凭据，不受 Cursor Key 池白名单约束。
+ * Connect 可用时，把 `connect/{id}` 并进 /v1/models，让客户端能从目录里选路。
+ *
+ * 来源两层：Connect 自己的 AvailableModels，再补上 SDK 目录的同名镜像。
+ * 目录拉失败时至少还能靠镜像露出前缀；SDK 白名单不参与过滤（见 `connectModelScope`）。
  */
 async function withConnectModels(
   deps: AppDeps,
@@ -437,25 +444,50 @@ async function withConnectModels(
   auth?: AuthContext
 ): Promise<ModelListResult> {
   if (!deps.connect?.available) return listed;
-  try {
-    const extra = await deps.connect.listModels();
-    const mapped = extra.flatMap((model) => {
-      const id = model.id?.trim();
-      if (!id) return [];
-      return [{
-        id: `${CONNECT_MODEL_PREFIX}${id}`,
-        name: model.displayName ? `${model.displayName} (Connect)` : `${id} (Connect)`,
-        aliases: [] as string[],
-        ...(model.parameters?.length ? { parameters: model.parameters } : {}),
-        ...(model.variants?.length ? { variants: model.variants } : {})
-      }];
-    });
-    const visible = filterModelsByScope(mapped, auth?.modelScope);
-    if (!visible.length) return listed;
-    return { models: [...listed.models, ...visible], source: listed.source };
-  } catch {
-    return listed;
+  const byId = new Map<string, ModelEntry>();
+  for (const model of listed.models) {
+    const clone = sdkModelAsConnect(model);
+    if (clone) byId.set(clone.id.toLowerCase(), clone);
   }
+  try {
+    for (const model of await deps.connect.listModels()) {
+      const entry = connectCatalogEntry(model);
+      if (entry) byId.set(entry.id.toLowerCase(), entry);
+    }
+  } catch (error) {
+    console.warn(
+      `[cursor-connect] /v1/models catalog unavailable: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const visible = filterModelsByScope([...byId.values()], connectModelScope(auth?.modelScope));
+  if (!visible.length) return listed;
+  return { models: [...listed.models, ...visible], source: listed.source };
+}
+
+function connectCatalogEntry(model: { id?: string; displayName?: string; parameters?: ModelEntry["parameters"]; variants?: ModelEntry["variants"] }): ModelEntry | undefined {
+  const id = model.id?.trim();
+  if (!id || isConnectModelId(id)) return undefined;
+  return {
+    id: `${CONNECT_MODEL_PREFIX}${id}`,
+    name: model.displayName ? `${model.displayName} (Connect)` : `${id} (Connect)`,
+    aliases: [],
+    provider: "connect",
+    ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+    ...(model.variants?.length ? { variants: model.variants } : {})
+  };
+}
+
+function sdkModelAsConnect(model: ModelEntry): ModelEntry | undefined {
+  const id = model.id?.trim();
+  if (!id || isConnectModelId(id) || model.provider === "connect") return undefined;
+  return {
+    id: `${CONNECT_MODEL_PREFIX}${id}`,
+    name: `${model.name || id} (Connect)`,
+    aliases: [],
+    provider: "connect",
+    ...(model.parameters?.length ? { parameters: model.parameters } : {}),
+    ...(model.variants?.length ? { variants: model.variants } : {})
+  };
 }
 
 /**
@@ -514,8 +546,13 @@ async function scopedModelIdentity(deps: AppDeps, auth: AuthContext, model: stri
  */
 function enforceGatewayModelScope(identity: ModelIdentity, scope: ModelScope | undefined, model: string): void {
   if (!scope) return;
+  const connect = isConnectModelId(model);
+  // Connect 模型名是另一套命名空间：SDK 白名单不能把 connect/grok-4.6 挡成 403。
+  const effective = connect ? connectModelScope(scope) : scope;
+  if (!effective) return;
+  const checked = connect ? modelIdentity(model) : identity;
   // 先判真命中：能明确说出「这个模型被排除了」时就不该退而报「查不到」，后者会把运维引去查上游。
-  if (!identityAllowed(identity, scope)) {
+  if (!identityAllowed(checked, effective)) {
     throw new ApiError(
       `This gateway API key is not allowed to use model "${model}": the model is outside its model scope. Widen the gateway key model scope in the admin panel or request another model.`,
       403,
@@ -523,7 +560,7 @@ function enforceGatewayModelScope(identity: ModelIdentity, scope: ModelScope | u
       "model"
     );
   }
-  if (denyRuleUnverifiable(identity, scope)) {
+  if (denyRuleUnverifiable(checked, effective)) {
     throw new ApiError(
       `Cannot verify whether model "${model}" is on this gateway API key's model deny list: the Cursor model catalogue is unavailable, so the request is refused instead of being let through an unevaluated deny rule. Retry once the catalogue recovers, or request the model by the exact name used in the deny list.`,
       403,
@@ -540,7 +577,8 @@ function enforceGatewayModelScope(identity: ModelIdentity, scope: ModelScope | u
  * 三个推理入口在 runner 里还会再查一遍，count_tokens 不进 runner，只有这一处能拦。
  */
 function enforceRegisteredKeyScope(identity: ModelIdentity, scope: ModelScope | undefined, model: string): void {
-  if (!scope) return;
+  // Connect 不走 Cursor Key 池，key 上的 SDK 范围管不到这条路。
+  if (!scope || isConnectModelId(model)) return;
   if (!identityAllowed(identity, scope)) {
     throw new ApiError(
       `This Cursor API key is not allowed to use model "${model}": the model is outside the scope registered for this key in the admin panel. Widen that scope or request another model.`,

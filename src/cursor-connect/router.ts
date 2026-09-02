@@ -1,4 +1,4 @@
-import type { CursorRunner } from "../types.js";
+import type { CursorRunner, ModelScope } from "../types.js";
 
 /**
  * Provider 选路（计划 §P6）。
@@ -11,6 +11,24 @@ export type ProviderId = "sdk" | "connect";
 
 export const CONNECT_MODEL_PREFIX = "connect/";
 export const PROVIDER_HEADER = "x-gateway-provider";
+
+export function isConnectModelId(model: string | undefined): boolean {
+  return Boolean(model?.trim().toLowerCase().startsWith(CONNECT_MODEL_PREFIX));
+}
+
+/**
+ * Connect 自己的范围规则。
+ *
+ * SDK 白名单里的 `grok-4.6` 不能把 `connect/grok-4.6` 藏起来——两条路线的模型名本来就不是同一套。
+ * 只有白名单/黑名单里出现了 `connect/` 条目时，才按那些条目过滤 Connect 目录。
+ */
+export function connectModelScope(scope?: ModelScope): ModelScope | undefined {
+  if (!scope) return undefined;
+  const allowed = (scope.allowed ?? []).filter(isConnectModelId);
+  const excluded = (scope.excluded ?? []).filter(isConnectModelId);
+  if (!allowed.length && !excluded.length) return undefined;
+  return { allowed, excluded };
+}
 
 export interface ProviderSelectionInput {
   /** 入站请求头（已小写化或大小写不敏感查找）。 */
