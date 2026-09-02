@@ -211,6 +211,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         <div class="nav-group">密钥</div>
         <button type="button" class="nav-item" data-nav="keys">Cursor Key 池</button>
         <button type="button" class="nav-item" data-nav="gateway-keys">网关密钥</button>
+        <button type="button" class="nav-item" data-nav="connect">Connect 凭据</button>
         <div class="nav-group">策略</div>
         <button type="button" class="nav-item" data-nav="routing">取用策略与会话粘性</button>
         <button type="button" class="nav-item" data-nav="system-prompt">默认系统提示词</button>
@@ -341,6 +342,98 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 </div>
                 <div class="empty hidden" id="gw-empty">暂无网关密钥</div>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="sec-connect" class="hidden" data-section="connect">
+          <div class="panel">
+            <div class="head">
+              <h2>Cursor Connect 凭据</h2>
+              <span class="hint">Connect 路线直连 <code>aiserver.v1.InferenceService/Stream</code>，用 session token + 稳定设备标识，与 SDK 路线的 Cursor Key 池互不相干。</span>
+            </div>
+            <div class="body">
+              <div class="callout" id="connect-status-box">
+                <strong id="connect-status-title">正在读取状态…</strong>
+                <span id="connect-status-detail"></span>
+              </div>
+              <div class="callout warn">
+                <strong>设备标识必须稳定</strong>
+                同一份凭据的 machineId 在整个生命周期内不能变，否则上游会把它当成另一台设备。留空会自动生成一个并永久保存，不要每次都填新的。
+                <br>凭据只能写入、不能读回：后台不回传 token 明文，只显示首尾各 4 位用于辨认。
+              </div>
+              <div class="row" style="margin-bottom:14px">
+                <input id="cc-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
+                <input id="cc-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
+                <input id="cc-machine" placeholder="machineId（留空自动生成）" style="flex:1;min-width:160px" autocomplete="off">
+                <button class="primary" id="btn-cc-add">添加凭据</button>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr>
+                    <th>备注</th><th>token</th><th>类型</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
+                  </tr></thead>
+                  <tbody id="cc-body"></tbody>
+                </table>
+              </div>
+              <div class="empty hidden" id="cc-empty">暂无 Connect 凭据。加一把之后这条路线才会出现在选路里。</div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="head">
+              <h2>运行设置</h2>
+              <span class="hint">这些值来自环境变量，改完需要重启进程。这里只做回显，避免后台改了却与实际出站不一致。</span>
+            </div>
+            <div class="body">
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>项</th><th>当前值</th><th>env</th></tr></thead>
+                  <tbody id="cc-settings-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="head">
+              <h2>模型目录</h2>
+              <span class="hint">来自 <code>AiService/AvailableModels</code>，不是硬编码。参数定义是 effort/thinking 等参数值域的权威来源。</span>
+            </div>
+            <div class="body">
+              <div class="row" style="margin-bottom:12px">
+                <button id="btn-cc-models">拉取目录</button>
+                <button id="btn-cc-models-refresh">强制刷新</button>
+                <span class="hint" id="cc-models-hint"></span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>模型</th><th>显示名</th><th>上下文</th><th>能力</th><th>参数</th><th>状态</th></tr></thead>
+                  <tbody id="cc-models-body"></tbody>
+                </table>
+              </div>
+              <div class="empty hidden" id="cc-models-empty">还没有拉取过目录</div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="head">
+              <h2>Run 列表</h2>
+              <span class="hint">只有走工具循环 / background 的请求才会落 run。普通一问一答不建 run。</span>
+            </div>
+            <div class="body">
+              <div class="row" style="margin-bottom:12px">
+                <button id="btn-cc-runs">刷新 Run</button>
+                <span class="hint" id="cc-runs-hint"></span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>run</th><th>模型</th><th>状态</th><th>交付</th><th>尝试</th><th>事件</th><th>开始</th><th>操作</th></tr></thead>
+                  <tbody id="cc-runs-body"></tbody>
+                </table>
+              </div>
+              <div class="empty hidden" id="cc-runs-empty">暂无 run</div>
+              <pre id="cc-run-detail" class="hidden" style="margin-top:14px;max-height:320px;overflow:auto;background:var(--panel-2);padding:12px;border-radius:8px;font-size:12px"></pre>
             </div>
           </div>
         </section>
@@ -584,6 +677,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     dashboard: '概览',
     keys: 'Cursor Key 池',
     'gateway-keys': '网关密钥',
+    connect: 'Connect 凭据',
     routing: '取用策略与会话粘性',
     'system-prompt': '默认系统提示词',
     proxy: '代理设置',
@@ -753,6 +847,144 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (name === 'system-prompt') hydrateSystemPrompt();
     if (name === 'history') loadLogs();
     if (name === 'proxy') loadProxy();
+    if (name === 'connect') loadConnect();
+  }
+
+  /* ------------------------------------------------ Cursor Connect 面板 */
+
+  var CC_SETTING_ROWS = [
+    ['默认 provider', 'defaultProvider', 'GATEWAY_PROVIDER'],
+    ['出站 base URL', 'baseUrl', 'CURSOR_CONNECT_BASE_URL'],
+    ['编码', 'codec', 'CURSOR_CONNECT_CODEC'],
+    ['单帧上限', 'readMaxBytes', 'CURSOR_CONNECT_MAX_FRAME_BYTES'],
+    ['向上游声明工具', 'sendTools', 'CURSOR_CONNECT_SEND_TOOLS'],
+    ['本地工具白名单', 'localTools', 'CURSOR_CONNECT_LOCAL_TOOLS'],
+    ['网关子代理', 'subagents', 'CURSOR_CONNECT_SUBAGENTS'],
+    ['background worker', 'background', 'CURSOR_CONNECT_BACKGROUND'],
+    ['客户端版本', 'clientVersion', 'CURSOR_CONNECT_CLIENT_VERSION']
+  ];
+
+  function loadConnect(){
+    api('GET', '/admin/api/connect').then(function(data){
+      renderConnectStatus(data);
+      renderConnectSettings(data.settings || {});
+      renderConnectCredentials(data.credentials || []);
+    }).catch(function(err){
+      $('connect-status-title').textContent = '读取失败';
+      $('connect-status-detail').textContent = err.message;
+    });
+  }
+
+  function renderConnectStatus(data){
+    var status = data.status || {};
+    var box = $('connect-status-box');
+    box.className = 'callout' + (status.available ? '' : ' warn');
+    $('connect-status-title').textContent = status.available ? 'Connect 路线可用' : 'Connect 路线未就绪';
+    var bits = [];
+    if (status.activeCredentials !== undefined) {
+      bits.push(status.activeCredentials + ' / ' + (status.credentials || 0) + ' 把凭据可用');
+    }
+    if (status.reason) bits.push(status.reason);
+    if (data.settings && data.settings.defaultProvider === 'connect') bits.push('已设为默认 provider');
+    else bits.push('默认仍走 SDK 路线；单请求可用 x-gateway-provider: connect 或模型名前缀 connect/ 指定');
+    $('connect-status-detail').textContent = bits.join('；');
+  }
+
+  function renderConnectSettings(settings){
+    var rows = CC_SETTING_ROWS.map(function(row){
+      var value = settings[row[1]];
+      if (Array.isArray(value)) value = value.length ? value.join(', ') : '（全关）';
+      else if (typeof value === 'boolean') value = value ? '开' : '关';
+      return '<tr><td>' + esc(row[0]) + '</td><td><code>' + esc(value === undefined ? '-' : value) +
+        '</code></td><td class="muted">' + esc(row[2]) + '</td></tr>';
+    });
+    $('cc-settings-body').innerHTML = rows.join('');
+  }
+
+  function renderConnectCredentials(list){
+    $('cc-empty').classList.toggle('hidden', list.length > 0);
+    $('cc-body').innerHTML = list.map(function(item){
+      var badge = item.status === 'active' ? '<span class="chip ok">● 可用</span>' : '<span class="chip bad">● 停用</span>';
+      var warn = item.tokenType === 'web' ? ' <span class="chip bad">web token</span>' : '';
+      var actions = [
+        '<button data-cc-test="' + esc(item.id) + '">测试</button>',
+        item.status === 'active'
+          ? '<button data-cc-disable="' + esc(item.id) + '">停用</button>'
+          : '<button data-cc-enable="' + esc(item.id) + '">启用</button>',
+        '<button data-cc-rotate="' + esc(item.id) + '">换 token</button>',
+        '<button class="danger" data-cc-del="' + esc(item.id) + '">删除</button>'
+      ].join(' ');
+      return '<tr>' +
+        '<td>' + esc(item.label || '-') + '</td>' +
+        '<td><code>' + esc(item.tokenHint) + '</code></td>' +
+        '<td>' + esc(item.tokenType) + warn + '</td>' +
+        '<td><code>' + esc(item.machineId) + '</code>' + (item.hasMacMachineId ? ' +mac' : '') + '</td>' +
+        '<td>' + esc(item.clientVersion) + '</td>' +
+        '<td>' + badge + '</td>' +
+        '<td>' + (item.failureCount || 0) + (item.lastError ? ' <span class="hint" title="' + esc(item.lastError) + '">?</span>' : '') + '</td>' +
+        '<td class="muted">' + esc(item.lastUsedAt ? item.lastUsedAt.replace('T', ' ').slice(0, 19) : '-') + '</td>' +
+        '<td class="row" style="gap:6px">' + actions + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function loadConnectModels(force){
+    $('cc-models-hint').textContent = '正在拉取…';
+    api('GET', '/admin/api/connect/models' + (force ? '?refresh=true' : '')).then(function(data){
+      var models = data.models || [];
+      $('cc-models-empty').classList.toggle('hidden', models.length > 0);
+      $('cc-models-hint').textContent = models.length + ' 个模型' + (force ? '（已强制刷新）' : '');
+      $('cc-models-body').innerHTML = models.map(function(model){
+        var caps = [];
+        if (model.supportsAgent) caps.push('agent');
+        if (model.supportsThinking) caps.push('thinking');
+        if (model.supportsImages) caps.push('images');
+        if (model.supportsMaxMode) caps.push('max');
+        var params = (model.parameters || []).map(function(p){
+          return p.id + '(' + (p.values || []).map(function(v){ return v.value; }).join('/') + ')';
+        });
+        var state = model.degradation === 'degraded'
+          ? '<span class="chip warn">● 降级</span>'
+          : '<span class="chip ok">● 正常</span>';
+        return '<tr>' +
+          '<td><code>' + esc(model.id) + '</code>' + (model.defaultOn ? ' <span class="hint">默认</span>' : '') + '</td>' +
+          '<td>' + esc(model.displayName || '-') + '</td>' +
+          '<td>' + esc(model.contextTokenLimit || '-') + '</td>' +
+          '<td class="muted">' + esc(caps.join(', ') || '-') + '</td>' +
+          '<td class="muted">' + esc(params.join(' ') || '-') + '</td>' +
+          '<td>' + state + '</td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function(err){
+      $('cc-models-hint').textContent = '拉取失败：' + err.message;
+    });
+  }
+
+  function loadConnectRuns(){
+    api('GET', '/admin/api/connect/runs?limit=50').then(function(data){
+      var runs = data.runs || [];
+      $('cc-runs-empty').classList.toggle('hidden', runs.length > 0);
+      $('cc-runs-hint').textContent = runs.length + ' 条';
+      $('cc-runs-body').innerHTML = runs.map(function(run){
+        var terminal = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+        var cls = run.status === 'completed' ? 'ok' : (run.status === 'failed' ? 'bad' : 'warn');
+        return '<tr>' +
+          '<td><code>' + esc(run.id.slice(0, 8)) + '</code></td>' +
+          '<td>' + esc(run.requestedModel) + '</td>' +
+          '<td><span class="chip ' + cls + '">● ' + esc(run.status) + '</span></td>' +
+          '<td class="muted">' + esc(run.deliveryState) + '</td>' +
+          '<td>' + esc(run.attempt) + '</td>' +
+          '<td>' + esc(run.lastEventSeq) + '</td>' +
+          '<td class="muted">' + esc(run.startedAt ? run.startedAt.replace('T', ' ').slice(0, 19) : '-') + '</td>' +
+          '<td class="row" style="gap:6px">' +
+            '<button data-cc-run="' + esc(run.id) + '">详情</button>' +
+            (terminal ? '' : '<button class="danger" data-cc-run-cancel="' + esc(run.id) + '">取消</button>') +
+          '</td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function(err){
+      $('cc-runs-hint').textContent = '读取失败：' + err.message;
+    });
   }
   function closeMenu(){
     $('sidebar').classList.remove('open');
@@ -1568,6 +1800,110 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('modal-save').addEventListener('click', saveModal);
   $('modal-mask').addEventListener('click', function(event){
     if (event.target === $('modal-mask')) closeModal();
+  });
+
+  /* ------------------------------------- Connect 面板的交互 */
+
+  $('btn-cc-add').addEventListener('click', function(){
+    var token = $('cc-token').value.trim();
+    if (!token) { toast('请先粘贴 session token', true); return; }
+    var body = { sessionToken: token };
+    var label = $('cc-label').value.trim();
+    var machine = $('cc-machine').value.trim();
+    if (label) body.label = label;
+    if (machine) body.machineId = machine;
+    api('POST', '/admin/api/connect/credentials', body).then(function(){
+      // 明文 token 不留在输入框里：这个页面可能在共享屏幕上开着。
+      $('cc-token').value = '';
+      $('cc-label').value = '';
+      $('cc-machine').value = '';
+      toast('已添加 Connect 凭据');
+      loadConnect();
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') toast('添加失败：' + err.message, true);
+    });
+  });
+
+  $('btn-cc-models').addEventListener('click', function(){ loadConnectModels(false); });
+  $('btn-cc-models-refresh').addEventListener('click', function(){ loadConnectModels(true); });
+  $('btn-cc-runs').addEventListener('click', loadConnectRuns);
+
+  $('cc-body').addEventListener('click', function(event){
+    var target = event.target;
+    if (!target || target.tagName !== 'BUTTON') return;
+    var id = target.getAttribute('data-cc-test');
+    if (id) {
+      target.disabled = true;
+      target.textContent = '测试中…';
+      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id) + '/test').then(function(res){
+        if (res.ok) toast('连通，目录 ' + res.models + ' 个模型（' + res.durationMs + 'ms）');
+        else toast('测试失败 ' + (res.status || '') + '：' + (res.error || '未知错误'), true);
+        loadConnect();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('测试失败：' + err.message, true);
+        loadConnect();
+      });
+      return;
+    }
+    id = target.getAttribute('data-cc-enable') || target.getAttribute('data-cc-disable');
+    if (id) {
+      var action = target.hasAttribute('data-cc-enable') ? 'enable' : 'disable';
+      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id) + '/' + action).then(function(){
+        toast(action === 'enable' ? '已启用' : '已停用');
+        loadConnect();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('操作失败：' + err.message, true);
+      });
+      return;
+    }
+    id = target.getAttribute('data-cc-rotate');
+    if (id) {
+      var next = window.prompt('粘贴新的 session token（machineId 保持不变）');
+      if (!next || !next.trim()) return;
+      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id), { sessionToken: next.trim() }).then(function(){
+        toast('已更新 token');
+        loadConnect();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('更新失败：' + err.message, true);
+      });
+      return;
+    }
+    id = target.getAttribute('data-cc-del');
+    if (id) {
+      if (!window.confirm('删除这份凭据？之后走 Connect 的请求会改用其它凭据，没有其它凭据时会回落 SDK 路线。')) return;
+      api('DELETE', '/admin/api/connect/credentials/' + encodeURIComponent(id)).then(function(){
+        toast('已删除');
+        loadConnect();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('删除失败：' + err.message, true);
+      });
+    }
+  });
+
+  $('cc-runs-body').addEventListener('click', function(event){
+    var target = event.target;
+    if (!target || target.tagName !== 'BUTTON') return;
+    var id = target.getAttribute('data-cc-run');
+    if (id) {
+      api('GET', '/admin/api/connect/runs/' + encodeURIComponent(id)).then(function(data){
+        var box = $('cc-run-detail');
+        box.classList.remove('hidden');
+        box.textContent = JSON.stringify(data, null, 2);
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('读取失败：' + err.message, true);
+      });
+      return;
+    }
+    id = target.getAttribute('data-cc-run-cancel');
+    if (id) {
+      if (!window.confirm('取消这个 run？已经交付给客户端的内容不会撤回。')) return;
+      api('POST', '/admin/api/connect/runs/' + encodeURIComponent(id) + '/cancel').then(function(){
+        toast('已取消');
+        loadConnectRuns();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('取消失败：' + err.message, true);
+      });
+    }
   });
 
   $('btn-add-key').addEventListener('click', function(){

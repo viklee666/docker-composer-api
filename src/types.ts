@@ -81,6 +81,39 @@ export interface GatewayConfig {
   systemPromptMode: SystemPromptMode;
   /** 默认系统提示词正文。env: SYSTEM_PROMPT，后台可改。 */
   systemPrompt?: string;
+
+  /* ------------------------------- Cursor Connect 路线（aiserver.v1.InferenceService/Stream） */
+
+  /**
+   * 以下 Connect 字段全部**可选**：既有部署与测试里的 config 字面量不必知道这条路线的存在。
+   * 缺省值由 `connectSettings(config)` 统一填，不要在使用处各写各的 `?? default`。
+   */
+
+  /**
+   * 默认走哪条 provider。默认 `sdk`：Connect 路线的工具循环尚未实测过，
+   * 不能默认接管全部流量。env: GATEWAY_PROVIDER，后台可改。
+   */
+  defaultProvider?: GatewayProvider;
+  /** Connect 出站 base URL。env: CURSOR_CONNECT_BASE_URL。 */
+  connectBaseUrl?: string;
+  /** Connect 请求体编码；json 只作调试。env: CURSOR_CONNECT_CODEC。 */
+  connectCodec?: "proto" | "json";
+  /** 单帧 payload 上限（字节）。env: CURSOR_CONNECT_MAX_FRAME_BYTES。 */
+  connectReadMaxBytes?: number;
+  /** 是否向上游声明工具。默认 false，见计划 §P2 未实测的接续假设。env: CURSOR_CONNECT_SEND_TOOLS。 */
+  connectSendTools?: boolean;
+  /** 允许启用的网关本地工具名（默认全关）。env: CURSOR_CONNECT_LOCAL_TOOLS。 */
+  connectLocalTools?: string[];
+  /** 是否启用网关编排子代理。env: CURSOR_CONNECT_SUBAGENTS。 */
+  connectSubagents?: boolean;
+  /** background worker 是否启动。env: CURSOR_CONNECT_BACKGROUND。 */
+  connectBackground?: boolean;
+  /** 从 env 播种的 Connect session token（首次启动时写入 cc_credentials）。env: CURSOR_CONNECT_TOKEN。 */
+  connectSessionToken?: string;
+  /** 播种凭据的设备标识；不给则自动生成一个并持久化（**生命周期内不可变**）。env: CURSOR_CONNECT_MACHINE_ID。 */
+  connectMachineId?: string;
+  /** 播种凭据的客户端版本号。env: CURSOR_CONNECT_CLIENT_VERSION。 */
+  connectClientVersion?: string;
 }
 
 /** Cursor SDK 会话生命周期：durable 复用 agent；stateless 为今日每请求新建。 */
@@ -343,7 +376,19 @@ export interface CursorRunRequest {
   mode?: AgentMode;
   /** 本次请求解析后的 Cursor client-type（sdk / sand）。由 KeyRotatingRunner 按 key 设置写入。 */
   clientType?: CursorClientType;
+  /**
+   * 本次请求走哪条 provider。由 server 在建请求时按 header / 模型前缀 / key 设置选定，
+   * 交给 ProviderRoutingRunner 分发。缺省即 SDK 路线，行为与改造前一致。
+   */
+  provider?: GatewayProvider;
+  /** 入站原始请求体，仅 Connect 路线用来做结构化解析（SDK 路线拿不到也用不上）。 */
+  rawBody?: unknown;
+  /** 入站协议，供 Connect 路线选择结构化解析器。 */
+  inboundProtocol?: "openai-chat" | "openai-responses" | "anthropic";
 }
+
+/** 两条推理路线：SDK（@cursor/sdk）与 Connect（aiserver.v1.InferenceService/Stream）。 */
+export type GatewayProvider = "sdk" | "connect";
 
 export interface CursorRunResult {
   text: string;

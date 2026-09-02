@@ -36,6 +36,10 @@ import {
 } from "./sdk-network.js";
 import { createApp } from "./server.js";
 import { SqliteStateStore } from "./store.js";
+import { BackgroundWorker } from "./cursor-connect/background-worker.js";
+import { ProviderRoutingRunner } from "./cursor-connect/routing-runner.js";
+import { CursorConnectService, connectSettings, seedConnectCredential } from "./cursor-connect/service.js";
+import { CursorConnectStore } from "./cursor-connect/store.js";
 
 // 必须在任何 import("@cursor/sdk") 之前挂上 loader，否则硬编码的 client-type 头无法按请求改写。
 installSandClientHeaderHook();
@@ -160,11 +164,47 @@ const sdkRunner = new CursorSdkRunner(store, {
   getModelCatalog: getModelCatalogEntry,
   sessionHub
 });
-const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
+const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
   maxKeyAttempts: config.maxKeyAttempts,
   maxTransientAttempts: config.maxTransientAttempts,
   resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
 });
+
+/*
+ * Cursor Connect 路线（aiserver.v1.InferenceService/Stream）。
+ *
+ * 与 SDK 路线彻底并列：自己的凭据表（cc_credentials）、自己的目录缓存、自己的 transport。
+ * 一条路线的 key、重试和错误污染不到另一条——`ProviderRoutingRunner` 只按
+ * `CursorRunRequest.provider` 分发，选路结果由 server.ts 在建请求时定好。
+ *
+ * 库共用同一个 SQLite 文件，但表名一律 `cc_` 前缀，且 `src/store.ts` 一行没动。
+ */
+const connectStore = CursorConnectStore.open(config.sqlitePath);
+seedConnectCredential(connectStore, config);
+const connect = new CursorConnectService({ store: connectStore, config });
+if (connect.status().available) {
+  console.log(`Cursor Connect: ${connect.status().activeCredentials} credential(s) ready, base=${connectSettings(config).baseUrl}`);
+} else {
+  console.log(`Cursor Connect: inactive (${connect.status().reason ?? "未配置"})`);
+}
+
+// background worker 只在显式打开时启动：它会自己取 lease 跑 queued 的 run，
+// 没有对外端点在用的时候白跑一圈没意义。
+const connectWorker = connectSettings(config).background
+  ? new BackgroundWorker({
+      store: connectStore,
+      execute: async (run) => {
+        // 目前 background run 的实际推理由 tool-results 端点驱动的重新入队承担；
+        // worker 负责的是把状态从 queued 推进到有人接手，以及崩溃后的接管。
+        console.log(`[cursor-connect] worker picked run ${run.id} (attempt ${run.attempt})`);
+        return { status: "awaiting_tool" };
+      },
+      onEvent: (event) => connect.publish(event)
+    })
+  : undefined;
+connectWorker?.start();
+
+const runner = new ProviderRoutingRunner({ sdk: sdkRoute, connect });
 
 /*
  * 金额是 Cursor 服务端算的、最终一致的：run 刚结束时往往还查不到，
@@ -185,6 +225,7 @@ const app = createApp({
   keyPool,
   gatewayKeyPool,
   usageReconciler,
+  connect,
   startedAt: Date.now()
 });
 
@@ -262,6 +303,9 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
         });
       }
       await executorLeases.releaseAll();
+      // 关停 Connect worker 不是失败：它会把在途 run 放回 queued，重启后接着跑。
+      await connectWorker?.stop();
+      connectStore.close();
       process.exit(0);
     })();
   });

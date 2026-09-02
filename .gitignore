@@ -1,5 +1,7 @@
 node_modules
 dist
+# 历史遗留的另一份编译产物目录，与 dist 同类
+dist-wp5
 .wrangler
 .dev.vars
 .env

@@ -2,6 +2,9 @@ import { Readable } from "node:stream";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { registerAdminRoutes } from "./admin.js";
 import { authenticate, explicitSessionId, extractToken, sessionAffinity } from "./auth.js";
+import { registerConnectRoutes } from "./cursor-connect/routes.js";
+import { selectProvider } from "./cursor-connect/router.js";
+import type { CursorConnectService } from "./cursor-connect/service.js";
 import {
   anthropicError,
   anthropicErrorType,
@@ -97,6 +100,11 @@ export interface AppDeps {
   startedAt?: number;
   /** 模型列表来源，默认走 Cursor SDK（测试时可注入桩）。 */
   modelLister?: ModelLister;
+  /**
+   * Cursor Connect 路线。没配凭据时不提供，此时选路一律回落 SDK，
+   * `/v1/cursor-connect/*` 与后台的 Connect 面板会明确报「未配置」而不是静默 404。
+   */
+  connect?: CursorConnectService;
   /** SDK 网络配置应用器，测试时可注入桩以避免加载真实 SDK。 */
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
 }
@@ -357,6 +365,14 @@ export function createApp(deps: AppDeps): FastifyInstance {
   });
 
   registerAdminRoutes(app, deps);
+  registerConnectRoutes(app, {
+    ...(deps.connect ? { connect: deps.connect, store: deps.connect.store } : {}),
+    // 与主 API 共用同一套入站鉴权，不给 Connect 端点开后门。
+    authorize: (request) => {
+      authFor(deps, request);
+    },
+    ...(deps.connect ? { subscribe: (runId, listener) => deps.connect!.subscribe(runId, listener) } : {})
+  });
 
   return app;
 }
@@ -716,6 +732,14 @@ function loggedRunRequest(
   }
 ): CursorRunRequest {
   const stickyKey = stickyKeyFor(input.request, input.auth, input.conversationSeed);
+  // 选路只在这一处发生：三套对外协议都经过 loggedRunRequest，
+  // 分散到各 handler 会让「哪条规则命中的」再也说不清。
+  const selection = selectProvider({
+    headers: input.request.headers as Record<string, string | string[] | undefined>,
+    model: input.prepared.model,
+    defaultProvider: deps.config.defaultProvider,
+    connectAvailable: deps.connect?.available === true
+  });
   const run: CursorRunRequest = {
     ...toRunRequest({
       prepared: input.prepared,
@@ -733,13 +757,26 @@ function loggedRunRequest(
     ...(input.auth.modelScope ? { gatewayModelScope: input.auth.modelScope } : {}),
     ...(stickyKey ? { stickyKey } : {}),
     ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
-    ...(input.durableTurn ? { durableTurn: input.durableTurn } : {})
+    ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
+    provider: selection.provider,
+    // `connect/xxx` 只是选路命名空间，不是模型名的一部分。
+    ...(selection.model && selection.model !== input.prepared.model ? { model: selection.model } : {}),
+    // Connect 路线要用结构化 system；SDK 路线拿不到也用不上这两个字段。
+    ...(selection.provider === "connect"
+      ? { rawBody: input.request.body, inboundProtocol: inboundProtocolOf(input.protocol) }
+      : {})
   };
   log.reasoningEffort = run.reasoningEffort;
   log.maxMode = run.maxMode;
   log.fast = run.fast;
   log.agentMode = run.mode;
   return run;
+}
+
+/** `ProtocolKind` → Connect 侧结构化解析器要的入站协议名。 */
+function inboundProtocolOf(protocol: CursorRunRequest["protocol"]): "openai-chat" | "openai-responses" | "anthropic" {
+  if (protocol === "anthropic-messages") return "anthropic";
+  return protocol === "openai-responses" ? "openai-responses" : "openai-chat";
 }
 
 /**

@@ -1,7 +1,16 @@
+import { DEFAULT_CONNECT_BASE_URL } from "./cursor-connect/client.js";
+import { DEFAULT_READ_MAX_BYTES } from "./cursor-connect/envelope.js";
 import { DEFAULT_AUTO_DISABLE_THRESHOLD } from "./key-pool.js";
 import { parseModelParamsSpec } from "./model-params.js";
 import { DEFAULT_REQUEST_LOG_KEEP } from "./store.js";
-import type { AgentMode, CursorSdkSessionMode, GatewayConfig, RoutingStrategy, SystemPromptMode } from "./types.js";
+import type {
+  AgentMode,
+  CursorSdkSessionMode,
+  GatewayConfig,
+  GatewayProvider,
+  RoutingStrategy,
+  SystemPromptMode
+} from "./types.js";
 
 /** 挂起工具 execute 的默认等待（15min）。env: CURSOR_SDK_TOOL_HOLD_TTL_MS。 */
 export const DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS = 900_000;
@@ -52,8 +61,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     sessionAffinityTtlMs: integerValue(env.SESSION_AFFINITY_TTL_MS, 60 * 60 * 1000),
     proxyUrl: optionalString(env.PROXY_URL),
     systemPromptMode: parseSystemPromptMode(env.SYSTEM_PROMPT_MODE),
-    systemPrompt: optionalString(env.SYSTEM_PROMPT)
+    systemPrompt: optionalString(env.SYSTEM_PROMPT),
+
+    // Connect 路线。默认全关 / 全保守：这条路线还没跑过真实流量，
+    // 默认接管流量或默认开工具都会让一次配置失误直接打到生产请求上。
+    defaultProvider: parseProvider(env.GATEWAY_PROVIDER),
+    connectBaseUrl: stringValue(env.CURSOR_CONNECT_BASE_URL, DEFAULT_CONNECT_BASE_URL),
+    connectCodec: env.CURSOR_CONNECT_CODEC?.trim().toLowerCase() === "json" ? "json" : "proto",
+    connectReadMaxBytes: integerValue(env.CURSOR_CONNECT_MAX_FRAME_BYTES, DEFAULT_READ_MAX_BYTES),
+    connectSendTools: booleanValue(env.CURSOR_CONNECT_SEND_TOOLS, false),
+    connectLocalTools: parseList(env.CURSOR_CONNECT_LOCAL_TOOLS),
+    connectSubagents: booleanValue(env.CURSOR_CONNECT_SUBAGENTS, false),
+    connectBackground: booleanValue(env.CURSOR_CONNECT_BACKGROUND, false),
+    connectSessionToken: optionalString(env.CURSOR_CONNECT_TOKEN),
+    connectMachineId: optionalString(env.CURSOR_CONNECT_MACHINE_ID),
+    connectClientVersion: stringValue(env.CURSOR_CONNECT_CLIENT_VERSION, DEFAULT_CONNECT_CLIENT_VERSION)
   };
+}
+
+/** 播种凭据的默认客户端版本。与本地 Cursor 一致，便于上游按版本识别。 */
+export const DEFAULT_CONNECT_CLIENT_VERSION = "3.18.9";
+
+function parseProvider(value: string | undefined): GatewayProvider {
+  return value?.trim().toLowerCase() === "connect" ? "connect" : "sdk";
+}
+
+function parseList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(/[,;\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 /**

@@ -1,7 +1,11 @@
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
 import { createCursorApiKey } from "./cursor-account.js";
+import { cursorTokenType } from "./cursor-connect/credentials.js";
+import { CursorConnectService, connectSettings } from "./cursor-connect/service.js";
+import type { CcCredential } from "./cursor-connect/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { GatewayKeyPool } from "./gateway-key-pool.js";
 import {
@@ -383,6 +387,158 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return testProxy(raw);
   });
 
+  /* ------------------------------------------------ Cursor Connect 路线 */
+
+  /**
+   * Connect 面板的总览。
+   * 凭据一律**不回传 token**：只给出形状提示，后台能认出是哪一把、但拿不到明文。
+   */
+  app.get("/admin/api/connect", async (request) => {
+    requireAdmin(request, deps);
+    const settings = connectSettings(deps.config);
+    if (!deps.connect) {
+      return { enabled: false, settings, status: { available: false, reason: "网关未装载 Connect 路线" }, credentials: [] };
+    }
+    return {
+      enabled: true,
+      settings,
+      status: deps.connect.status(),
+      credentials: deps.connect.store.listCredentials().map(publicCredential)
+    };
+  });
+
+  app.post("/admin/api/connect/credentials", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const body = objectBody(request.body);
+    const token = typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
+    if (!token) {
+      throw new ApiError("sessionToken is required.", 400, "invalid_request_error", "sessionToken");
+    }
+    // 浏览器登录态不能拿来调推理：本地就能判定的事不必等上游拒。
+    if (cursorTokenType(token) === "web") {
+      throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
+    }
+    const record = connect.store.upsertCredential({
+      sessionToken: token,
+      label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined,
+      // machineId 生命周期内不可变：不给就生成一把并持久化，绝不每次请求随机。
+      machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : randomUUID(),
+      macMachineId: stringParam(body.macMachineId),
+      clientVersion: stringParam(body.clientVersion) ?? connectSettings(deps.config).clientVersion,
+      clientOs: stringParam(body.clientOs) ?? process.platform,
+      clientArch: stringParam(body.clientArch) ?? process.arch,
+      deviceType: stringParam(body.deviceType) ?? "desktop",
+      timezone: stringParam(body.timezone),
+      allowedModels: optionalStringArray(body.allowed, "allowed"),
+      excludedModels: optionalStringArray(body.excluded, "excluded")
+    });
+    return { credential: publicCredential(record) };
+  });
+
+  app.post("/admin/api/connect/credentials/:id", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const id = keyId(request);
+    const existing = connect.store.credential(id);
+    if (!existing) throw new ApiError("Credential not found.", 404, "not_found");
+    const body = objectBody(request.body);
+    const token = typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
+    if (token && cursorTokenType(token) === "web") {
+      throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
+    }
+    const record = connect.store.upsertCredential({
+      id,
+      ...(token ? { sessionToken: token } : {}),
+      label: stringParam(body.label),
+      machineId: stringParam(body.machineId) ?? existing.machineId,
+      macMachineId: stringParam(body.macMachineId),
+      clientVersion: stringParam(body.clientVersion) ?? existing.clientVersion,
+      clientOs: stringParam(body.clientOs),
+      clientArch: stringParam(body.clientArch),
+      deviceType: stringParam(body.deviceType),
+      timezone: stringParam(body.timezone),
+      allowedModels: optionalStringArray(body.allowed, "allowed"),
+      excludedModels: optionalStringArray(body.excluded, "excluded")
+    });
+    return { credential: publicCredential(record) };
+  });
+
+  app.post("/admin/api/connect/credentials/:id/enable", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    connect.store.setCredentialStatus(keyId(request), "active");
+    return { credential: publicCredential(connect.store.credential(keyId(request))!) };
+  });
+
+  app.post("/admin/api/connect/credentials/:id/disable", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    connect.store.setCredentialStatus(keyId(request), "disabled");
+    return { credential: publicCredential(connect.store.credential(keyId(request))!) };
+  });
+
+  app.delete("/admin/api/connect/credentials/:id", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    if (!connect.store.deleteCredential(keyId(request))) {
+      throw new ApiError("Credential not found.", 404, "not_found");
+    }
+    return { deleted: true };
+  });
+
+  /** 连通性测试：真打一次 AvailableModels，成功回目录规模，失败原样把上游错误交回后台。 */
+  app.post("/admin/api/connect/credentials/:id/test", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const startedAt = Date.now();
+    try {
+      const result = await connect.testCredential(keyId(request));
+      return { ...result, durationMs: Date.now() - startedAt };
+    } catch (error) {
+      const api = normalizeError(error);
+      return { ok: false, status: api.statusCode, error: api.message, durationMs: Date.now() - startedAt };
+    }
+  });
+
+  app.get("/admin/api/connect/models", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const refresh = (request.query as { refresh?: string } | undefined)?.refresh === "true";
+    return { models: await connect.listModels(refresh) };
+  });
+
+  app.get("/admin/api/connect/runs", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const limit = positiveInt((request.query as { limit?: string } | undefined)?.limit) ?? 50;
+    return { runs: connect.store.listRuns({ limit }) };
+  });
+
+  app.get("/admin/api/connect/runs/:id", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const id = keyId(request);
+    const run = connect.store.run(id);
+    if (!run) throw new ApiError("Run not found.", 404, "not_found");
+    return {
+      run,
+      toolCalls: connect.store.toolCalls(id),
+      tasks: connect.store.tasksForRun(id),
+      events: connect.store.eventsAfter(id, 0, 200)
+    };
+  });
+
+  app.post("/admin/api/connect/runs/:id/cancel", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const id = keyId(request);
+    const run = connect.store.run(id);
+    if (!run) throw new ApiError("Run not found.", 404, "not_found");
+    connect.store.releaseRunLease(id, "cancelled");
+    return { run: connect.store.run(id) };
+  });
+
   app.get("/admin/api/keys", async (request) => {
     requireAdmin(request, deps);
     const keys = await deps.keyPool.list();
@@ -705,6 +861,48 @@ function requireAdmin(request: FastifyRequest, deps: AppDeps): void {
 }
 
 /** 多密钥入站没接上时所有 gateway-keys 接口都得直接 503，否则 UI 会以为写进去了其实根本没池。 */
+function requireConnect(deps: AppDeps): CursorConnectService {
+  if (!deps.connect) {
+    throw new ApiError("这个网关没有装载 Cursor Connect 路线。", 503, "provider_unavailable");
+  }
+  return deps.connect;
+}
+
+/**
+ * 凭据的对外形状。**绝不回传 token**：后台只需要认出是哪一把，
+ * 而一个能读回明文的接口等于把库里的凭据搬到了浏览器里。
+ */
+function publicCredential(record: CcCredential): Record<string, unknown> {
+  return {
+    id: record.id,
+    label: record.label ?? null,
+    tokenType: record.tokenType ?? "unknown",
+    tokenHint: tokenHint(record.sessionToken),
+    machineId: maskTail(record.machineId),
+    hasMacMachineId: Boolean(record.macMachineId),
+    clientVersion: record.clientVersion,
+    clientOs: record.clientOs ?? null,
+    clientArch: record.clientArch ?? null,
+    status: record.status,
+    allowed: record.allowedModels ?? [],
+    excluded: record.excludedModels ?? [],
+    failureCount: record.failureCount,
+    lastUsedAt: record.lastUsedAt ?? null,
+    lastError: record.lastError ?? null,
+    createdAt: record.createdAt
+  };
+}
+
+/** 只给长度与首尾各几位，够运维认出是哪一把，不够任何人拿去用。 */
+function tokenHint(token: string): string {
+  if (token.length <= 12) return `***(${token.length})`;
+  return `${token.slice(0, 4)}…${token.slice(-4)}(${token.length})`;
+}
+
+function maskTail(value: string): string {
+  return value.length <= 8 ? "***" : `${value.slice(0, 8)}…`;
+}
+
 function requireGatewayKeyPool(deps: AppDeps): GatewayKeyPool {
   if (!deps.gatewayKeyPool) {
     throw new ApiError("Gateway multi-key mode is not configured.", 503, "gateway_keys_unavailable");

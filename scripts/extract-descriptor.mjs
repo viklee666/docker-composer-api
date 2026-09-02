@@ -1,0 +1,287 @@
+/**
+ * 从 Cursor 的 agent-host bundle 里抽出一个 protobuf descriptor 子图，写成
+ * `docs/reference/` 下的参考文件。协议字段只能从这里来，不能猜、不能外查。
+ *
+ *   node scripts/extract-descriptor.mjs <bundle.js> <RootTypeName> [...more roots] --out <file>
+ *
+ * 三件事让结果可信：
+ *
+ * 1. **按 webpack 模块分域**。压缩后的局部变量名（`go`、`To`、`W`…）在同一个 bundle 的
+ *    不同模块里会重复；全文件建索引会让 `T:go` 解析到另一个模块的同名变量，
+ *    生成出来的字段号看着像模像样、其实是别的消息。
+ * 2. **跟随跨模块引用**。`T:g.SRo` 表示"从 `n(<id>)` 导入的模块里名为 `SRo` 的导出"，
+ *    要顺着 `n.d(t,{SRo:()=>X})` 的导出表找到那个模块里的局部变量再继续。
+ * 3. **只导出可达闭包**。从根类型沿字段引用走，既不漏嵌套消息，也不把整个 aiserver.v1 拖进来。
+ */
+import { readFileSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+
+const args = process.argv.slice(2);
+const outIndex = args.indexOf("--out");
+if (outIndex < 0 || args.length < 3) {
+  console.error("usage: node scripts/extract-descriptor.mjs <bundle.js> <Root> [...] --out <file>");
+  process.exit(2);
+}
+const bundlePath = args[0];
+const roots = args.slice(1, outIndex);
+const outPath = args[outIndex + 1];
+/* ------------------------------------------------ webpack 模块切分 */
+
+/**
+ * moduleId → 模块体（含最外层花括号）。
+ *
+ * 要扫**整个 chunk 目录**而不只是入口那个文件：webpack 把模块拆在多个 chunk 里，
+ * 跨模块引用经常指向另一个 `.js`。只扫一个文件时会在 `module 69584 not found` 上停住。
+ */
+const modules = new Map();
+for (const file of readdirSync(dirname(bundlePath)).filter((name) => name.endsWith(".js"))) {
+  const text = readFileSync(join(dirname(bundlePath), file), "utf8");
+  for (const match of text.matchAll(/(\d+):\((?:\w+(?:,\w+)*)?\)=>\{/g)) {
+    if (modules.has(match[1])) continue;
+    const braceAt = match.index + match[0].length - 1;
+    try {
+      modules.set(match[1], readBalanced(text, braceAt, "{", "}"));
+    } catch {
+      // 不配平的候选不是真模块头，跳过。
+    }
+  }
+}
+
+/** 每个模块的索引都是惰性建的：整个 bundle 有上千个模块，全建太慢也没必要。 */
+const indexCache = new Map();
+
+function indexOf(moduleId) {
+  const cached = indexCache.get(moduleId);
+  if (cached) return cached;
+  const body = modules.get(moduleId);
+  if (!body) throw new Error(`webpack module ${moduleId} not found`);
+
+  const byLocal = new Map();
+  const byTypeName = new Map();
+  const header = /([\w$]+)\.runtime=(\w+)\.proto3,\1\.typeName="([^"]+)",\1\.fields=\2\.proto3\.util\.newFieldList\(\(\)=>/g;
+  for (const match of body.matchAll(header)) {
+    const [, local, , typeName] = match;
+    const at = match.index + match[0].length;
+    const entry = {
+      moduleId,
+      local,
+      typeName,
+      fieldsText: readBalanced(body, at, "[", "]"),
+      classText: readClass(body, local)
+    };
+    byLocal.set(local, entry);
+    byTypeName.set(typeName, entry);
+  }
+
+  const enumByLocal = new Map();
+  for (const match of body.matchAll(/(\w+)\.proto3\.util\.setEnumType\(([\w$]+),"([^"]+)",(\[[^\]]*\])\)/g)) {
+    const [, , local, typeName, values] = match;
+    enumByLocal.set(local, { moduleId, local, typeName, values, iife: readEnumIife(body, local) });
+  }
+
+  // `a=n(36038)` 形式的导入绑定：本地名 → 被导入的模块 id。
+  const imports = new Map();
+  for (const match of body.matchAll(/([\w$]+)\s*=\s*\w+\((\d+)\)/g)) imports.set(match[1], match[2]);
+
+  // `n.d(t,{SRo:()=>X,...})` 的导出表：导出名 → 本模块局部变量。
+  const exports = new Map();
+  for (const block of body.matchAll(/\w+\.d\(\w+,\{([^}]*)\}\)/g)) {
+    for (const pair of block[1].matchAll(/([\w$]+):\(\)=>([\w$]+)/g)) exports.set(pair[1], pair[2]);
+  }
+
+  const index = { moduleId, byLocal, byTypeName, enumByLocal, imports, exports };
+  indexCache.set(moduleId, index);
+  return index;
+}
+
+function moduleIdContaining(typeName) {
+  for (const [id, body] of modules) {
+    if (body.includes(`typeName="${typeName}"`)) return id;
+  }
+  throw new Error(`root type not found in any webpack module: ${typeName}`);
+}
+
+/* -------------------------------------------------- 可达性闭包 */
+
+const wantedMessages = new Map();
+const wantedEnums = new Map();
+const queue = [];
+/** 局部名同名不同模块时加后缀区分。声明在输出之前，否则输出段会撞 TDZ。 */
+const localNames = new Map();
+
+for (const root of roots) {
+  const id = moduleIdContaining(root);
+  const entry = indexOf(id).byTypeName.get(root);
+  if (!entry) throw new Error(`root ${root} is in module ${id} but has no field list`);
+  console.log(`root ${root} -> webpack module ${id}`);
+  queue.push(entry);
+}
+
+while (queue.length) {
+  const entry = queue.shift();
+  if (wantedMessages.has(entry.typeName)) continue;
+  wantedMessages.set(entry.typeName, entry);
+
+  for (const ref of referencedLocals(entry.fieldsText)) {
+    const resolved = resolveRef(entry.moduleId, ref);
+    if (!resolved) continue;
+    if (ref.kind === "enum") wantedEnums.set(resolved.typeName, resolved);
+    else if (!wantedMessages.has(resolved.typeName)) queue.push(resolved);
+  }
+}
+
+/* -------------------------------------------------- 输出 */
+
+const chunks = [
+  // 只记文件名，不记绝对路径：抽取机器的安装布局没必要跟着进仓库。
+  `// Extracted from Cursor agent-host bundle ${basename(bundlePath)}`,
+  `// roots: ${roots.join(", ")}`,
+  `// ${wantedMessages.size} messages, ${wantedEnums.size} enums (reachability closure over field references)`,
+  "// Generated by scripts/extract-descriptor.mjs -- do not edit by hand.",
+  ""
+];
+// 先把所有名字定下来再输出：不同模块里同名的局部变量（两个 `lo`）会在导出文件里撞成一个，
+// 后果是某个消息拿到别人的构造函数与字段表。
+for (const entry of [...wantedEnums.values(), ...wantedMessages.values()]) localNameFor(entry);
+
+for (const entry of [...wantedEnums.values()].sort(byName)) {
+  const name = localNameFor(entry);
+  chunks.push(
+    `${renameLocal(entry.iife, entry.local, name)};a.proto3.util.setEnumType(${name},"${entry.typeName}",${entry.values});`
+  );
+}
+for (const entry of [...wantedMessages.values()].sort(byName)) {
+  const name = localNameFor(entry);
+  const classText = normalizeNamespace(renameLocal(entry.classText, entry.local, name));
+  const fields = normalizeNamespace(renameLocal(rewriteRefs(entry), entry.local, name));
+  chunks.push(
+    `${classText}${name}.runtime=a.proto3,${name}.typeName="${entry.typeName}",${name}.fields=a.proto3.util.newFieldList(()=>${fields});`
+  );
+}
+
+mkdirSync(dirname(resolve(outPath)), { recursive: true });
+writeFileSync(outPath, `${chunks.join("\n")}\n`, "utf8");
+console.log(`wrote ${outPath}: ${wantedMessages.size} messages / ${wantedEnums.size} enums`);
+
+/* -------------------------------------------------- helpers */
+
+function byName(a, b) {
+  return a.typeName < b.typeName ? -1 : a.typeName > b.typeName ? 1 : 0;
+}
+
+/**
+ * 跨模块引用在导出的参考文件里必须改写成本地名，否则下游生成器看到的是
+ * `g.SRo` 这种在文件里根本不存在的绑定。局部名冲突时给个带模块 id 的后缀。
+ */
+function rewriteRefs(entry) {
+  let text = entry.fieldsText;
+  for (const ref of referencedLocals(entry.fieldsText)) {
+    if (!ref.qualified) continue;
+    const resolved = resolveRef(entry.moduleId, ref);
+    if (!resolved) continue;
+    text = text.split(ref.raw).join(localNameFor(resolved));
+  }
+  return text;
+}
+
+function localNameFor(entry) {
+  const key = `${entry.moduleId}\u0000${entry.local}`;
+  const existing = localNames.get(key);
+  if (existing) return existing;
+  const taken = new Set(localNames.values());
+  let name = entry.local;
+  let suffix = 0;
+  while (taken.has(name)) name = suffix++ === 0 ? `${entry.local}_${entry.moduleId}` : `${entry.local}_${entry.moduleId}_${suffix}`;
+  localNames.set(key, name);
+  return name;
+}
+
+/** 只替换独立标识符，不碰 `foo.local` 这类属性名和更长的标识符。 */
+function renameLocal(text, from, to) {
+  if (!text || from === to) return text;
+  return text.replace(new RegExp(`(?<![\\w$.])${escapeRe(from)}(?![\\w$])`, "g"), to);
+}
+
+/**
+ * 各模块给 protobuf 运行时起的别名不同（`a.proto3` / `_.proto3` / `r.proto3`）。
+ * 导出文件里必须统一成 `a.`，否则下游生成器按 `a.proto3.util.initPartial` 找构造函数边界时
+ * 会跳过本类、一路匹配到后面某个类，把别人的零值算到这个消息头上。
+ */
+function normalizeNamespace(text) {
+  if (!text) return text;
+  return text
+    .replace(/(?<![\w$.])[\w$]+\.proto3\./g, "a.proto3.")
+    .replace(/(?<![\w$.])[\w$]+\.(Message|Struct|Value|ListValue|protoInt64)\b/g, "a.$1");
+}
+
+function resolveRef(moduleId, ref) {
+  const index = indexOf(moduleId);
+  if (!ref.qualified) {
+    return ref.kind === "enum" ? index.enumByLocal.get(ref.local) : index.byLocal.get(ref.local);
+  }
+  const importedId = index.imports.get(ref.namespace);
+  if (!importedId) return undefined;
+  const target = indexOf(importedId);
+  const local = target.exports.get(ref.local) ?? ref.local;
+  return ref.kind === "enum" ? target.enumByLocal.get(local) : target.byLocal.get(local);
+}
+
+/** 从字段列表文本里挑出被引用的局部变量（message / enum / map value）。 */
+function referencedLocals(fieldsText) {
+  const refs = [];
+  const push = (kind, raw) => {
+    // `a.Struct` / `a.Value` 是 protobuf-es 的 well-known 类型，不是本 bundle 的消息。
+    if (/^\w+\.(Struct|Value|ListValue|Timestamp|Duration|Any|Empty)$/.test(raw)) return;
+    const dot = raw.indexOf(".");
+    refs.push(
+      dot < 0
+        ? { kind, raw, local: raw, qualified: false }
+        : { kind, raw, namespace: raw.slice(0, dot), local: raw.slice(dot + 1), qualified: true }
+    );
+  };
+  for (const match of fieldsText.matchAll(/kind:"enum",T:[\w$]+\.proto3\.getEnumType\(([\w$.]+)\)/g)) push("enum", match[1]);
+  for (const match of fieldsText.matchAll(/kind:"message",T:([\w$.]+)/g)) push("message", match[1]);
+  for (const _ of fieldsText.matchAll(/kind:"message",T[,}]/g)) push("message", "T");
+  for (const match of fieldsText.matchAll(/V:\{kind:"message",T:([\w$.]+)\}/g)) push("message", match[1]);
+  return refs;
+}
+
+function readClass(text, local) {
+  const marker = new RegExp(`class ${escapeRe(local)} extends \\w+\\.Message\\{`);
+  const found = marker.exec(text);
+  if (!found) return "";
+  return `class ${local} extends a.Message${readBalanced(text, found.index + found[0].length - 1, "{", "}")}`;
+}
+
+function readEnumIife(text, local) {
+  const marker = new RegExp(
+    `function\\(e\\)\\{((?:e\\[e\\.\\w+=\\d+\\]="\\w+",?)+)\\}\\(${escapeRe(local)}\\|\\|\\(${escapeRe(local)}=\\{\\}\\)\\)`
+  );
+  const found = marker.exec(text);
+  return found ? `!${found[0]}` : "";
+}
+
+function escapeRe(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function readBalanced(text, at, open, close) {
+  if (text[at] !== open) throw new Error(`expected ${open} at ${at}, saw ${text[at]}`);
+  let depth = 0;
+  let quote = "";
+  for (let i = at; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return text.slice(at, i + 1);
+    }
+  }
+  throw new Error(`unbalanced ${open} from ${at}`);
+}
