@@ -341,8 +341,17 @@ export interface CursorRunRequest {
   /**
    * 本段对话的稳定种子（显式会话头 / Responses 继承 / conversationSeed(body)）。
    * 与 stickyKey 同源，但不带 ownerHash 前缀；无识别身份时不要填。
+   * 有值不代表一定进 SessionHub：Hub 复用还要看 reuseDurableAgent。
    */
   conversationSeed?: string;
+  /**
+   * 是否把本请求送进 SessionHub 复用本地 Agent。
+   * false：即使有 conversationSeed / stickyKey 也走 stateless（create + 全文）。
+   * Chat / Messages 只靠 system+首条 user 哈希认「同一段对话」会把互不相干的外部请求
+   * 撞进同一把锁，前一个还在跑时后一个排队，客户端一断就是日志里的 499。
+   * 未设时保持旧行为（有 seed/sticky 就进 Hub），给直接调 runner 的单测用。
+   */
+  reuseDurableAgent?: boolean;
   /**
    * durable 路径的本轮增量。由 server 从入站 body 算出后传入；rawBody 本身不进 runner。
    */

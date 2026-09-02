@@ -130,7 +130,8 @@ export class CursorSdkRunner implements CursorRunner {
       }
       const hub = this.input.sessionHub;
       // durableSessionId 必须在 KeyRotatingRunner 注入 apiKey 之后算，空 key 会撞槽。
-      const durableId = hub ? durableSessionId({
+      // reuseDurableAgent === false：seed 只给 key 粘性，不进 Hub（见 server canReuseDurableAgent）。
+      const durableId = hub && input.reuseDurableAgent !== false ? durableSessionId({
         apiKey: input.apiKey,
         model: input.model,
         workingDirectory: input.workingDirectory || this.input.defaultWorkingDirectory,
@@ -243,13 +244,16 @@ export class CursorSdkRunner implements CursorRunner {
     try {
       yield* this.runDurableLocked(hub, sessionId, input, signal);
     } finally {
-      const slot = hub.get(sessionId);
-      if (slot?.state === "running" && slot.pending.size > 0) {
-        hub.beginAwaitingTools(sessionId);
-      } else if (slot?.state === "running") {
-        await this.dropDurableSession(hub, sessionId).catch(() => undefined);
+      try {
+        const slot = hub.get(sessionId);
+        if (slot?.state === "running" && slot.pending.size > 0) {
+          hub.beginAwaitingTools(sessionId);
+        } else if (slot?.state === "running") {
+          await this.dropDurableSession(hub, sessionId).catch(() => undefined);
+        }
+      } finally {
+        release();
       }
-      release();
     }
   }
 

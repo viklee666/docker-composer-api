@@ -185,11 +185,15 @@ function modelConfigFrom(input: CursorRunRequest): ConnectConversation["modelCon
 /**
  * 同一段对话要发同一个 `conversation_id`，否则上游每轮都当新对话（prompt 缓存也就没了）。
  *
- * 身份沿用 `durableIdentity`：它只认显式会话头 / conversationSeed / stickyKey，
- * 明确拒绝拿 ownerHash 或裸 sessionKey 兜底——那会把整个网关的请求并成一段对话。
- * 认不出身份就每次新开一段，这比错误合并安全。
+ * 身份沿用 `durableIdentity`，但必须再看 `reuseDurableAgent`：Chat / Messages 只靠
+ * system+首条 user 哈希认「同一段对话」时，server 会把该位置 false。
+ * 此时若仍用 seed 当 conversation_id，互不相干的外部请求会在上游挤进同一段对话，
+ * 并发 Stream 被标成 canceled → 网关日志 499。后台联通性测试没有 seed，每次新 UUID，所以测得通。
+ *
+ * 认不出身份、或明确不复用时，每次新开一段。禁止拿 ownerHash / 裸 sessionKey 兜底。
  */
 export function conversationIdFor(input: CursorRunRequest): string {
+  if (input.reuseDurableAgent === false) return randomUUID();
   const identity = durableIdentity({
     conversationSeed: input.conversationSeed,
     stickyKey: input.stickyKey

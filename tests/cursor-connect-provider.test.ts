@@ -820,6 +820,24 @@ test("conversation_id is stable per conversation seed and never merges unrelated
   assert.notEqual(conversationIdFor(anonymous), conversationIdFor(anonymous));
 });
 
+test("reuseDurableAgent false does not reuse conversation_id even with the same seed", () => {
+  const first = conversationIdFor(runRequest({
+    conversationSeed: "same-hello-hash",
+    stickyKey: "owner:same-hello-hash",
+    reuseDurableAgent: false
+  }));
+  const second = conversationIdFor(runRequest({
+    conversationSeed: "same-hello-hash",
+    stickyKey: "owner:same-hello-hash",
+    reuseDurableAgent: false
+  }));
+  assert.notEqual(first, second);
+  assert.notEqual(
+    first,
+    conversationIdFor(runRequest({ conversationSeed: "same-hello-hash", stickyKey: "owner:same-hello-hash" }))
+  );
+});
+
 test("the caller's AbortSignal reaches fetch and surfaces as 499", async () => {
   const controller = new AbortController();
   let sawSignal: AbortSignal | undefined;

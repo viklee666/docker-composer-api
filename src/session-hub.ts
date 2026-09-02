@@ -4,6 +4,7 @@ import {
   DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS,
   DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS
 } from "./config.js";
+import { ApiError } from "./errors.js";
 
 /**
  * 第一次 execute 之后排空并行工具的窗口。先 queueMicrotask，再等本常量毫秒（含 0ms）。
@@ -12,6 +13,9 @@ import {
 export const PARALLEL_TOOL_SETTLE_MS = 25;
 
 export const TOOL_HOLD_EXPIRED_LOG = "[session-hub] tool hold expired";
+
+/** cancel/dispose 挂死不能把 Hub 互斥锁卡住：后一个同会话请求会一直排队直到客户端断连（499）。 */
+const RECYCLE_CLEANUP_MS = 5_000;
 
 export type SessionSlotState = "running" | "awaiting_tools" | "idle" | "dead";
 
@@ -99,6 +103,8 @@ export interface SessionHubOptions {
   idleTtlMs?: number;
   maxLiveSessions?: number;
   parallelToolSettleMs?: number;
+  /** cancel/dispose 上限；单测可缩短。 */
+  recycleCleanupMs?: number;
   store?: SessionHubStore;
   /** 注入时钟；提供时不挂真实 hold setTimeout，单测用 sweep() 过期。 */
   now?: () => number;
@@ -279,6 +285,7 @@ export class SessionHub {
   readonly idleTtlMs: number;
   readonly maxLiveSessions: number;
   readonly parallelToolSettleMs: number;
+  readonly recycleCleanupMs: number;
 
   private readonly store: SessionHubStore | undefined;
   private readonly nowFn: () => number;
@@ -293,6 +300,7 @@ export class SessionHub {
     this.idleTtlMs = positiveBound(options.idleTtlMs, DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS);
     this.maxLiveSessions = positiveBound(options.maxLiveSessions, DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS);
     this.parallelToolSettleMs = options.parallelToolSettleMs ?? PARALLEL_TOOL_SETTLE_MS;
+    this.recycleCleanupMs = positiveBound(options.recycleCleanupMs, RECYCLE_CLEANUP_MS);
     this.store = options.store;
     this.usesFakeClock = typeof options.now === "function";
     this.nowFn = options.now ?? Date.now;
@@ -549,11 +557,11 @@ export class SessionHub {
     }
     slot.pending.clear();
     try {
-      await slot.run?.cancel?.();
+      await withCleanupTimeout(slot.run?.cancel?.(), this.recycleCleanupMs);
     } catch {
       // best-effort
     }
-    await disposeHubAgent(slot.agent);
+    await withCleanupTimeout(disposeHubAgent(slot.agent), this.recycleCleanupMs);
     // Idle/hold/LRU drop must deleteSession so Agent.resume cannot revive a disposed agent.
     if (this.store) {
       try {
@@ -615,7 +623,24 @@ function recycleError(sessionId: string, reason: RecycleReason): Error {
 
 function abortError(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) return signal.reason;
-  return new Error("aborted");
+  return new ApiError("Request was aborted.", 499, "request_aborted");
+}
+
+function withCleanupTimeout(promise: Promise<unknown> | undefined, ms = RECYCLE_CLEANUP_MS): Promise<void> {
+  if (!promise) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(), ms);
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      }
+    );
+  });
 }
 
 function abortPromise(signal: AbortSignal): Promise<never> {

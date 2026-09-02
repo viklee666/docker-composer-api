@@ -836,6 +836,7 @@ function loggedRunRequest(
     ...(input.auth.modelScope ? { gatewayModelScope: input.auth.modelScope } : {}),
     ...(stickyKey ? { stickyKey } : {}),
     ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
+    reuseDurableAgent: canReuseDurableAgent(input.protocol, input.request, input.conversationSeed),
     ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
     provider: selection.provider,
     // `connect/xxx` 只是选路命名空间，不是模型名的一部分。
@@ -872,6 +873,23 @@ function stickyKeyFor(request: FastifyRequest, auth: AuthContext, seed?: string)
   const explicit = explicitSessionId(request);
   const identity = explicit ?? seed ?? conversationSeed(request.body);
   return identity ? `${auth.ownerHash}:${identity}` : undefined;
+}
+
+/**
+ * 本地 Agent 复用必须有「这段对话」的硬身份，不能用 system+首条 user 的哈希冒充。
+ * 那个哈希对 OpenAI Chat / Anthropic Messages 几乎每次都有值，互不相干的「hello」会挤进
+ * 同一把 Hub 锁；前一个 create/send 还没结束，后一个就卡在 acquire 上，客户端一断就是 499。
+ * 后台联通性测试 forceStateless，所以测得通、外部一打就 499。
+ *
+ * 允许进 Hub 的只有：显式会话头，或 Responses 链上网关自己签发的 previous_response_id / 落库 seed。
+ */
+function canReuseDurableAgent(
+  protocol: CursorRunRequest["protocol"],
+  request: FastifyRequest,
+  seed?: string
+): boolean {
+  if (explicitSessionId(request)) return true;
+  return protocol === "openai-responses" && Boolean(seed);
 }
 
 /**

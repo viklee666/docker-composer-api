@@ -388,6 +388,47 @@ test("unidentifiable session is true stateless: no resume persist even with Hub 
   await hub.dropAll();
 });
 
+test("inferred conversationSeed does not enter the Hub when reuseDurableAgent is false", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const store = new MemoryStateStore();
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-inferred-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    },
+    resume: async () => {
+      throw new Error("resume must not run when reuseDurableAgent is false");
+    }
+  };
+  const runner = durableRunner(hub, factory, store);
+  const flatten = "Conversation:\nUSER: hello";
+
+  await runner.run(baseRun({
+    prompt: flatten,
+    conversationSeed: "same-hello-hash",
+    stickyKey: "owner:same-hello-hash",
+    durableTurn: userTurn("hello"),
+    reuseDurableAgent: false
+  }));
+  await runner.run(baseRun({
+    prompt: flatten,
+    conversationSeed: "same-hello-hash",
+    stickyKey: "owner:same-hello-hash",
+    durableTurn: userTurn("hello"),
+    reuseDurableAgent: false
+  }));
+
+  assert.equal(created.length, 2);
+  assert.equal(store.sessions.size, 0);
+  assert.equal(hub.size, 0);
+  assert.equal(sendText(created[0].sends[0]), flatten);
+  assert.equal(created[0].disposed, true);
+  assert.equal(created[1].disposed, true);
+  await hub.dropAll();
+});
+
 test("durable path B: marker tool_call then tool_result is a short send, same agent", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const agent = new MarkerAgent();
@@ -484,6 +525,16 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   assert.equal(capture.last?.durableTurn?.userText, "hello chat");
   assert.ok(capture.last?.conversationSeed);
   assert.ok(capture.last?.stickyKey);
+  assert.equal(capture.last?.reuseDurableAgent, false);
+
+  const chatSession = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key", "x-session-affinity": "sess-chat-1" },
+    payload: { model: "composer-2.5", messages: [{ role: "user", content: "hello chat" }] }
+  });
+  assert.equal(chatSession.statusCode, 200);
+  assert.equal(capture.last?.reuseDurableAgent, true);
 
   const responses = await app.inject({
     method: "POST",
@@ -495,6 +546,7 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   assert.equal(capture.last?.durableTurn?.kind, "new_user");
   assert.equal(capture.last?.durableTurn?.userText, "hello responses");
   assert.ok(capture.last?.conversationSeed);
+  assert.equal(capture.last?.reuseDurableAgent, true);
 
   const messages = await app.inject({
     method: "POST",
@@ -506,6 +558,16 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   assert.equal(capture.last?.durableTurn?.kind, "new_user");
   assert.equal(capture.last?.durableTurn?.userText, "hello messages");
   assert.ok(capture.last?.conversationSeed);
+  assert.equal(capture.last?.reuseDurableAgent, false);
+
+  const messagesSession = await app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { "x-api-key": "gateway-key", "anthropic-session-id": "sess-msg-1" },
+    payload: { model: "composer-2.5", max_tokens: 64, messages: [{ role: "user", content: "hello messages" }] }
+  });
+  assert.equal(messagesSession.statusCode, 200);
+  assert.equal(capture.last?.reuseDurableAgent, true);
 
   const counted = await app.inject({
     method: "POST",

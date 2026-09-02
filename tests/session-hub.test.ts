@@ -190,6 +190,30 @@ test("acquire abort while waiting does not drop an awaiting_tools slot", async (
   await hub.dropAll();
 });
 
+test("drop times out a hung dispose so the next acquire is not blocked", async () => {
+  const hub = new SessionHub({ recycleCleanupMs: 40 });
+  const agent: HubAgent = {
+    agentId: "hang-dispose",
+    send: async () => {
+      throw new Error("unused");
+    },
+    [Symbol.asyncDispose]: () => new Promise(() => undefined)
+  };
+  hub.put("sess-hang", createSessionSlot({
+    agent,
+    agentId: "hang-dispose",
+    apiKey: "key",
+    model: "m",
+    state: "idle"
+  }));
+  const started = Date.now();
+  await hub.drop("sess-hang");
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1_000, `hung dispose must not block drop, took ${elapsed}ms`);
+  const release = await hub.acquire("sess-hang");
+  release();
+});
+
 test("idle TTL recycles with cancel + dispose + store.deleteSession", async () => {
   let now = 1_000;
   const deleted: string[] = [];
