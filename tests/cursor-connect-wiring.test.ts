@@ -96,6 +96,54 @@ test("the stored token is not sitting in the database as plain text", () => {
   store.close();
 });
 
+test("rotating a pasted token does not wipe model scope or the source key link", () => {
+  const store = CursorConnectStore.open(":memory:");
+  const first = store.upsertCredential({
+    sessionToken: "token-one",
+    machineId: "machine-stable",
+    clientVersion: "1",
+    sourceCursorKeyId: "key-1",
+    allowedModels: ["grok-4.6"],
+    excludedModels: ["skip-me"],
+    macMachineId: "mac-1"
+  });
+  const rotated = store.upsertCredential({
+    id: first.id,
+    sessionToken: "token-two",
+    machineId: "machine-stable",
+    clientVersion: "1"
+  });
+  assert.equal(rotated.sourceCursorKeyId, "key-1");
+  assert.deepEqual(rotated.allowedModels, ["grok-4.6"]);
+  assert.deepEqual(rotated.excludedModels, ["skip-me"]);
+  assert.equal(rotated.macMachineId, "mac-1");
+  store.close();
+});
+
+test("importFromCursorKey copies the key scope and keeps machineId on the second pull", async () => {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const session = `${encode({ alg: "none" })}.${encode({ type: "session" })}.sig`;
+  const store = CursorConnectStore.open(":memory:");
+  const service = new CursorConnectService({
+    store,
+    config: baseConfig(),
+    fetchImpl: async () => Response.json({ accessToken: session, refreshToken: "refresh" })
+  });
+  const key = {
+    id: "key-1",
+    apiKey: "crsr_pool_key",
+    label: "pool",
+    modelScope: { allowed: ["grok-4.6"], excluded: [] }
+  };
+  const first = await service.importFromCursorKey(key);
+  assert.equal(first.sourceCursorKeyId, "key-1");
+  assert.deepEqual(first.allowedModels, ["grok-4.6"]);
+  const second = await service.importFromCursorKey({ ...key, label: "pool" }, { machineId: "should-not-win" });
+  assert.equal(second.id, first.id);
+  assert.equal(second.machineId, first.machineId);
+  store.close();
+});
+
 test("service availability and status explain what is missing", () => {
   const store = CursorConnectStore.open(":memory:");
   const service = new CursorConnectService({ store, config: baseConfig() });

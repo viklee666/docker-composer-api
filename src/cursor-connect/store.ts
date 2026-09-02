@@ -145,8 +145,12 @@ const SCHEMA = `
     last_used_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    source_cursor_key_id TEXT
   );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_credentials_source_key
+    ON cc_credentials(source_cursor_key_id)
+    WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != '';
 
   CREATE TABLE IF NOT EXISTS cc_conversations (
     id TEXT PRIMARY KEY,
@@ -287,6 +291,8 @@ export interface CcCredential {
   lastError?: string;
   createdAt: string;
   updatedAt: string;
+  /** 从 Cursor Key 池兑换来的凭据会记下源 key id，再拉一次时换 token、不换 machineId。 */
+  sourceCursorKeyId?: string;
 }
 
 export interface CcCredentialInput {
@@ -306,6 +312,7 @@ export interface CcCredentialInput {
   status?: string;
   allowedModels?: string[];
   excludedModels?: string[];
+  sourceCursorKeyId?: string;
 }
 
 export interface ConnectStoreOptions {
@@ -351,7 +358,8 @@ export class CursorConnectStore {
       ["cc_events", "attempt", "INTEGER NOT NULL DEFAULT 0"],
       ["cc_tool_calls", "idempotency_key", "TEXT"],
       ["cc_conversations", "latest_event_seq", "INTEGER NOT NULL DEFAULT 0"],
-      ["cc_credentials", "note", "TEXT"]
+      ["cc_credentials", "note", "TEXT"],
+      ["cc_credentials", "source_cursor_key_id", "TEXT"]
     ];
     for (const [table, column, type] of columns) {
       if (this.hasColumn(table, column)) continue;
@@ -360,6 +368,15 @@ export class CursorConnectStore {
       } catch {
         // 并发启动时另一个进程可能刚加过；下一次 hasColumn 就能看到。
       }
+    }
+    try {
+      this.db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_credentials_source_key
+         ON cc_credentials(source_cursor_key_id)
+         WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != ''`
+      );
+    } catch {
+      // 同上：并发启动时索引可能已经在。
     }
   }
 
@@ -458,22 +475,23 @@ export class CursorConnectStore {
         values.push(value);
       };
       put("label", input.label);
-      // token 只在显式给了新值时才覆盖：后台编辑其它字段时不该要求重填 token。
       if (input.sessionToken) put("encrypted_session_token", this.protect(input.sessionToken));
       if (input.sessionToken) put("token_type", cursorTokenType(input.sessionToken));
       put("machine_id", input.machineId);
-      put("mac_machine_id", input.macMachineId ?? null);
+      put("mac_machine_id", input.macMachineId);
       put("client_version", input.clientVersion);
-      put("client_os", input.clientOs ?? null);
-      put("client_arch", input.clientArch ?? null);
-      put("client_os_version", input.clientOsVersion ?? null);
-      put("device_type", input.deviceType ?? null);
-      put("client_key", input.clientKey ?? null);
-      put("session_id", input.sessionId ?? null);
-      put("timezone", input.timezone ?? null);
+      put("client_os", input.clientOs);
+      put("client_arch", input.clientArch);
+      put("client_os_version", input.clientOsVersion);
+      put("device_type", input.deviceType);
+      put("client_key", input.clientKey);
+      put("session_id", input.sessionId);
+      put("timezone", input.timezone);
       put("status", input.status);
-      put("allowed_models", input.allowedModels ? JSON.stringify(input.allowedModels) : null);
-      put("excluded_models", input.excludedModels ? JSON.stringify(input.excludedModels) : null);
+      if (input.allowedModels !== undefined) put("allowed_models", JSON.stringify(input.allowedModels));
+      if (input.excludedModels !== undefined) put("excluded_models", JSON.stringify(input.excludedModels));
+      const sourceKey = blankToNull(input.sourceCursorKeyId);
+      if (sourceKey) put("source_cursor_key_id", sourceKey);
       put("updated_at", ts);
       if (sets.length) this.db.prepare(`UPDATE cc_credentials SET ${sets.join(", ")} WHERE id = ?`).run(...values, input.id!);
       return this.credential(input.id!)!;
@@ -485,8 +503,9 @@ export class CursorConnectStore {
         `INSERT INTO cc_credentials
          (id, label, encrypted_session_token, token_type, expires_at, machine_id, mac_machine_id, client_version,
           client_os, client_arch, client_os_version, device_type, client_key, session_id, timezone,
-          status, allowed_models, excluded_models, failure_count, last_used_at, last_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)`
+          status, allowed_models, excluded_models, failure_count, last_used_at, last_error, created_at, updated_at,
+          source_cursor_key_id)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?)`
       )
       .run(
         id,
@@ -507,7 +526,8 @@ export class CursorConnectStore {
         input.allowedModels ? JSON.stringify(input.allowedModels) : null,
         input.excludedModels ? JSON.stringify(input.excludedModels) : null,
         ts,
-        ts
+        ts,
+        blankToNull(input.sourceCursorKeyId)
       );
     return this.credential(id)!;
   }
@@ -522,6 +542,13 @@ export class CursorConnectStore {
 
   credential(id: string): CcCredential | undefined {
     const row = this.db.prepare("SELECT * FROM cc_credentials WHERE id = ?").get(id);
+    return row ? this.mapCredential(row) : undefined;
+  }
+
+  credentialBySourceKeyId(sourceCursorKeyId: string): CcCredential | undefined {
+    const id = sourceCursorKeyId.trim();
+    if (!id) return undefined;
+    const row = this.db.prepare("SELECT * FROM cc_credentials WHERE source_cursor_key_id = ?").get(id);
     return row ? this.mapCredential(row) : undefined;
   }
 
@@ -1022,7 +1049,8 @@ export class CursorConnectStore {
       lastUsedAt: optional(row.last_used_at),
       lastError: optional(row.last_error),
       createdAt: row.created_at as string,
-      updatedAt: row.updated_at as string
+      updatedAt: row.updated_at as string,
+      sourceCursorKeyId: optional(row.source_cursor_key_id)
     };
   }
 }

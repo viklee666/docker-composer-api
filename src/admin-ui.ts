@@ -350,7 +350,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           <div class="panel">
             <div class="head">
               <h2>Cursor Connect 凭据</h2>
-              <span class="hint">Connect 路线直连 <code>aiserver.v1.InferenceService/Stream</code>，用 session token + 稳定设备标识，与 SDK 路线的 Cursor Key 池互不相干。</span>
+              <span class="hint">Connect 直连 <code>aiserver.v1.InferenceService/Stream</code>。凭据优先从 Cursor Key 池兑换；也可以继续粘贴桌面端 session JWT。与 SDK 路线的运行时互不共用。</span>
             </div>
             <div class="body">
               <div class="callout" id="connect-status-box">
@@ -362,6 +362,13 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 同一份凭据的 machineId 在整个生命周期内不能变，否则上游会把它当成另一台设备。留空会自动生成一个并永久保存，不要每次都填新的。
                 <br>凭据只能写入、不能读回：后台不回传 token 明文，只显示首尾各 4 位用于辨认。
               </div>
+              <div class="row" style="margin-bottom:10px">
+                <select id="cc-from-key" style="flex:2;min-width:240px" title="从 Cursor Key 池兑换 session token">
+                  <option value="">选择一把 Cursor Key</option>
+                </select>
+                <button class="primary" id="btn-cc-from-key">从 Key 拉取</button>
+              </div>
+              <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。同一把 key 再拉取会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token。</p>
               <div class="row" style="margin-bottom:14px">
                 <input id="cc-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
                 <input id="cc-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
@@ -869,10 +876,26 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       renderConnectStatus(data);
       renderConnectSettings(data.settings || {});
       renderConnectCredentials(data.credentials || []);
+      fillCcKeySelect(Array.isArray(data.cursorKeys) ? data.cursorKeys : lastKeys);
     }).catch(function(err){
       $('connect-status-title').textContent = '读取失败';
       $('connect-status-detail').textContent = err.message;
     });
+  }
+
+  function fillCcKeySelect(keys){
+    var sel = $('cc-from-key');
+    if (!sel) return;
+    var current = sel.value;
+    var list = keys || [];
+    var opts = ['<option value="">' + (list.length ? '选择一把 Cursor Key' : 'Key 池是空的，请先添加 Cursor Key') + '</option>'];
+    list.forEach(function(key){
+      var label = (key.label || key.maskedKey || key.id) + (key.status === 'disabled' ? '（已禁用）' : '');
+      opts.push('<option value="' + esc(key.id) + '">' + esc(label) + '</option>');
+    });
+    sel.innerHTML = opts.join('');
+    if (current) sel.value = current;
+    $('btn-cc-from-key').disabled = !list.length;
   }
 
   function renderConnectStatus(data){
@@ -906,6 +929,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('cc-body').innerHTML = list.map(function(item){
       var badge = item.status === 'active' ? '<span class="chip ok">● 可用</span>' : '<span class="chip bad">● 停用</span>';
       var warn = item.tokenType === 'web' ? ' <span class="chip bad">web token</span>' : '';
+      if (item.sourceCursorKeyId) warn += ' <span class="chip">Key 池</span>';
       var actions = [
         '<button data-cc-test="' + esc(item.id) + '">测试</button>',
         item.status === 'active'
@@ -1214,6 +1238,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '</div>';
       var actions = '<button data-action="test" data-id="' + esc(key.id) + '">测试</button>';
       actions += '<button data-action="models" data-id="' + esc(key.id) + '">模型范围</button>';
+      actions += '<button data-action="connect-import" data-id="' + esc(key.id) + '" title="用这把 key 向 Cursor 兑换 Connect session token">拉取 Connect</button>';
       if (key.status === 'active') {
         actions += '<button data-action="disable" data-id="' + esc(key.id) + '">禁用</button>';
       } else {
@@ -1802,8 +1827,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (event.target === $('modal-mask')) closeModal();
   });
 
-  /* ------------------------------------- Connect 面板的交互 */
-
   $('btn-cc-add').addEventListener('click', function(){
     var token = $('cc-token').value.trim();
     if (!token) { toast('请先粘贴 session token', true); return; }
@@ -1821,6 +1844,29 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       loadConnect();
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('添加失败：' + err.message, true);
+    });
+  });
+
+  $('btn-cc-from-key').addEventListener('click', function(){
+    var id = $('cc-from-key').value.trim();
+    if (!id) { toast('请先选择一把 Cursor Key', true); return; }
+    var body = { cursorKeyId: id };
+    var label = $('cc-label').value.trim();
+    var machine = $('cc-machine').value.trim();
+    if (label) body.label = label;
+    if (machine) body.machineId = machine;
+    var btn = $('btn-cc-from-key');
+    btn.disabled = true;
+    var prev = btn.textContent;
+    btn.textContent = '拉取中…';
+    api('POST', '/admin/api/connect/credentials/from-key', body).then(function(){
+      toast('已从 Key 拉取 Connect 凭据');
+      loadConnect();
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') toast('拉取失败：' + err.message, true);
+    }).finally(function(){
+      btn.disabled = false;
+      btn.textContent = prev || '从 Key 拉取';
     });
   });
 
@@ -2126,6 +2172,15 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       var key = findKey(id);
       modalState = { kind: 'key-scope', id: id };
       openScopeModal('key-scope', id, key && key.modelScope);
+      return;
+    }
+    if (action === 'connect-import') {
+      button.disabled = true;
+      api('POST', '/admin/api/connect/credentials/from-key', { cursorKeyId: id }).then(function(){
+        toast('已拉取 Connect 凭据，可到「Connect 凭据」页查看');
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('拉取失败：' + err.message, true);
+      }).finally(function(){ button.disabled = false; });
       return;
     }
     if (action === 'delete') {

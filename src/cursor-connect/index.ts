@@ -62,6 +62,13 @@ export {
 export { postConnectStream, type ConnectFetch, type ConnectStreamResult } from "./transport.js";
 
 export {
+  EXCHANGE_USER_API_KEY_PATH,
+  exchangeUrl,
+  exchangeUserApiKey,
+  type ExchangedCursorTokens
+} from "./api-key-exchange.js";
+
+export {
   CursorConnectClient,
   DEFAULT_CONNECT_BASE_URL,
   INFERENCE_SERVICE,

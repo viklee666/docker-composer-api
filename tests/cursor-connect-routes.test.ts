@@ -26,13 +26,48 @@ class StubRunner implements CursorRunner {
   }
 }
 
-/** 一元上游桩：AvailableModels 的请求与响应都是裸 protobuf，没有 envelope。 */
-function connectFetch(models: AvailableModelsResponse_AvailableModel[]) {
-  return async (): Promise<Response> =>
-    new Response(new AvailableModelsResponse({ models }).toBinary(), { status: 200 });
+function jwt(payload: Record<string, unknown>): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.sig`;
 }
 
-async function buildApp(options: { withCredential?: boolean; config?: Partial<GatewayConfig> } = {}) {
+/** 一元上游桩：AvailableModels 的请求与响应都是裸 protobuf；兑换接口走 JSON。 */
+function connectFetch(
+  models: AvailableModelsResponse_AvailableModel[],
+  exchange: {
+    accessToken?: string;
+    refreshToken?: string;
+    status?: number;
+    body?: unknown;
+    calls?: Array<{ url: string; authorization: string; body: string }>;
+  } = {}
+) {
+  const session = exchange.accessToken ?? jwt({ type: "session", sub: "acct" });
+  const refresh = exchange.refreshToken ?? "refresh-token";
+  return async (url: string, init?: RequestInit): Promise<Response> => {
+    if (String(url).includes("/auth/exchange_user_api_key")) {
+      exchange.calls?.push({
+        url: String(url),
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization ?? ""),
+        body: String(init?.body ?? "")
+      });
+      if (exchange.status && exchange.status >= 400) {
+        const payload = exchange.body ?? { error: "denied" };
+        return new Response(typeof payload === "string" ? payload : JSON.stringify(payload), { status: exchange.status });
+      }
+      return Response.json({ accessToken: session, refreshToken: refresh });
+    }
+    return new Response(new AvailableModelsResponse({ models }).toBinary(), { status: 200 });
+  };
+}
+
+async function buildApp(
+  options: {
+    withCredential?: boolean;
+    config?: Partial<GatewayConfig>;
+    exchange?: Parameters<typeof connectFetch>[1];
+  } = {}
+) {
   const store = new MemoryStateStore();
   const config: GatewayConfig = {
     ...loadConfig({}),
@@ -51,17 +86,20 @@ async function buildApp(options: { withCredential?: boolean; config?: Partial<Ga
   const connect = new CursorConnectService({
     store: connectStore,
     config,
-    fetchImpl: connectFetch([
-      new AvailableModelsResponse_AvailableModel({ name: "grok-4.6", defaultOn: true }),
-      new AvailableModelsResponse_AvailableModel({
-        name: "gone",
-        degradationStatus: AvailableModelsResponse_DegradationStatus.DISABLED
-      })
-    ])
+    fetchImpl: connectFetch(
+      [
+        new AvailableModelsResponse_AvailableModel({ name: "grok-4.6", defaultOn: true }),
+        new AvailableModelsResponse_AvailableModel({
+          name: "gone",
+          degradationStatus: AvailableModelsResponse_DegradationStatus.DISABLED
+        })
+      ],
+      options.exchange
+    )
   });
 
   const app = createApp({ config, store, runner: new StubRunner(), keyPool, connect });
-  return { app, connect, connectStore };
+  return { app, connect, connectStore, keyPool };
 }
 
 const adminAuth = { authorization: `Bearer ${ADMIN_PASSWORD}` };
@@ -90,6 +128,12 @@ test("admin endpoints require the admin password, not just any gateway key", asy
       `${url} 不该接受普通网关密钥`
     );
   }
+  const fromKey = "/admin/api/connect/credentials/from-key";
+  assert.equal((await app.inject({ method: "POST", url: fromKey, payload: { cursorKeyId: "x" } })).statusCode, 401);
+  assert.equal(
+    (await app.inject({ method: "POST", url: fromKey, headers: apiAuth, payload: { cursorKeyId: "x" } })).statusCode,
+    401
+  );
   await app.close();
 });
 
@@ -133,6 +177,104 @@ test("a credential can be created, tested, disabled and deleted from the admin A
   assert.equal(removed.statusCode, 200);
   const after = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
   assert.deepEqual((after.json() as { credentials: unknown[] }).credentials, []);
+  await app.close();
+});
+
+test("a connect credential can be imported from a Cursor key in the pool", async () => {
+  const calls: Array<{ url: string; authorization: string; body: string }> = [];
+  const accessToken = jwt({ type: "session", sub: "acct" });
+  const { app, connectStore, keyPool } = await buildApp({
+    exchange: { accessToken, refreshToken: "refresh-token", calls }
+  });
+  const [key] = await keyPool.list();
+  const created = await app.inject({
+    method: "POST",
+    url: "/admin/api/connect/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id }
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const credential = (created.json() as { credential: Record<string, unknown> }).credential;
+  assert.equal(credential.sourceCursorKeyId, key.id);
+  assert.equal(credential.label, key.label);
+  assert.ok(!JSON.stringify(credential).includes(accessToken));
+  assert.ok(!JSON.stringify(credential).includes(key.apiKey));
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/auth\/exchange_user_api_key$/);
+  assert.equal(calls[0].authorization, `Bearer ${key.apiKey}`);
+  assert.equal(calls[0].body, "{}");
+
+  const stored = connectStore.credential(String(credential.id));
+  assert.equal(stored?.sessionToken, accessToken);
+  assert.equal(stored?.sourceCursorKeyId, key.id);
+  const machineId = stored!.machineId;
+
+  const listed = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  assert.doesNotMatch(listed.body, new RegExp(accessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(listed.body, new RegExp(key.apiKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  const again = await app.inject({
+    method: "POST",
+    url: "/admin/api/connect/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id, machineId: "should-not-replace" }
+  });
+  assert.equal(again.statusCode, 200);
+  const updated = (again.json() as { credential: { id: string } }).credential;
+  assert.equal(updated.id, credential.id, "同一把 key 再拉应更新而不是新建");
+  assert.equal(connectStore.credential(updated.id)?.machineId, machineId);
+  assert.equal(connectStore.listCredentials().length, 1);
+  await app.close();
+});
+
+test("importing from a missing Cursor key is 404 and does not invent a credential", async () => {
+  const { app, connectStore } = await buildApp();
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/api/connect/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: "missing-key" }
+  });
+  assert.equal(response.statusCode, 404);
+  assert.equal(connectStore.listCredentials().length, 0);
+  await app.close();
+});
+
+test("from-key requires a cursorKeyId", async () => {
+  const { app } = await buildApp();
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/api/connect/credentials/from-key",
+    headers: adminAuth,
+    payload: {}
+  });
+  assert.equal(response.statusCode, 400);
+  await app.close();
+});
+
+test("from-key surfaces exchange failures without leaking the Cursor key", async () => {
+  const { app, keyPool } = await buildApp({ exchange: { status: 403, body: { error: "denied", apiKey: "cursor-key" } } });
+  const [key] = await keyPool.list();
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/api/connect/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id }
+  });
+  assert.equal(response.statusCode, 403);
+  assert.doesNotMatch(response.body, /cursor-key/);
+  await app.close();
+});
+
+test("the admin connect panel lists Cursor keys for import", async () => {
+  const { app, keyPool } = await buildApp();
+  const [key] = await keyPool.list();
+  const response = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  const body = response.json() as { cursorKeys: Array<{ id: string; apiKey?: string; maskedKey: string }> };
+  assert.equal(body.cursorKeys.length, 1);
+  assert.equal(body.cursorKeys[0].id, key.id);
+  assert.equal(body.cursorKeys[0].apiKey, undefined);
+  assert.ok(body.cursorKeys[0].maskedKey);
   await app.close();
 });
 

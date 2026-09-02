@@ -396,15 +396,38 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   app.get("/admin/api/connect", async (request) => {
     requireAdmin(request, deps);
     const settings = connectSettings(deps.config);
+    const cursorKeys = (await deps.keyPool.list()).map(publicKey);
     if (!deps.connect) {
-      return { enabled: false, settings, status: { available: false, reason: "网关未装载 Connect 路线" }, credentials: [] };
+      return { enabled: false, settings, status: { available: false, reason: "网关未装载 Connect 路线" }, credentials: [], cursorKeys };
     }
     return {
       enabled: true,
       settings,
       status: deps.connect.status(),
-      credentials: deps.connect.store.listCredentials().map(publicCredential)
+      credentials: deps.connect.store.listCredentials().map(publicCredential),
+      cursorKeys
     };
+  });
+
+  /**
+   * 从 Cursor Key 池兑换 Connect session token。
+   * 必须挂在 `credentials/:id` 之前，避免 `from-key` 被当成凭据 id。
+   */
+  app.post("/admin/api/connect/credentials/from-key", async (request) => {
+    requireAdmin(request, deps);
+    const connect = requireConnect(deps);
+    const body = objectBody(request.body);
+    const cursorKeyId = typeof body.cursorKeyId === "string" ? body.cursorKeyId.trim() : "";
+    if (!cursorKeyId) {
+      throw new ApiError("cursorKeyId is required.", 400, "invalid_request_error", "cursorKeyId");
+    }
+    const key = await deps.keyPool.get(cursorKeyId);
+    if (!key) throw new ApiError("Cursor key not found.", 404, "not_found", "cursorKeyId");
+    const record = await connect.importFromCursorKey(key, {
+      label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined,
+      machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : undefined
+    });
+    return { credential: publicCredential(record) };
   });
 
   app.post("/admin/api/connect/credentials", async (request) => {
@@ -889,7 +912,8 @@ function publicCredential(record: CcCredential): Record<string, unknown> {
     failureCount: record.failureCount,
     lastUsedAt: record.lastUsedAt ?? null,
     lastError: record.lastError ?? null,
-    createdAt: record.createdAt
+    createdAt: record.createdAt,
+    sourceCursorKeyId: record.sourceCursorKeyId ?? null
   };
 }
 

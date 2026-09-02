@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 import type { ModelCatalog } from "../model-params.js";
 import type {
+  CursorKeyRecord,
   CursorRunRequest,
   CursorRunResult,
   CursorRunner,
@@ -12,6 +13,7 @@ import type {
   RequestUsage
 } from "../types.js";
 import { fetchAvailableModels, type ConnectCatalog, type ConnectModelEntry } from "./available-models.js";
+import { exchangeUserApiKey } from "./api-key-exchange.js";
 import { resolveRequestedModel } from "./catalog.js";
 import { CursorConnectClient, DEFAULT_CONNECT_BASE_URL } from "./client.js";
 import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
@@ -414,6 +416,46 @@ export class CursorConnectService implements CursorRunner {
       };
     } catch (error) {
       this.noteFailure(credential, error);
+      throw error;
+    }
+  }
+
+  /**
+   * 用 Cursor Key 池里的 `crsr_` 向上游兑换 session JWT，写成 Connect 凭据。
+   * 同一把 key 再拉一次只换 token，machineId 保持不变。
+   */
+  async importFromCursorKey(
+    key: Pick<CursorKeyRecord, "id" | "apiKey" | "label" | "modelScope">,
+    options: { label?: string; machineId?: string } = {}
+  ): Promise<CcCredential> {
+    const tokens = await exchangeUserApiKey({
+      apiKey: key.apiKey,
+      baseUrl: this.settings.baseUrl,
+      fetchImpl: this.options.fetchImpl
+    });
+    const existing = this.options.store.credentialBySourceKeyId(key.id);
+    const label = options.label?.trim() || key.label?.trim() || existing?.label;
+    const write = (target?: CcCredential): CcCredential =>
+      this.options.store.upsertCredential({
+        ...(target ? { id: target.id } : {}),
+        label,
+        sessionToken: tokens.accessToken,
+        machineId: target?.machineId || options.machineId?.trim() || randomUUID(),
+        clientVersion: this.settings.clientVersion,
+        ...(!target
+          ? { clientOs: process.platform, clientArch: process.arch, deviceType: "desktop" }
+          : {}),
+        sourceCursorKeyId: key.id,
+        allowedModels: key.modelScope.allowed,
+        excludedModels: key.modelScope.excluded,
+        status: "active"
+      });
+    try {
+      return write(existing);
+    } catch (error) {
+      // 两个进程同时首次导入同一把 key 时，输家撞 UNIQUE。改走更新而不是把兑换结果丢掉。
+      const raced = this.options.store.credentialBySourceKeyId(key.id);
+      if (raced) return write(raced);
       throw error;
     }
   }
