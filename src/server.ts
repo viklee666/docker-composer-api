@@ -193,8 +193,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
   app.post("/v1/chat/completions", async (request, reply) => {
     const auth = authFor(deps, request);
     noteGatewayKeyUse(deps, auth);
-    const prepared = prepareOpenAiChat(request.body, { systemPrompt: gatewaySystemPrompt(deps.config) });
-    const durableTurn = extractDurableTurn("openai-chat", request.body);
+    const promptSettings = gatewaySystemPrompt(deps.config);
+    const prepared = prepareOpenAiChat(request.body, { systemPrompt: promptSettings });
+    // slotHints 要等选 key 之后才能算 durableSessionId；指纹 / lastUserText 由 runner 对齐。
+    const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings);
     const seed = conversationSeed(request.body);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
@@ -228,7 +230,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const previousResponseId = typeof body.previous_response_id === "string" ? body.previous_response_id : undefined;
     const previous = previousResponseId ? await deps.store.getResponse(previousResponseId, auth.ownerHash) : undefined;
     if (previousResponseId && !previous) throw new ApiError("Previous response not found.", 404, "not_found", "previous_response_id");
-    const prepared = prepareOpenAiResponses(body, previous ? { response: previous.response, inputItems: previous.inputItems } : undefined, { systemPrompt: gatewaySystemPrompt(deps.config) });
+    const promptSettings = gatewaySystemPrompt(deps.config);
+    const prepared = prepareOpenAiResponses(body, previous ? { response: previous.response, inputItems: previous.inputItems } : undefined, { systemPrompt: promptSettings });
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `resp_${compactId()}`;
     const created = nowSeconds();
@@ -241,7 +244,9 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const durableTurn = extractDurableTurn(
       "openai-responses",
       body,
-      previous ? { response: previous.response, inputItems: previous.inputItems } : undefined
+      previous ? { response: previous.response, inputItems: previous.inputItems } : undefined,
+      undefined,
+      promptSettings
     );
     const log = beginLog("/v1/responses", auth, prepared);
     const run = loggedRunRequest(deps, log, {
@@ -323,8 +328,9 @@ export function createApp(deps: AppDeps): FastifyInstance {
   app.post("/v1/messages", async (request, reply) => {
     const auth = authFor(deps, request);
     noteGatewayKeyUse(deps, auth);
-    const prepared = prepareAnthropicMessages(request.body, { systemPrompt: gatewaySystemPrompt(deps.config) });
-    const durableTurn = extractDurableTurn("anthropic-messages", request.body);
+    const promptSettings = gatewaySystemPrompt(deps.config);
+    const prepared = prepareAnthropicMessages(request.body, { systemPrompt: promptSettings });
+    const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings);
     const seed = conversationSeed(request.body);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;

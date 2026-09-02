@@ -1373,6 +1373,17 @@ test("SDK tool-call event parsing ignores arg-less progress and preserves parall
       { id: "call_b", name: "Grep", arguments: { pattern: "TODO" } }
     ]
   );
+  assert.deepEqual(
+    toolCallsFromSdkEvent({ type: "tool_call", name: "Read", status: "completed", args: { path: "README.md" } }),
+    []
+  );
+  assert.deepEqual(
+    toolCallsFromSdkEvent({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Read", input: { path: "README.md" } }] }
+    }),
+    []
+  );
 });
 
 test("CursorSdkRunner retries without custom tools when the SDK rejects send-level customTools", async () => {
@@ -1788,7 +1799,7 @@ test("CursorSdkRunner returns all captured custom tool callbacks and cancels the
   assert.equal(sdkRun?.cancelled, true);
 });
 
-test("CursorSdkRunner serializes concurrent requests for the same session", async () => {
+test("CursorSdkRunner without Hub does not serialize concurrent requests", async () => {
   let sendCount = 0;
   let releaseFirst!: () => void;
   const firstCanFinish = new Promise<void>((resolve) => {
@@ -1815,13 +1826,9 @@ test("CursorSdkRunner serializes concurrent requests for the same session", asyn
         });
       }
     }),
-    resume: async () => ({
-      agentId: "agent-test",
-      send: async () => {
-        sendCount += 1;
-        return new FakeSdkRun({ waitResult: { status: "finished", result: `run ${sendCount}` } });
-      }
-    })
+    resume: async () => {
+      throw new Error("no Hub must not resume");
+    }
   };
   const runner = new CursorSdkRunner(new MemoryStateStore(), { defaultWorkingDirectory: "/workspace", sdkClientVersion: "test" }, factory);
   const input: CursorRunRequest = {
@@ -1840,14 +1847,14 @@ test("CursorSdkRunner serializes concurrent requests for the same session", asyn
   await firstStreamStarted;
   const second = runner.run(input);
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(sendCount, 1, "second request should wait for the first session run to finish");
+  assert.equal(sendCount, 2, "SESSION_MODE=stateless / no Hub must not wait on the old session lock");
   releaseFirst();
 
   assert.equal((await first).text, "run 1");
   assert.equal((await second).text, "run 2");
 });
 
-test("CursorSdkRunner drops a busy resumed agent and creates a fresh one", async () => {
+test("CursorSdkRunner without Hub does not resume a stored agent", async () => {
   let createCount = 0;
   let resumeCount = 0;
   const factory: AgentFactory = {
@@ -1886,7 +1893,7 @@ test("CursorSdkRunner drops a busy resumed agent and creates a fresh one", async
   const recovered = await runner.run(input);
 
   assert.equal(recovered.text, "fresh");
-  assert.equal(resumeCount, 1);
+  assert.equal(resumeCount, 0);
   assert.equal(createCount, 2);
 });
 

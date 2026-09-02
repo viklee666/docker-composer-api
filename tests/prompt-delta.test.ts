@@ -517,6 +517,22 @@ test("GetMcpTools-only trailing results become empty when lastUserText matches",
   assert.equal(second.toolResults, undefined);
 });
 
+test("gateway SYSTEM_PROMPT append is in durable systemText and fingerprint", () => {
+  const body = {
+    messages: [
+      { role: "system", content: "client" },
+      { role: "user", content: "hi" }
+    ]
+  };
+  const off = extractDurableTurn("openai-chat", body);
+  const appended = extractDurableTurn("openai-chat", body, undefined, undefined, { mode: "append", text: "gateway" });
+  assert.equal(off.systemText, "client");
+  assert.equal(appended.systemText, "client\n\ngateway");
+  assert.notEqual(appended.systemFingerprint, off.systemFingerprint);
+  const overridden = extractDurableTurn("openai-chat", body, undefined, undefined, { mode: "override", text: "gateway" });
+  assert.equal(overridden.systemText, "gateway");
+});
+
 function resolveHints(row: Row): DurableSlotHints | undefined {
   if (!row.slotHints) return undefined;
   if (typeof row.slotHints !== "function") return row.slotHints;

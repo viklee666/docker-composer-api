@@ -79,6 +79,11 @@ export interface SessionSlot {
   holdDeadline?: number;
   /** Tool call ids already served to the client (history rewrite detection). */
   issuedToolCallIds: string[];
+  /**
+   * Client-visible call ids that must resolve the same hung execute.
+   * Responses rewrites `toolu_…` / UUID into `call_${suffix}`; Chat/Anthropic echo the execute id.
+   */
+  callAliases: Map<string, string>;
   /** sha256(sorted issued ids + lastUserText). */
   historyChecksum: string;
   /** True when the handle came from Agent.resume (do not re-send STABLE_DIRECTIVE). */
@@ -136,9 +141,33 @@ export function createSessionSlot(input: CreateSessionSlotInput): SessionSlot {
     lastUserText: input.lastUserText,
     lastUsedAt: 0,
     issuedToolCallIds,
+    callAliases: new Map(),
     historyChecksum: input.historyChecksum ?? historyChecksum(issuedToolCallIds, input.lastUserText),
     resumed: input.resumed
   };
+}
+
+/** Responses `call_id`: strip a leading `call_`, then put it back so `foo` and `call_foo` collide. */
+export function responsesCallId(id: string): string {
+  const suffix = id.trim().replace(/^call_/, "");
+  return suffix ? `call_${suffix}` : id;
+}
+
+/** Map a client-returned tool id onto the hung execute key, if any. */
+export function canonicalHoldId(slot: SessionSlot, clientId: string): string | undefined {
+  if (!clientId) return undefined;
+  if (slot.pending.has(clientId)) return clientId;
+  const aliased = slot.callAliases.get(clientId);
+  if (aliased && slot.pending.has(aliased)) return aliased;
+  for (const pendingId of slot.pending.keys()) {
+    if (clientId === responsesCallId(pendingId) || pendingId === responsesCallId(clientId)) return pendingId;
+  }
+  return undefined;
+}
+
+export function rememberCallAlias(slot: SessionSlot, executeId: string, alias: string | undefined): void {
+  if (!alias || alias === executeId) return;
+  slot.callAliases.set(alias, executeId);
 }
 
 /** Stable checksum of served tool_call ids + last user text (D11 history rewrite). */
@@ -215,10 +244,8 @@ export function inboundHistoryIncompatible(
   const issued = slot.issuedToolCallIds ?? [];
   if (!issued.length) return false;
   if (input.kind === "tool_results") {
-    const resultIds = new Set((input.toolResults ?? []).map((item) => item.id));
-    const pendingIds = [...slot.pending.keys()];
-    const needed = pendingIds.length > 0 ? pendingIds : issued;
-    return !needed.some((id) => resultIds.has(id));
+    // Unmatched ids while execute is hung are abort+path B in the runner, not a history rewrite.
+    return false;
   }
   if (input.kind === "new_user" && slot.state === "awaiting_tools") return false;
   const prompt = input.prompt ?? "";
@@ -356,14 +383,17 @@ export class SessionHub {
       return;
     }
     slot.pending.set(toolCallId, { name, resolve, reject });
+    rememberCallAlias(slot, toolCallId, responsesCallId(toolCallId));
   }
 
   resolvePending(sessionId: string, toolCallId: string, result: unknown): boolean {
     const slot = this.slots.get(sessionId);
     if (!slot) return false;
-    const pending = slot.pending.get(toolCallId);
+    const holdId = canonicalHoldId(slot, toolCallId);
+    if (!holdId) return false;
+    const pending = slot.pending.get(holdId);
     if (!pending) return false;
-    slot.pending.delete(toolCallId);
+    slot.pending.delete(holdId);
     pending.resolve(result);
     this.touch(sessionId);
     if (slot.pending.size === 0 && slot.state === "awaiting_tools") {

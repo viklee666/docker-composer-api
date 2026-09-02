@@ -86,12 +86,32 @@ test("inboundHistoryIncompatible: missing issued ids is not a valid result", () 
   assert.equal(inboundHistoryIncompatible(slot, {
     kind: "tool_results",
     toolResults: [{ id: "call_other" }]
-  }), true);
+  }), false);
   assert.equal(inboundHistoryIncompatible(slot, {
     kind: "tool_results",
     toolResults: [{ id: "call_read_1" }]
   }), false);
   assert.equal(inboundHistoryIncompatible(slot, { kind: "new_user" }), false);
+});
+
+test("inboundHistoryIncompatible: Responses call_ prefix matches hung execute id", () => {
+  const slot = createSessionSlot({
+    agent: dummyAgent(),
+    agentId: "agent-1",
+    apiKey: "key",
+    model: "m",
+    issuedToolCallIds: ["toolu_01abc"],
+    state: "awaiting_tools"
+  });
+  slot.pending.set("toolu_01abc", {
+    name: "lookup",
+    resolve: () => undefined,
+    reject: () => undefined
+  });
+  assert.equal(inboundHistoryIncompatible(slot, {
+    kind: "tool_results",
+    toolResults: [{ id: "call_toolu_01abc" }]
+  }), false);
 });
 
 test("tool fingerprint change drop+creates a new agent (not 400)", async () => {
@@ -363,21 +383,16 @@ test("no live slot + no agentId + tool_results is 400, not a poisoned create", a
   await hub.dropAll();
 });
 
-test("mismatched tool_results while pending drop+creates instead of hanging", async () => {
+test("mismatched tool_results while pending abort hung execute then path B", async () => {
   const store = new MemoryStateStore();
   const hub = new SessionHub({ parallelToolSettleMs: 0, store });
   const held = new HeldToolAgent();
-  const created: AgentLike[] = [];
+  let createCount = 0;
   const factory: AgentFactory = {
     create: async (options) => {
-      if (created.length === 0) {
-        held.attachCreateOptions(options);
-        created.push(held);
-        return held;
-      }
-      const next = new TrackingAgent("agent-after-rewrite");
-      created.push(next);
-      return next;
+      createCount += 1;
+      held.attachCreateOptions(options);
+      return held;
     }
   };
   const runner = durableRunner(hub, factory, store);
@@ -402,10 +417,11 @@ test("mismatched tool_results while pending drop+creates instead of hanging", as
     }
   }));
 
-  assert.equal(created.length, 2);
-  assert.equal(held.disposed, true);
-  assert.equal(http2.agentId, "agent-after-rewrite");
-  assert.match(sendText((created[1] as TrackingAgent).sends[0]), /TOOL RESULT \(call_unknown\)/);
+  assert.equal(createCount, 1);
+  assert.equal(held.disposed, false);
+  assert.equal(http2.agentId, "agent-held");
+  assert.equal(held.sends.length, 2);
+  assert.match(sendText(held.sends[1]), /TOOL RESULT \(call_unknown\)/);
   assert.equal(hub.get(sessionHash(seed))?.pending.size ?? 0, 0);
   await hub.dropAll();
 });
@@ -625,10 +641,19 @@ class HeldToolAgent implements AgentLike {
 
   async send(message: unknown): Promise<HeldFakeRun> {
     this.sends.push(message);
-    const tools = this.tools;
-    if (!tools?.Read) throw new Error("HeldToolAgent expected customTools.Read on create");
     const run = new HeldFakeRun();
     this.runs.push(run);
+    if (this.sends.length > 1) {
+      run.attach(async function* () {
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "after tool" }] }
+        };
+      });
+      return run;
+    }
+    const tools = this.tools;
+    if (!tools?.Read) throw new Error("HeldToolAgent expected customTools.Read on create");
     run.attach(async function* () {
       yield {
         type: "assistant",

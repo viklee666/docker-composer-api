@@ -114,6 +114,21 @@ test("durable two user turns: one create, two incremental sends, no ASSISTANT re
   await hub.dropAll();
 });
 
+test("durable first send prefixes gateway SYSTEM text", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new TrackingAgent();
+  const factory: AgentFactory = { create: async () => agent };
+  const runner = durableRunner(hub, factory);
+  await runner.run(baseRun({
+    conversationSeed: "seed-system",
+    durableTurn: { kind: "new_user", userText: "hello", systemText: "gateway-rule", ...FP }
+  }));
+  const payload = sendText(agent.sends[0]);
+  assert.match(payload, /SYSTEM:\ngateway-rule/);
+  assert.match(payload, /hello/);
+  await hub.dropAll();
+});
+
 test("durable held execute: same runId, one send, resolve, no cancel/dispose", async (t) => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const logs: string[] = [];
@@ -165,6 +180,134 @@ test("durable held execute: same runId, one send, resolve, no cancel/dispose", a
   assert.ok(logs.some((line) => line.includes("[durable] send first")), logs.join("\n"));
   error.mock.restore();
   await hub.dropAll();
+});
+
+test("Responses remapped call_id still resolves the hung execute (path A)", async (t) => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const logs: string[] = [];
+  const error = t.mock.method(console, "error", (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  });
+  const agent = new HeldToolAgent("toolu_01lookup");
+  const factory: AgentFactory = {
+    create: async (options) => {
+      agent.attachCreateOptions(options);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-responses-alias";
+
+  const http1 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: userTurn("lookup ping")
+  }));
+  assert.equal(http1.toolCalls.length, 1);
+  assert.equal(http1.toolCalls[0]?.id, "toolu_01lookup");
+
+  const http2 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_toolu_01lookup", content: "pong" }]
+    }
+  }));
+
+  assert.equal(agent.sends.length, 1, "remapped call_id must resolve execute, not send");
+  assert.equal(http2.runId, http1.runId);
+  assert.match(http2.text, /pong/);
+  assert.ok(logs.some((line) => line.includes("[durable] resolve execute id=call_toolu_01lookup")), logs.join("\n"));
+  error.mock.restore();
+  await hub.dropAll();
+});
+
+test("unmatched tool_results abort hung execute then path B, no drop+create", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new HeldToolAgent();
+  let createCount = 0;
+  const factory: AgentFactory = {
+    create: async (options) => {
+      createCount += 1;
+      agent.attachCreateOptions(options);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-unmatched-abort";
+
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: userTurn("Read README.md")
+  }));
+  const http2 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_other", content: "stale replay" }]
+    }
+  }));
+
+  assert.equal(createCount, 1);
+  assert.equal(agent.sends.length, 2);
+  assert.match(sendText(agent.sends[1]), /TOOL RESULT \(call_other\):\nstale replay/);
+  assert.equal(http2.text, "after tool");
+  assert.equal(agent.disposed, false);
+  await hub.dropAll();
+});
+
+test("SDK event tool_call with a different id than execute is not double-emitted", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new HeldToolAgent("call_read_1", "evt_other");
+  const factory: AgentFactory = {
+    create: async (options) => {
+      agent.attachCreateOptions(options);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const http1 = await runner.run(baseRun({
+    conversationSeed: "seed-dedup-ids",
+    tools: [readTool],
+    durableTurn: userTurn("Read README.md")
+  }));
+  assert.deepEqual(http1.toolCalls.map((call) => call.id), ["call_read_1"]);
+  assert.equal(http1.toolCalls.length, 1);
+  await hub.dropAll();
+});
+
+test("no Hub and kill switch off is true stateless, never old resume", async () => {
+  const created: TrackingAgent[] = [];
+  let resumeCount = 0;
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-nohub-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    },
+    resume: async () => {
+      resumeCount += 1;
+      throw new Error("SESSION_MODE=stateless must not resume");
+    }
+  };
+  const store = new MemoryStateStore();
+  const runner = new CursorSdkRunner(store, {
+    defaultWorkingDirectory: "/workspace",
+    sdkClientVersion: "test",
+    disableSessionResume: false
+  }, factory);
+  const flatten = "Conversation:\nUSER: hello\nASSISTANT: old\nUSER: next";
+  await runner.run(baseRun({ prompt: flatten, conversationSeed: "seed-nohub", stickyKey: "sticky-nohub" }));
+  await runner.run(baseRun({ prompt: flatten, conversationSeed: "seed-nohub", stickyKey: "sticky-nohub" }));
+  assert.equal(resumeCount, 0);
+  assert.equal(created.length, 2);
+  assert.equal(sendText(created[0].sends[0]), flatten);
+  assert.equal(created[0].disposed, true);
 });
 
 test("kill switch stays stateless even when a Hub is injected", async () => {
@@ -557,6 +700,11 @@ class HeldToolAgent implements AgentLike {
   readonly runs: HeldFakeRun[] = [];
   tools: Record<string, SDKCustomTool> | undefined;
 
+  constructor(
+    private readonly executeId = "call_read_1",
+    private readonly eventId?: string
+  ) {}
+
   attachCreateOptions(options: Record<string, unknown>): void {
     const local = asRecord(options.local);
     this.tools = local?.customTools as Record<string, SDKCustomTool> | undefined;
@@ -564,19 +712,30 @@ class HeldToolAgent implements AgentLike {
 
   async send(message: unknown): Promise<HeldFakeRun> {
     this.sends.push(message);
-    const tools = this.tools;
-    if (!tools?.Read) throw new Error("HeldToolAgent expected customTools.Read on create");
     const run = new HeldFakeRun();
     this.runs.push(run);
+    if (this.sends.length > 1) {
+      run.attach(async function* () {
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "after tool" }] }
+        };
+      });
+      return run;
+    }
+    const tools = this.tools;
+    if (!tools?.Read) throw new Error("HeldToolAgent expected customTools.Read on create");
+    const executeId = this.executeId;
+    const eventId = this.eventId ?? executeId;
     run.attach(async function* () {
       yield {
         type: "assistant",
         message: { content: [{ type: "text", text: "Calling Read." }] }
       };
-      const pending = tools.Read.execute({ file_path: "README.md" }, { toolCallId: "call_read_1" }) as Promise<unknown>;
+      const pending = tools.Read.execute({ file_path: "README.md" }, { toolCallId: executeId }) as Promise<unknown>;
       yield {
         type: "tool_call",
-        toolCall: { id: "call_read_1", name: "Read", arguments: { file_path: "README.md" } }
+        toolCall: { id: eventId, name: "Read", arguments: { file_path: "README.md" } }
       };
       const result = await pending;
       yield {

@@ -3,13 +3,15 @@ import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
 import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorClientType, waitForSandClientHook } from "./sand-client.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
-import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers } from "./protocol.js";
+import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers, responseCallIds } from "./protocol.js";
 import { durableSessionId } from "./durable-id.js";
 import {
   EventPump,
   createSessionSlot,
   durableSlotReplaceReason,
   recordIssuedToolCalls,
+  rememberCallAlias,
+  responsesCallId,
   touchSlotHistory,
   type HubPumpItem,
   type SessionHub,
@@ -64,7 +66,6 @@ export interface AgentFactory {
 }
 
 export class CursorSdkRunner implements CursorRunner {
-  private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly durableRunOrdinals = new Map<string, number>();
 
   constructor(
@@ -88,7 +89,11 @@ export class CursorSdkRunner implements CursorRunner {
        * 必须释放租约让引用计数归零、SDK dispose 掉它，否则这把 key 之后的每个请求都会秒失败到进程重启。
        */
       executorLeases?: ExecutorLeaseManager;
-      /** WP4 durable Hub。未注入时即使 kill switch 关闭也走今日 streamLocked（旧 resume）。 */
+      /**
+       * WP4 durable Hub. When omitted, every request is true stateless
+       * (create+full prompt+cancel+dispose). Never fall through to the old
+       * getSession/resume+full-transcript path.
+       */
       sessionHub?: SessionHub;
     },
     private readonly agentFactory?: AgentFactory
@@ -119,7 +124,7 @@ export class CursorSdkRunner implements CursorRunner {
       // kill switch 或本请求 forceStateless：每请求独立 fresh agent，没有共享会话状态需要保护；
       // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
       // client-type 必须包住整段 SDK 调用：header 是在 create/send 时写入的。
-      if (usesStatelessPath(input, this.input.disableSessionResume)) {
+      if (this.isStateless(input)) {
         yield* iterateWithCursorClientType(clientType, this.streamLocked(input, signal, id));
         return;
       }
@@ -137,11 +142,7 @@ export class CursorSdkRunner implements CursorRunner {
         return;
       }
       // D4: Hub 在但认不出会话 → 真 stateless（与 kill switch 相同）。禁止用 ownerHash/sessionKey 走旧 resume。
-      if (hub && !durableId) {
-        yield* iterateWithCursorClientType(clientType, this.streamLocked({ ...input, forceStateless: true }, signal, id));
-        return;
-      }
-      yield* iterateWithCursorClientType(clientType, this.withSessionLock(id, () => this.streamLocked(input, signal, id)));
+      yield* iterateWithCursorClientType(clientType, this.streamLocked({ ...input, forceStateless: true }, signal, id));
     } catch (error) {
       await this.recycleExecutorOnAuthFailure(input, error);
       throw error;
@@ -171,7 +172,7 @@ export class CursorSdkRunner implements CursorRunner {
     // 全部与 abort 竞速：空闲超时或客户端断连时请求一定能收尾，而不是永久悬挂、随流量持续堆积句柄与内存。
     const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
     recordRunTelemetry(input, resolved);
-    const existingAgentId = usesStatelessPath(input, this.input.disableSessionResume) ? undefined : await this.store.getSession(id);
+    const existingAgentId = this.isStateless(input) ? undefined : await this.store.getSession(id);
     let resumedAgent: AgentLike | undefined;
     if (existingAgentId && typeof factory.resume === "function") {
       try {
@@ -225,22 +226,6 @@ export class CursorSdkRunner implements CursorRunner {
       logDeduped(`sent\0${input.model}\0${summary}`, `[model-params] model="${input.model}" sending params: ${summary}`);
     }
     return { model, ...(intent.mode ? { mode: intent.mode } : {}) };
-  }
-
-  private async *withSessionLock(id: string, run: () => AsyncIterable<CursorStreamEvent>): AsyncIterable<CursorStreamEvent> {
-    const previous = this.sessionLocks.get(id) ?? Promise.resolve();
-    let release!: () => void;
-    const current = previous.catch(() => undefined).then(() => new Promise<void>((resolve) => {
-      release = resolve;
-    }));
-    this.sessionLocks.set(id, current);
-    await previous.catch(() => undefined);
-    try {
-      yield* run();
-    } finally {
-      release();
-      if (this.sessionLocks.get(id) === current) this.sessionLocks.delete(id);
-    }
   }
 
   /**
@@ -337,13 +322,22 @@ export class CursorSdkRunner implements CursorRunner {
           console.error(`[durable] resolve execute id=${result.id}`);
         }
       }
-      if (!resolvedAny) {
-        const text = formatPathBToolResults(turn.toolResults ?? []);
-        await sendRecoverable({ kind: "tool_results", message: text, firstSend: false });
-      } else if ((hub.get(sessionId)?.pending.size ?? 0) === 0) {
-        // Path A HTTP2: same Run continues; leave awaiting_tools only while execute is still held.
-        hub.markRunning(sessionId);
+      if (resolvedAny) {
+        if ((hub.get(sessionId)?.pending.size ?? 0) === 0) {
+          // Path A HTTP2: same Run continues; leave awaiting_tools only while execute is still held.
+          hub.markRunning(sessionId);
+        }
+        slot = hub.get(sessionId) ?? slot;
+        yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+        return;
       }
+      // Nothing resolved. If execute is still hung, path B send would hit "active run" and drop+create.
+      if (slot.pending.size > 0) {
+        console.error(`[durable] unmatched tool_results; abort hung execute session=${sessionId.slice(0, 12)}`);
+        await this.abortHungDurableRun(hub, sessionId, slot, "unmatched tool_result");
+      }
+      const text = formatPathBToolResults(turn.toolResults ?? []);
+      await sendRecoverable({ kind: "tool_results", message: text, firstSend: false });
       slot = hub.get(sessionId) ?? slot;
       yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
       return;
@@ -351,14 +345,7 @@ export class CursorSdkRunner implements CursorRunner {
 
     if (slot.state === "awaiting_tools") {
       console.error(`[durable] user cancelled pending tools session=${sessionId.slice(0, 12)}`);
-      for (const id of [...slot.pending.keys()]) {
-        hub.rejectPending(sessionId, id, new Error("user cancelled tools"));
-      }
-      await withCleanupTimeout(slot.run?.cancel?.().catch(() => undefined));
-      if (slot.waitPromise) await withCleanupTimeout(slot.waitPromise.catch(() => undefined));
-      slot.run = undefined;
-      slot.waitPromise = undefined;
-      slot.runId = undefined;
+      await this.abortHungDurableRun(hub, sessionId, slot, "user cancelled tools");
     }
 
     const firstSend = slot.lastUserText === undefined && !slot.resumed;
@@ -531,6 +518,23 @@ export class CursorSdkRunner implements CursorRunner {
     });
   }
 
+  private async abortHungDurableRun(
+    hub: SessionHub,
+    sessionId: string,
+    slot: SessionSlot,
+    reason: string
+  ): Promise<void> {
+    for (const id of [...slot.pending.keys()]) {
+      hub.rejectPending(sessionId, id, new Error(reason));
+    }
+    await withCleanupTimeout(slot.run?.cancel?.().catch(() => undefined));
+    if (slot.waitPromise) await withCleanupTimeout(slot.waitPromise.catch(() => undefined));
+    slot.run = undefined;
+    slot.waitPromise = undefined;
+    slot.runId = undefined;
+    hub.markIdle(sessionId);
+  }
+
   private async dropDurableSession(hub: SessionHub, sessionId: string): Promise<void> {
     this.durableRunOrdinals.delete(sessionId);
     await hub.drop(sessionId).catch(() => undefined);
@@ -602,6 +606,7 @@ export class CursorSdkRunner implements CursorRunner {
   ): AsyncIterable<CursorStreamEvent> {
     const usageLedger = new TurnUsageLedger();
     const capturedToolCalls: GatewayToolCall[] = [];
+    const sdkEventToolCalls: GatewayToolCall[] = [];
     const textParts: string[] = [];
     const keepThinking = !input.stream;
     const thinkingParts: string[] = [];
@@ -615,7 +620,7 @@ export class CursorSdkRunner implements CursorRunner {
     let pathB = false;
 
     const parkPathB = (): void => {
-      recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+      recordIssuedToolCalls(slot, issuedIdsWithAliases(slot, toolCalls));
       hub.markIdle(sessionId);
     };
 
@@ -710,13 +715,25 @@ export class CursorSdkRunner implements CursorRunner {
       }
       const errorDetail = errorDetailFromSdkEvent(event);
       if (errorDetail) streamErrorDetails.push(errorDetail);
-      const eventToolCalls = keepDeclaredOnly(toolCallsFromSdkEvent(event))
+      const parsedEventCalls = keepDeclaredOnly(toolCallsFromSdkEvent(event))
         .map((toolCall) => normalizeToolCallForClient(toolCall, input.tools));
-      for (const toolCall of eventToolCalls) {
-        pushToolCall(toolCalls, toolCall);
-        yield { type: "tool_call", toolCall };
+      for (const toolCall of parsedEventCalls) {
+        pushToolCall(sdkEventToolCalls, toolCall);
       }
     }
+
+    const collectHeldToolCall = (toolCall: GatewayToolCall): GatewayToolCall | undefined => {
+      const declared = keepDeclaredOnly([toolCall]);
+      if (!declared.length) return undefined;
+      const normalized = normalizeToolCallForClient(declared[0], input.tools);
+      if (toolCalls.some((item) => item.id === normalized.id || sameToolInvocation(item, normalized))) {
+        return undefined;
+      }
+      pushToolCall(toolCalls, normalized);
+      rememberCallAlias(slot, normalized.id, responseCallIds(normalized).callId);
+      rememberCallAlias(slot, normalized.id, responsesCallId(normalized.id));
+      return normalized;
+    };
 
     const parkHeld = async function* (): AsyncIterable<CursorStreamEvent> {
       await hub.settleParallelTools();
@@ -733,14 +750,22 @@ export class CursorSdkRunner implements CursorRunner {
           yield* applyEvent(extra.event);
         }
       }
-      for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
-        const declared = keepDeclaredOnly([toolCall]);
-        if (!declared.length) continue;
-        const normalized = normalizeToolCallForClient(declared[0], input.tools);
-        pushToolCall(toolCalls, normalized);
-        yield { type: "tool_call", toolCall: normalized };
+      const start = toolCalls.length;
+      if (slot.pending.size > 0) {
+        for (const toolCall of capturedToolCalls) collectHeldToolCall(toolCall);
+        for (const eventCall of sdkEventToolCalls) {
+          if (toolCalls.some((item) => item.id === eventCall.id || sameToolInvocation(item, eventCall))) continue;
+          const matchId = [...slot.pending.keys()].find((id) => slot.pending.get(id)?.name === eventCall.name);
+          if (matchId) collectHeldToolCall({ ...eventCall, id: matchId });
+        }
+      } else {
+        for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) collectHeldToolCall(toolCall);
+        for (const toolCall of sdkEventToolCalls) collectHeldToolCall(toolCall);
       }
-      recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+      for (const toolCall of toolCalls.slice(start)) {
+        yield { type: "tool_call", toolCall };
+      }
+      recordIssuedToolCalls(slot, issuedIdsWithAliases(slot, toolCalls));
       hub.beginAwaitingTools(sessionId);
       yield {
         type: "done",
@@ -813,17 +838,18 @@ export class CursorSdkRunner implements CursorRunner {
       }
     }
 
-    for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
-      const declared = keepDeclaredOnly([toolCall]);
-      if (!declared.length) continue;
-      const normalized = normalizeToolCallForClient(declared[0], input.tools);
-      pushToolCall(toolCalls, normalized);
-      yield { type: "tool_call", toolCall: normalized };
-    }
-
     if (slot.pending.size > 0) {
       yield* parkHeld();
       return;
+    }
+
+    for (const toolCall of pendingCapturedToolCalls(capturedToolCalls, toolCalls)) {
+      const emitted = collectHeldToolCall(toolCall);
+      if (emitted) yield { type: "tool_call", toolCall: emitted };
+    }
+    for (const toolCall of sdkEventToolCalls) {
+      const emitted = collectHeldToolCall(toolCall);
+      if (emitted) yield { type: "tool_call", toolCall: emitted };
     }
 
     let waitError: unknown;
@@ -873,7 +899,7 @@ export class CursorSdkRunner implements CursorRunner {
       throw upstreamRunError(input.model, uniqueJoined([...streamErrorDetails, errorMessage(waitError)]));
     }
 
-    recordIssuedToolCalls(slot, toolCalls.map((toolCall) => toolCall.id));
+    recordIssuedToolCalls(slot, issuedIdsWithAliases(slot, toolCalls));
     hub.markIdle(sessionId);
     yield {
       type: "done",
@@ -1146,7 +1172,7 @@ export class CursorSdkRunner implements CursorRunner {
         agentId: agent.agentId,
         runId: run.id
       };
-      if (!usesStatelessPath(input, this.input.disableSessionResume) && agent.agentId) await this.store.saveSession(id, agent.agentId);
+      if (!this.isStateless(input) && agent.agentId) await this.store.saveSession(id, agent.agentId);
       yield { type: "done", result };
       finishedNormally = true;
     } finally {
@@ -1235,6 +1261,11 @@ export class CursorSdkRunner implements CursorRunner {
 
   private sdkMessage(input: CursorRunRequest): unknown {
     return sdkTextMessage(input.prompt, input.images);
+  }
+
+  /** 进程级 kill switch、单请求 forceStateless、或未注入 Hub：跳过 Hub 与旧 resume 的 get/save。 */
+  private isStateless(input: CursorRunRequest): boolean {
+    return Boolean(this.input.disableSessionResume || input.forceStateless || !this.input.sessionHub);
   }
 }
 
@@ -1436,11 +1467,6 @@ function sessionId(input: CursorRunRequest): string {
   return createHash("sha256")
     .update([input.apiKey, input.model, input.sessionKey, input.workingDirectory ?? ""].join("\0"))
     .digest("hex");
-}
-
-/** 进程级 kill switch 或单请求 forceStateless：跳过 Hub 与旧 resume 的 get/save。 */
-function usesStatelessPath(input: CursorRunRequest, disableSessionResume?: boolean): boolean {
-  return Boolean(disableSessionResume || input.forceStateless);
 }
 
 function durableIdempotencyKey(sessionId: string, runOrdinal: number, kind: string): string {
@@ -1865,11 +1891,9 @@ export function toolCallsFromSdkEvent(event: unknown): GatewayToolCall[] {
   if (truncated?.args === true) return [];
   const args = objectArgs(tool.arguments) ?? objectArgs(tool.args) ?? objectArgs(tool.input);
   if (!args) return [];
-  return [{
-    id: stringValue(tool.id) ?? stringValue(tool.call_id) ?? stringValue(tool.callId) ?? `call_${randomUUID().replaceAll("-", "")}`,
-    name,
-    arguments: args
-  }];
+  const id = stringValue(tool.id) ?? stringValue(tool.call_id) ?? stringValue(tool.callId);
+  if (!id) return [];
+  return [{ id, name, arguments: args }];
 }
 
 function toolCallsFromAssistantMessage(record: Record<string, unknown>): GatewayToolCall[] {
@@ -1881,8 +1905,10 @@ function toolCallsFromAssistantMessage(record: Record<string, unknown>): Gateway
     if (item?.type !== "tool_use") continue;
     const name = typeof item.name === "string" ? item.name.trim() : "";
     if (!name) continue;
+    const id = stringValue(item.id);
+    if (!id) continue;
     toolCalls.push({
-      id: stringValue(item.id) ?? `call_${randomUUID().replaceAll("-", "")}`,
+      id,
       name,
       arguments: objectArgs(item.input) ?? {}
     });
@@ -1902,6 +1928,22 @@ function pushToolCall(toolCalls: GatewayToolCall[], toolCall: GatewayToolCall): 
     return;
   }
   toolCalls.push(toolCall);
+}
+
+function sameToolInvocation(left: GatewayToolCall, right: GatewayToolCall): boolean {
+  return left.name === right.name && JSON.stringify(left.arguments) === JSON.stringify(right.arguments);
+}
+
+function issuedIdsWithAliases(slot: SessionSlot, toolCalls: GatewayToolCall[]): string[] {
+  const ids: string[] = [];
+  for (const toolCall of toolCalls) {
+    ids.push(toolCall.id);
+    ids.push(responsesCallId(toolCall.id));
+    ids.push(responseCallIds(toolCall).callId);
+    rememberCallAlias(slot, toolCall.id, responsesCallId(toolCall.id));
+    rememberCallAlias(slot, toolCall.id, responseCallIds(toolCall).callId);
+  }
+  return ids;
 }
 
 function pendingCapturedToolCalls(captured: GatewayToolCall[], emitted: GatewayToolCall[]): GatewayToolCall[] {

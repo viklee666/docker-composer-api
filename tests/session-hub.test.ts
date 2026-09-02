@@ -114,6 +114,25 @@ test("hold:true execute returns a pending Promise and never the fake-success cop
   await hub.dropAll();
 });
 
+test("resolvePending accepts Responses call_ prefix of the hung execute id", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const sessionId = "sess-alias";
+  hub.put(sessionId, createSessionSlot({
+    agent: { agentId: "a", send: async () => { throw new Error("unused"); } },
+    agentId: "a",
+    apiKey: "key",
+    model: "composer-2.5"
+  }));
+  let resolved: unknown;
+  hub.registerHold(sessionId, "toolu_01abc", "lookup", (value) => {
+    resolved = value;
+  }, () => undefined);
+  assert.equal(hub.resolvePending(sessionId, "call_toolu_01abc", { content: [{ type: "text", text: "pong" }] }), true);
+  assert.deepEqual(resolved, { content: [{ type: "text", text: "pong" }] });
+  assert.equal(hub.get(sessionId)?.pending.size, 0);
+  await hub.dropAll();
+});
+
 test("parallel tools after first execute are collected across the settle window", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const sessionId = "sess-parallel";

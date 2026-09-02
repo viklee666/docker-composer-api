@@ -220,8 +220,8 @@ export interface DurableTurn {
   toolsFingerprint: string;
   toolResults?: Array<{ id: string; content: string; isError?: boolean }>;
   /**
-   * Unhashed client system text (`systemSeedText(body)`). Additive; first durable
-   * send may prefix `SYSTEM:\n{systemText}`. Omitted when empty so WP2 cases stay intact.
+   * Unhashed system text after gateway append/override (`resolveSystemText`).
+   * First durable send may prefix `SYSTEM:\n{systemText}`. Omitted when empty.
    */
   systemText?: string;
 }

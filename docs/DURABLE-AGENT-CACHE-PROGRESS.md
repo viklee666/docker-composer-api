@@ -38,7 +38,6 @@
 - 选定方案：持久 Agent + 增量 send + 同 Run 挂起 execute（WP0 fail 则 §2.1 降级 B）
 - Kill switch：`CURSOR_SDK_DISABLE_SESSION_RESUME=true` 必须仍是今日 create+全文+假成功+cancel+dispose
 - WP7 已翻生产默认：新部署 durable；kill switch 默认 false；`CURSOR_SDK_DISABLE_SESSION_RESUME=true` 仍锁回今日路径（测试锁定）
-- 未 git commit（除非用户另说）
 
 ---
 
@@ -322,7 +321,7 @@ Task 子代理**看不到** Cursor `/sdk` skill。主会话从 WP4 起必须把�
 
 ### WP8 · 人工验证
 
-- 状态：已完成（本环境能做的 Fake 等价物；live 未做）
+- 状态：Fake 已完成；live 部分完成（key/目录/durable create+send 已见，S1 首轮后 Windows SDK AV 中断）
 - 已做（Fake / 单测等价，非 live）：
   - S1 纯文本多轮：`tests/cursor-durable-runner.test.ts`「durable two user turns」— 一次 create、两次增量 send、第二次 payload 无 `ASSISTANT:`
   - S2 工具往返（WP0 pass / path A）：同文件「durable held execute」— 一次 create、一次 send、`resolve execute`、同一 runId、中间无 cancel/dispose
@@ -331,13 +330,32 @@ Task 子代理**看不到** Cursor `/sdk` skill。主会话从 WP4 起必须把�
   - D18 path B：marker 短 send；abort 后 slot 仍 idle
   - 三端点 `durableTurn` 接线：chat / responses / messages
   - WP5 busy/stale/指纹 drop+create；WP6 钉 key 401 不换 key
-- 未做项（环境无 `CURSOR_API_KEY` / `CURSOR_API_KEYS`，**未假装测过**）：
-  - S1/S2/S3/S4/S5 live（真实 Composer 缓存率、Claude Code Read、Responses `previous_response_id` 真链、kill switch 重启后真请求）
-  - S6 两 seed 交错 live
-  - S7 Hold TTL 15min 实墙（单测有缩短 TTL）
-  - S8 停用一把 key 后其它会话仍可用（pin 单测有，live 隔离无）
-  - WP0 live held-execute 2s（测试 skip）
-- 未 git commit
+- live（2026-09-02，Windows 宿主机 + `.env` 真实 Cursor key，模型目录含 `grok-4.6`）：
+  - **已过**：网关启动日志 `Cursor SDK session mode: durable`；`GET /v1/models` 200，目录有 `grok-4.6`；S1 走到 `[durable] create agentId=...` + `[durable] send first`（增量路径已接线）
+  - **未完成 S1 及之后**：`Agent.send` 加载 `@cursor/sdk` 的 `357.js`（local runtime）后进程以 **0xC0000005 ACCESS_VIOLATION** 退出，客户端 `ECONNRESET`。空工作区同样崩。`CURSOR_PREWARM=false` 挡不住这次崩溃（README 只覆盖了启动预热扫描）
+  - Linux 旁路未跑成：Docker Desktop 引擎起不来（`com.docker.service` 未开、引擎 `_ping` HTTP 500；WSL Ubuntu `HCS/0x800705aa` 资源不足，当时空闲物理内存约 1.6GB）
+  - 脚本：`scripts/live-durable-smoke.mjs`（勿把密钥打进日志）。Linux/Docker 起来后：`node scripts/live-durable-smoke.mjs`，或已有网关时 `LIVE_GATEWAY_URL=http://127.0.0.1:8787 node scripts/live-durable-smoke.mjs`
+- 仍未做（需 Linux 宿主或可用的 Docker）：S1 第二轮 cacheRead、S2 path A `resolve execute`、S3/S4/S5 live、S6–S8、WP0 live held-execute 2s
+
+### 审阅十项（2026-09-02）
+
+代码已修：
+
+1. Responses `call_${suffix}` 与 hung execute id 别名：`registerHold` / `resolvePending` / `inboundHistoryIncompatible`
+2. `SESSION_MODE=stateless` 且无 Hub = 真 stateless（create+全文+cancel+dispose），不再走旧 resume；`trackAgentBaseline` 只在 durable Hub
+3. `tool_results` 对不上 pending 时先 reject/cancel 挂起 execute，再 path B send
+4. `SYSTEM_PROMPT` append|override 进入 `extractDurableTurn` / 首轮 `SYSTEM:` send
+6. SDK 事件缺 tool id 不再 `randomUUID()`
+7. parkHeld 优先 execute 捕获，同一次 park 只下发一次 tool_call，并记下 Responses call_id 别名
+
+按计划保留：
+
+5. server 入口仍不传 `slotHints`（durableSessionId 含 apiKey，gateway 要等选 key）。runner 的 `ensureDurableSlot` + lastUserText 400 仍对齐指纹 / empty
+8. WP0 仍为 `held-execute: pass`（源码/类型；live skip / Windows AV）。不假装 live 过
+9. 共享内存 store：重启后续不上 checkpoint（D9/D10）。idle 续聊 = 新 agent；重启 leftover `tool_results` = 400
+10. 相同 last user 再发仍 400 `Empty durable turn`，不是幂等回放（避免对 idle agent 再 send 同一句）
+
+- 验证：`npx tsc --noEmit -p tsconfig.json` 干净；`npm test` 514 tests / 512 pass / 2 skip / 0 fail
 
 ---
 

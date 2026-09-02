@@ -173,10 +173,9 @@ const runner = new KeyRotatingRunner(sdkRunner, keyPool, {
  */
 const usageReconciler = new UsageReconciler({
   store,
-  // kill switch 打开：每个请求都是全新 agent，不落基线（今日）。
-  // kill switch 关闭：runner 仍可能跨请求复用 agent（旧 resume，以及 WP3+ durable Hub），必须记增量。
-  // durable 时 shouldUseDurableHub 为 true；它蕴含 kill switch 关闭，与 !disable 一并写明意图。
-  trackAgentBaseline: useDurableHub || !config.cursorSdkDisableSessionResume
+  // 只有 durable Hub 会跨请求复用 agent，才记增量基线。
+  // kill switch / SESSION_MODE=stateless 都是每请求 create+dispose，不落基线。
+  trackAgentBaseline: useDurableHub
 });
 
 const app = createApp({
@@ -199,7 +198,7 @@ if (config.cursorSdkDisableSessionResume) {
     `Cursor SDK session mode: durable (idle ttl ${Math.round(config.cursorSdkSessionIdleTtlMs / 1000)}s, max ${config.cursorSdkMaxLiveSessions})`
   );
 } else {
-  console.log("Cursor SDK session mode: stateless (SESSION_MODE=stateless; kill switch off)");
+  console.log("Cursor SDK session mode: stateless (create+full prompt+cancel+dispose; same as kill switch)");
 }
 if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1.1 mode enabled");
 if (config.sandClientMode) console.log("Cursor Sand channel enabled globally (per-key overrides still apply)");

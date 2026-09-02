@@ -9,8 +9,9 @@ import {
   responseContentToText
 } from "./protocol.js";
 import { systemSeedText } from "./routing.js";
+import { resolveSystemText } from "./system-prompt.js";
 import { isHostMetaTool } from "./tool-compat.js";
-import type { DurableTurn, GatewayImage, GatewayTool, ProtocolKind } from "./types.js";
+import type { DurableTurn, GatewayImage, GatewayTool, ProtocolKind, SystemPromptSettings } from "./types.js";
 
 /**
  * Slot 侧提示：与 SessionHub 对齐的最小字段。历史 checksum 等由后续 WP 扩展。
@@ -39,15 +40,20 @@ interface TurnBits {
  *
  * `protocol` 决定 messages / input / tool_result 形状；`previous` 只给 Responses
  * `previous_response_id` 用来对上 `call_id`（含宿主元工具丢弃）。
+ * `systemPrompt` 与 flatten 路径同一套 append/override，否则 durable send 会丢掉后台系统提示。
+ *
+ * `slotHints` 需要活 slot。gateway 选 key 之前 server 往往还没有 durableSessionId，
+ * 指纹 / lastUserText 由 runner `ensureDurableSlot` 对齐；入口能拿到 hints 时仍应传入。
  */
 export function extractDurableTurn(
   protocol: ProtocolKind,
   body: unknown,
   previous?: DurablePrevious,
-  slotHints?: DurableSlotHints
+  slotHints?: DurableSlotHints,
+  systemPrompt?: SystemPromptSettings
 ): DurableTurn {
   const record = asRecord(body) ?? {};
-  const systemText = systemSeedText(record);
+  const systemText = resolveSystemText(systemSeedText(record), systemPrompt);
   const systemFingerprint = sha256Hex(systemText);
   const toolsFingerprint = fingerprintTools(parseTools(protocol, record));
   const withSystem = (turn: DurableTurn): DurableTurn => (systemText ? { ...turn, systemText } : turn);
