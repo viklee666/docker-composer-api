@@ -148,9 +148,6 @@ const SCHEMA = `
     updated_at TEXT NOT NULL,
     source_cursor_key_id TEXT
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_credentials_source_key
-    ON cc_credentials(source_cursor_key_id)
-    WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != '';
 
   CREATE TABLE IF NOT EXISTS cc_conversations (
     id TEXT PRIMARY KEY,
@@ -369,14 +366,14 @@ export class CursorConnectStore {
         // 并发启动时另一个进程可能刚加过；下一次 hasColumn 就能看到。
       }
     }
-    try {
+    // 索引必须在补列之后建：SCHEMA 里的 CREATE TABLE IF NOT EXISTS 不会给旧表加列，
+    // 若把这个 UNIQUE INDEX 放进 SCHEMA，旧库会在 migrate 之前就以 "no such column" 炸死进程。
+    if (this.hasColumn("cc_credentials", "source_cursor_key_id")) {
       this.db.exec(
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_credentials_source_key
          ON cc_credentials(source_cursor_key_id)
          WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != ''`
       );
-    } catch {
-      // 同上：并发启动时索引可能已经在。
     }
   }
 

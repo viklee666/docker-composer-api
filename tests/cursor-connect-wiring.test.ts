@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.js";
 import { ApiError } from "../src/errors.js";
@@ -93,6 +97,56 @@ test("the stored token is not sitting in the database as plain text", () => {
   const raw = store.rawCredentialRow(record.id);
   assert.ok(raw, "row should exist");
   assert.ok(!JSON.stringify(raw).includes("super-secret-token"), "落库的值不该是明文");
+  store.close();
+});
+
+test("opening an existing cc_credentials table without source_cursor_key_id migrates instead of crashing", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "cc-store-")), "state.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE cc_credentials (
+      id TEXT PRIMARY KEY,
+      label TEXT,
+      encrypted_session_token TEXT NOT NULL,
+      token_type TEXT,
+      expires_at TEXT,
+      machine_id TEXT NOT NULL,
+      mac_machine_id TEXT,
+      client_version TEXT NOT NULL,
+      client_os TEXT,
+      client_arch TEXT,
+      client_os_version TEXT,
+      device_type TEXT,
+      client_key TEXT,
+      session_id TEXT,
+      timezone TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      allowed_models TEXT,
+      excluded_models TEXT,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      last_used_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO cc_credentials
+      (id, label, encrypted_session_token, machine_id, client_version, status, failure_count, created_at, updated_at)
+      VALUES ('cred-1', 'legacy', '${Buffer.from("old-token", "utf8").toString("base64")}', 'machine-1', '3.18.9', 'active', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+  `);
+  legacy.close();
+
+  const store = CursorConnectStore.open(path);
+  const row = store.credential("cred-1");
+  assert.equal(row?.label, "legacy");
+  assert.equal(row?.sessionToken, "old-token");
+  assert.equal(row?.sourceCursorKeyId, undefined);
+  const imported = store.upsertCredential({
+    sessionToken: "new-token",
+    machineId: "machine-2",
+    clientVersion: "3.18.9",
+    sourceCursorKeyId: "key-1"
+  });
+  assert.equal(store.credentialBySourceKeyId("key-1")?.id, imported.id);
   store.close();
 });
 
