@@ -1,17 +1,21 @@
 /**
- * 有界内存版 Cursor SDK LocalAgentStore（对接 @cursor/sdk 的 local.store 注入点）。
+ * Cursor SDK LocalAgentStore 注入点（local.store）。
  *
- * 为什么需要它：SDK 默认的 SqliteLocalAgentStore 是"每个 Agent.create 各开一份"的生命周期，
- * 实测每个 agent 会残留约 7~8 个内核句柄且 dispose 后不释放（Windows/Linux fd 同理），
- * 网关"每请求 fresh agent"的用法会让句柄随请求数线性增长，长期运行后拖垮进程。
- * SDK 自带的 JsonlLocalAgentStore 虽可全局共享，但按行追加 + 更新时全文件重写，
- * 高流量下磁盘无限增长且重写成本随历史线性上升，同样是慢性死亡。
+ * 生产用进程级有界 SQLite（createSqliteAgentStore）：一个 DatabaseSync 文件，
+ * 路径由调用方传入（index.ts 用 dirname(sqlitePath)/agents.sqlite → compose 下 /data/agents.sqlite）。
+ * 禁止 SDK 默认的 SqliteLocalAgentStore.open（每 agent 一份 store.db，实测残留 7~8 个句柄且 dispose 不释放），
+ * 禁止 JsonlLocalAgentStore（按行追加 + 更新时全文件重写），禁止写进 state.sqlite（Connect 已对该文件另开连接）。
  *
- * 网关始终注入这一份共享内存 store（禁止 omit 后落到 SDK 每 agent SQLite）。
- * kill switch 打开（CURSOR_SDK_DISABLE_SESSION_RESUME=true）：agent 记录只在单次请求内有意义，
- * idle TTL 用无参默认 10 分钟。durable 默认把 idle TTL 拉长到 CURSOR_SDK_SESSION_IDLE_TTL_MS（60min）。
- * 两层回收：闲置超时清理 + 超量 LRU。进程重启后内存 checkpoint 丢失，下一请求 fresh create（可接受）。
+ * createEphemeralAgentStore 仍导出：tests/server.test.ts 在用，语义保持 upsert + 有界内存。
+ *
+ * 网关始终注入 store（禁止 omit 后落到 SDK 每 agent SQLite）。kill switch 只改 TTL：
+ * 打开 → 无参默认 10min/256；关闭 → CURSOR_SDK_SESSION_IDLE_TTL_MS / CURSOR_SDK_MAX_LIVE_SESSIONS。
+ * 两层回收：闲置超时 + 超量 LRU，SQL DELETE 行，不关连接、不 unlink 每 agent 文件。
  */
+
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 interface AgentDocument {
   readonly agentId: string;
@@ -263,6 +267,395 @@ export function createEphemeralAgentStore(options?: EphemeralAgentStoreOptions) 
   };
 
   return { agents, runs, checkpoints, runEvents: runEventsStore };
+}
+
+/** 与 SQLITE_PATH 同目录；compose 默认 SQLITE_PATH=/data/state.sqlite → /data/agents.sqlite。 */
+export const AGENT_STORE_FILENAME = "agents.sqlite";
+
+export type SqliteAgentStore = ReturnType<typeof createSqliteAgentStore>;
+
+/**
+ * 进程级有界 SQLite LocalAgentStore。一个连接贯穿进程生命周期，永不 per-agent open/close/unlink。
+ */
+export function createSqliteAgentStore(path: string, options?: EphemeralAgentStoreOptions) {
+  const idleTtlMs = positiveBound(options?.idleTtlMs, STATELESS_AGENT_STORE_IDLE_TTL_MS);
+  const maxAgents = positiveBound(options?.maxAgents, STATELESS_AGENT_STORE_MAX_AGENTS);
+  mkdirSync(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  try {
+    db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+  } catch {
+    // 内存库等场景不支持 WAL，忽略。
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      agent_id TEXT PRIMARY KEY,
+      document_json TEXT,
+      touched_at INTEGER NOT NULL,
+      lru_seq INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agents_lru ON agents(lru_seq);
+    CREATE INDEX IF NOT EXISTS idx_agents_touched ON agents(touched_at);
+
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      document_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_runs_agent ON runs(agent_id);
+
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      agent_id TEXT NOT NULL,
+      blob_id TEXT NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY (agent_id, blob_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS run_events (
+      run_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      offset TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT,
+      payload_ref TEXT,
+      idempotency_key TEXT,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (run_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_events_offset ON run_events(run_id, offset);
+
+    CREATE TABLE IF NOT EXISTS run_event_meta (
+      run_id TEXT PRIMARY KEY,
+      agent_id TEXT,
+      touched_at INTEGER NOT NULL
+    );
+  `);
+
+  let lruClock = Number(db.prepare("SELECT COALESCE(MAX(lru_seq), 0) AS n FROM agents").get()?.n ?? 0);
+  let closed = false;
+
+  const nextLru = (): number => {
+    lruClock += 1;
+    return lruClock;
+  };
+
+  const dropAgent = (agentId: string): void => {
+    const runIds = new Set<string>();
+    for (const row of db.prepare("SELECT run_id FROM runs WHERE agent_id = ?").all(agentId)) {
+      if (typeof row.run_id === "string") runIds.add(row.run_id);
+    }
+    for (const row of db.prepare("SELECT run_id FROM run_event_meta WHERE agent_id = ?").all(agentId)) {
+      if (typeof row.run_id === "string") runIds.add(row.run_id);
+    }
+    const deleteEvents = db.prepare("DELETE FROM run_events WHERE run_id = ?");
+    const deleteMeta = db.prepare("DELETE FROM run_event_meta WHERE run_id = ?");
+    for (const runId of runIds) {
+      deleteEvents.run(runId);
+      deleteMeta.run(runId);
+    }
+    db.prepare("DELETE FROM runs WHERE agent_id = ?").run(agentId);
+    db.prepare("DELETE FROM checkpoints WHERE agent_id = ?").run(agentId);
+    db.prepare("DELETE FROM agents WHERE agent_id = ?").run(agentId);
+  };
+
+  const sweep = (): void => {
+    const now = Date.now();
+    const idleIds = db
+      .prepare("SELECT agent_id FROM agents WHERE ? - touched_at >= ?")
+      .all(now, idleTtlMs)
+      .flatMap((row) => (typeof row.agent_id === "string" ? [row.agent_id] : []));
+    for (const agentId of idleIds) dropAgent(agentId);
+
+    for (;;) {
+      const count = Number(db.prepare("SELECT COUNT(*) AS n FROM agents").get()?.n ?? 0);
+      if (count < maxAgents) break;
+      const oldest = db.prepare("SELECT agent_id FROM agents ORDER BY lru_seq ASC, agent_id ASC LIMIT 1").get();
+      if (typeof oldest?.agent_id !== "string") break;
+      dropAgent(oldest.agent_id);
+    }
+
+    const orphan = db
+      .prepare("SELECT run_id FROM run_event_meta WHERE agent_id IS NULL AND ? - touched_at >= ?")
+      .all(now, idleTtlMs);
+    const deleteEvents = db.prepare("DELETE FROM run_events WHERE run_id = ?");
+    const deleteMeta = db.prepare("DELETE FROM run_event_meta WHERE run_id = ?");
+    for (const row of orphan) {
+      if (typeof row.run_id !== "string") continue;
+      deleteEvents.run(row.run_id);
+      deleteMeta.run(row.run_id);
+    }
+  };
+
+  const touch = (agentId: string): void => {
+    const existing = db.prepare("SELECT 1 AS ok FROM agents WHERE agent_id = ?").get(agentId);
+    const now = Date.now();
+    const seq = nextLru();
+    if (existing) {
+      db.prepare("UPDATE agents SET touched_at = ?, lru_seq = ? WHERE agent_id = ?").run(now, seq, agentId);
+      return;
+    }
+    sweep();
+    db.prepare("INSERT INTO agents (agent_id, document_json, touched_at, lru_seq) VALUES (?, NULL, ?, ?)").run(
+      agentId,
+      now,
+      seq
+    );
+  };
+
+  const writeAgent = (agent: AgentDocument): AgentDocument => {
+    touch(agent.agentId);
+    db.prepare("UPDATE agents SET document_json = ? WHERE agent_id = ?").run(JSON.stringify(agent), agent.agentId);
+    return agent;
+  };
+
+  const associateRun = (runId: string, agentId: string): void => {
+    db.prepare(
+      `INSERT INTO run_event_meta (run_id, agent_id, touched_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET agent_id = excluded.agent_id`
+    ).run(runId, agentId, Date.now());
+  };
+
+  const writeRun = (run: RunDocument): RunDocument => {
+    touch(run.agentId);
+    db.prepare(
+      `INSERT INTO runs (run_id, agent_id, document_json)
+       VALUES (?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET agent_id = excluded.agent_id, document_json = excluded.document_json`
+    ).run(run.runId, run.agentId, JSON.stringify(run));
+    associateRun(run.runId, run.agentId);
+    return run;
+  };
+
+  const writeBlob = (agentId: string, blobId: string, data: Uint8Array): void => {
+    touch(agentId);
+    db.prepare(
+      `INSERT INTO checkpoints (agent_id, blob_id, data)
+       VALUES (?, ?, ?)
+       ON CONFLICT(agent_id, blob_id) DO UPDATE SET data = excluded.data`
+    ).run(agentId, blobId, data);
+  };
+
+  const agents = {
+    async get(input: { agentId: string }): Promise<AgentDocument | null> {
+      const row = db.prepare("SELECT document_json FROM agents WHERE agent_id = ?").get(input.agentId);
+      return parseDocument<AgentDocument>(row?.document_json);
+    },
+    async create(input: { agent: AgentDocument }): Promise<AgentDocument> {
+      return writeAgent(input.agent);
+    },
+    async update(input: { agent: AgentDocument }): Promise<AgentDocument> {
+      return writeAgent(input.agent);
+    },
+    async delete(input: { filter: { agentIds?: readonly string[]; cwd?: string } }): Promise<void> {
+      const rows = db.prepare("SELECT agent_id, document_json FROM agents").all();
+      for (const row of rows) {
+        if (typeof row.agent_id !== "string") continue;
+        if (input.filter.agentIds?.length && !input.filter.agentIds.includes(row.agent_id)) continue;
+        const agent = parseDocument<AgentDocument>(row.document_json);
+        if (input.filter.cwd !== undefined && agent?.cwd !== input.filter.cwd) continue;
+        dropAgent(row.agent_id);
+      }
+    },
+    async list(input?: { filter?: { cursor?: string; limit?: number; cwd?: string } }): Promise<{ items: AgentDocument[]; nextCursor?: string }> {
+      const filter = input?.filter;
+      const all = db
+        .prepare("SELECT document_json FROM agents")
+        .all()
+        .flatMap((row) => {
+          const agent = parseDocument<AgentDocument>(row.document_json);
+          return agent ? [agent] : [];
+        })
+        .filter((agent) => filter?.cwd === undefined || agent.cwd === filter.cwd)
+        .sort((a, b) => b.updatedAt - a.updatedAt || (a.agentId < b.agentId ? 1 : -1));
+      return paginate(all, (agent) => agent.agentId, filter?.cursor, filter?.limit);
+    }
+  };
+
+  const runs = {
+    async get(input: { agentId: string; runId: string }): Promise<RunDocument | null> {
+      const row = db
+        .prepare("SELECT document_json FROM runs WHERE agent_id = ? AND run_id = ?")
+        .get(input.agentId, input.runId);
+      return parseDocument<RunDocument>(row?.document_json);
+    },
+    async create(input: { run: RunDocument }): Promise<RunDocument> {
+      return writeRun(input.run);
+    },
+    async update(input: { run: RunDocument }): Promise<RunDocument> {
+      return writeRun(input.run);
+    },
+    async delete(input: { filter: { agentIds?: readonly string[]; runIds?: readonly string[] } }): Promise<void> {
+      const rows = db.prepare("SELECT run_id, agent_id FROM runs").all();
+      const deleteRun = db.prepare("DELETE FROM runs WHERE run_id = ?");
+      const deleteEvents = db.prepare("DELETE FROM run_events WHERE run_id = ?");
+      const deleteMeta = db.prepare("DELETE FROM run_event_meta WHERE run_id = ?");
+      for (const row of rows) {
+        if (typeof row.run_id !== "string" || typeof row.agent_id !== "string") continue;
+        if (input.filter.agentIds?.length && !input.filter.agentIds.includes(row.agent_id)) continue;
+        if (input.filter.runIds?.length && !input.filter.runIds.includes(row.run_id)) continue;
+        deleteEvents.run(row.run_id);
+        deleteMeta.run(row.run_id);
+        deleteRun.run(row.run_id);
+      }
+    },
+    async list(input?: { filter?: { agentIds?: readonly string[]; runIds?: readonly string[]; cursor?: string; limit?: number } }): Promise<{ items: RunDocument[]; nextCursor?: string }> {
+      const filter = input?.filter;
+      const all = db
+        .prepare("SELECT document_json FROM runs")
+        .all()
+        .flatMap((row) => {
+          const run = parseDocument<RunDocument>(row.document_json);
+          return run ? [run] : [];
+        })
+        .filter((run) =>
+          (!filter?.agentIds?.length || filter.agentIds.includes(run.agentId)) &&
+          (!filter?.runIds?.length || filter.runIds.includes(run.runId)))
+        .sort((a, b) => a.turnNumber - b.turnNumber || (a.runId < b.runId ? -1 : 1));
+      return paginate(all, (run) => run.runId, filter?.cursor, filter?.limit);
+    }
+  };
+
+  const checkpoints = {
+    async get(input: { agentId: string; blobId: string }): Promise<Uint8Array | null> {
+      const row = db
+        .prepare("SELECT data FROM checkpoints WHERE agent_id = ? AND blob_id = ?")
+        .get(input.agentId, input.blobId);
+      return row?.data === undefined || row.data === null ? null : asBytes(row.data);
+    },
+    async create(input: { agentId: string; blobId: string; data: Uint8Array }): Promise<void> {
+      writeBlob(input.agentId, input.blobId, input.data);
+    },
+    async update(input: { agentId: string; blobId: string; data: Uint8Array }): Promise<void> {
+      writeBlob(input.agentId, input.blobId, input.data);
+    },
+    async delete(input: { filter: { agentIds?: readonly string[]; blobIds?: readonly string[] } }): Promise<void> {
+      const rows = db.prepare("SELECT agent_id, blob_id FROM checkpoints").all();
+      const del = db.prepare("DELETE FROM checkpoints WHERE agent_id = ? AND blob_id = ?");
+      for (const row of rows) {
+        if (typeof row.agent_id !== "string" || typeof row.blob_id !== "string") continue;
+        if (input.filter.agentIds?.length && !input.filter.agentIds.includes(row.agent_id)) continue;
+        if (input.filter.blobIds?.length && !input.filter.blobIds.includes(row.blob_id)) continue;
+        del.run(row.agent_id, row.blob_id);
+      }
+    },
+    async list(input?: { filter?: { agentIds?: readonly string[]; blobIds?: readonly string[]; cursor?: string; limit?: number } }): Promise<{ items: string[]; nextCursor?: string }> {
+      const filter = input?.filter;
+      const all = db
+        .prepare("SELECT agent_id, blob_id FROM checkpoints")
+        .all()
+        .flatMap((row) => {
+          if (typeof row.agent_id !== "string" || typeof row.blob_id !== "string") return [];
+          if (filter?.agentIds?.length && !filter.agentIds.includes(row.agent_id)) return [];
+          if (filter?.blobIds?.length && !filter.blobIds.includes(row.blob_id)) return [];
+          return [row.blob_id];
+        })
+        .sort();
+      return paginate(all, (blobId) => blobId, filter?.cursor, filter?.limit);
+    }
+  };
+
+  const runEventsStore = {
+    async append(input: { runId: string; eventType: string; payload?: unknown; payloadRef?: string | null; idempotencyKey?: string | null }): Promise<RunEventDocument> {
+      const run = db.prepare("SELECT agent_id FROM runs WHERE run_id = ?").get(input.runId);
+      const knownAgent = typeof run?.agent_id === "string" ? run.agent_id : null;
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO run_event_meta (run_id, agent_id, touched_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET
+           touched_at = excluded.touched_at,
+           agent_id = COALESCE(run_event_meta.agent_id, excluded.agent_id)`
+      ).run(input.runId, knownAgent, now);
+      const seq = Number(
+        db.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM run_events WHERE run_id = ?").get(input.runId)?.n ?? 0
+      ) + 1;
+      const event: RunEventDocument = {
+        runId: input.runId,
+        seq,
+        offset: String(seq).padStart(12, "0"),
+        eventType: input.eventType,
+        payload: input.payload,
+        payloadRef: input.payloadRef ?? null,
+        idempotencyKey: input.idempotencyKey ?? null,
+        createdAt: now
+      };
+      db.prepare(
+        `INSERT INTO run_events (run_id, seq, offset, event_type, payload_json, payload_ref, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        event.runId,
+        event.seq,
+        event.offset,
+        event.eventType,
+        input.payload === undefined ? null : JSON.stringify(input.payload),
+        event.payloadRef,
+        event.idempotencyKey,
+        event.createdAt
+      );
+      return event;
+    },
+    async list(input: { runId: string; afterOffset?: string | null; limit?: number }): Promise<{ items: RunEventDocument[]; nextOffset?: string }> {
+      const after = input.afterOffset ?? "";
+      const rows = db
+        .prepare("SELECT * FROM run_events WHERE run_id = ? AND offset > ? ORDER BY offset ASC")
+        .all(input.runId, after);
+      const matched = rows.map(rowToRunEvent);
+      const items = typeof input.limit === "number" && input.limit >= 0 ? matched.slice(0, input.limit) : matched;
+      const last = items.at(-1);
+      return last ? { items, nextOffset: last.offset } : { items };
+    },
+    async delete(input: { filter: { runIds?: readonly string[] } }): Promise<void> {
+      const rows = db.prepare("SELECT run_id FROM run_event_meta").all();
+      const eventRunIds = db.prepare("SELECT DISTINCT run_id FROM run_events").all();
+      const ids = new Set<string>();
+      for (const row of [...rows, ...eventRunIds]) {
+        if (typeof row.run_id === "string") ids.add(row.run_id);
+      }
+      const deleteEvents = db.prepare("DELETE FROM run_events WHERE run_id = ?");
+      const deleteMeta = db.prepare("DELETE FROM run_event_meta WHERE run_id = ?");
+      for (const runId of ids) {
+        if (input.filter.runIds?.length && !input.filter.runIds.includes(runId)) continue;
+        deleteEvents.run(runId);
+        deleteMeta.run(runId);
+      }
+    }
+  };
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    db.close();
+  };
+
+  return { agents, runs, checkpoints, runEvents: runEventsStore, close };
+}
+
+function parseDocument<T>(json: unknown): T | null {
+  if (typeof json !== "string" || !json) return null;
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return null;
+  }
+}
+
+function asBytes(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return Uint8Array.from(value);
+  return new Uint8Array();
+}
+
+function rowToRunEvent(row: Record<string, unknown>): RunEventDocument {
+  return {
+    runId: String(row.run_id),
+    seq: Number(row.seq ?? 0),
+    offset: String(row.offset ?? ""),
+    eventType: String(row.event_type ?? ""),
+    payload: row.payload_json == null ? undefined : JSON.parse(String(row.payload_json)),
+    payloadRef: row.payload_ref === null || row.payload_ref === undefined ? null : String(row.payload_ref),
+    idempotencyKey: row.idempotency_key === null || row.idempotency_key === undefined ? null : String(row.idempotency_key),
+    createdAt: Number(row.created_at ?? 0)
+  };
 }
 
 function positiveBound(value: number | undefined, fallback: number): number {

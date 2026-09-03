@@ -10,7 +10,12 @@ import {
   selectProvider
 } from "./cursor-connect/router.js";
 import type { CursorConnectService } from "./cursor-connect/service.js";
-import { durableIdentity } from "./durable-id.js";
+import { durableIdentity, explicitSessionIdFromHeaders } from "./durable-id.js";
+import {
+  recordDurableCache,
+  recordIdentitySource,
+  durableTelemetrySnapshot
+} from "./durable-telemetry.js";
 import {
   anthropicError,
   anthropicErrorType,
@@ -40,7 +45,7 @@ import {
   type ModelListResult
 } from "./models.js";
 import { extractDurableTurn } from "./prompt-delta.js";
-import { denyRuleUnverifiable, filterModelsByScope, identityAllowed, modelIdentity } from "./routing.js";
+import { conversationSeed, denyRuleUnverifiable, filterModelsByScope, identityAllowed, modelIdentity } from "./routing.js";
 import {
   anthropicMessageObject,
   anthropicCompletionChars,
@@ -82,6 +87,7 @@ import type {
   CursorStreamEvent,
   EffectiveParamField,
   GatewayConfig,
+  GatewayProvider,
   KeyUsageRef,
   ModelIdentity,
   ModelScope,
@@ -152,7 +158,10 @@ interface RequestLog {
   maxMode?: boolean;
   fast?: boolean;
   agentMode?: AgentMode;
+  provider?: GatewayProvider;
 }
+
+type RequestWithLog = FastifyRequest & { gatewayRequestLog?: RequestLog };
 
 export function createApp(deps: AppDeps): FastifyInstance {
   const app = fastify({ logger: false, bodyLimit: 16 * 1024 * 1024 });
@@ -162,7 +171,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     reply
       .header("access-control-allow-origin", "*")
       .header("access-control-allow-methods", "GET,POST,DELETE,OPTIONS")
-      .header("access-control-allow-headers", "authorization,x-api-key,content-type,anthropic-version,anthropic-beta,x-session-affinity,x-opencode-session-id,x-opencode-session,anthropic-session-id,x-claude-code-session-id,x-session-id,session-id,session_id,conversation_id,x-codex-window-id,x-codex-turn-metadata,x-cursor-reasoning-effort,x-cursor-max-mode,x-cursor-fast,x-cursor-mode,x-cursor-model-params")
+      .header("access-control-allow-headers", "authorization,x-api-key,content-type,anthropic-version,anthropic-beta,x-session-affinity,x-opencode-session-id,x-opencode-session,anthropic-session-id,x-claude-code-session-id,x-claude-code-agent-id,x-claude-code-parent-agent-id,x-session-id,session-id,session_id,conversation_id,x-codex-window-id,x-codex-turn-metadata,x-cursor-reasoning-effort,x-cursor-max-mode,x-cursor-fast,x-cursor-mode,x-cursor-model-params")
       .header("access-control-max-age", "86400");
     // Anthropic 在所有响应（含成功与流式）上都带 request-id；错误体里复用同一个值。
     if (request.url.startsWith("/v1/messages")) {
@@ -174,7 +183,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error, request, reply) => {
-    sendProtocolError(request, reply, normalizeError(error));
+    const apiError = normalizeError(error);
+    persistHandlerError(deps, request, apiError);
+    if (reply.sent) return;
+    sendProtocolError(request, reply, apiError);
   });
 
   // 未命中任何路由时 Fastify 默认回 {message,error,statusCode}：既不是 Anthropic 信封也不是 OpenAI 信封，
@@ -184,13 +196,24 @@ export function createApp(deps: AppDeps): FastifyInstance {
     sendProtocolError(request, reply, new ApiError(`Unknown endpoint: ${request.method} ${path}`, 404, "not_found"));
   });
 
-  app.get("/health", async () => ({
-    ok: true,
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
-    cursorSdk: true,
-    storage: "sqlite"
-  }));
+  app.get("/health", async () => {
+    const durable = durableTelemetrySnapshot();
+    return {
+      ok: true,
+      service: SERVICE_NAME,
+      version: SERVICE_VERSION,
+      cursorSdk: true,
+      storage: "sqlite",
+      gitCommit: process.env.GIT_SHA ?? "unknown",
+      builtAt: process.env.BUILT_AT ?? "unknown",
+      sessionMode: deps.config.cursorSdkDisableSessionResume ? "stateless" : deps.config.cursorSdkSessionMode,
+      uptimeSeconds: Math.floor((Date.now() - (deps.startedAt ?? Date.now())) / 1000),
+      durable: {
+        hitRatio: durable.cache.hitRatio,
+        decisions: durable.decisions
+      }
+    };
+  });
 
   app.get("/v1/models", async (request) => {
     const { models } = await listModels(deps, request);
@@ -221,11 +244,11 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const prepared = prepareOpenAiChat(request.body, { systemPrompt: promptSettings });
     // slotHints 要等选 key 之后才能算 durableSessionId；指纹 / lastUserText 由 runner 对齐。
     const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings);
-    const seed = durableIdentity({ headers: request.headers, body: request.body, protocol: "openai-chat", ownerHash: auth.ownerHash });
+    const seed = noteDurableIdentity(request, request.body, "openai-chat", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
     const created = nowSeconds();
-    const log = beginLog("/v1/chat/completions", auth, prepared);
+    const log = beginLog("/v1/chat/completions", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "openai-chat",
@@ -265,13 +288,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
      * 每条记录只存直接父节点，但每一轮都把继承来的种子再写回自己那行，第三轮往后照样对得上。
      * 老库记录（无种子）与 store:false（压根没落库）自然退回按请求体现算，认不出就不启用粘性。
      */
-    const seed = durableIdentity({
-      headers: request.headers,
-      body,
-      protocol: "openai-responses",
-      ownerHash: auth.ownerHash,
-      conversationSeed: previous?.conversationSeed
-    });
+    const seed = noteDurableIdentity(request, body, "openai-responses", auth.ownerHash, previous?.conversationSeed);
     const durableTurn = extractDurableTurn(
       "openai-responses",
       body,
@@ -279,7 +296,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
       undefined,
       promptSettings
     );
-    const log = beginLog("/v1/responses", auth, prepared);
+    const log = beginLog("/v1/responses", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "openai-responses",
@@ -362,10 +379,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const promptSettings = gatewaySystemPrompt(deps.config);
     const prepared = prepareAnthropicMessages(request.body, { systemPrompt: promptSettings });
     const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings);
-    const seed = durableIdentity({ headers: request.headers, body: request.body, protocol: "anthropic-messages", ownerHash: auth.ownerHash });
+    const seed = noteDurableIdentity(request, request.body, "anthropic-messages", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;
-    const log = beginLog("/v1/messages", auth, prepared);
+    const log = beginLog("/v1/messages", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "anthropic-messages",
@@ -674,8 +691,79 @@ function withCatalogueDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<
   });
 }
 
-function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest): RequestLog {
-  return {
+function persistHandlerError(deps: AppDeps, request: FastifyRequest, error: ApiError): void {
+  const existing = (request as RequestWithLog).gatewayRequestLog;
+  if (existing) {
+    if (!existing.finished) finishLog(deps, existing, error.statusCode, error.message);
+    return;
+  }
+  const stub: RequestLog = {
+    endpoint: request.url.split("?")[0] || "/",
+    authMode: bestEffortAuthMode(deps, request),
+    keyUsageRef: {},
+    telemetryRef: {},
+    stream: false,
+    startedAt: Date.now(),
+    finished: false
+  };
+  finishLog(deps, stub, error.statusCode, error.message);
+}
+
+function bestEffortAuthMode(deps: AppDeps, request: FastifyRequest): RequestLogRecord["authMode"] {
+  if (request.url.startsWith("/admin")) return "admin";
+  try {
+    return authFor(deps, request).mode;
+  } catch {
+    return "gateway";
+  }
+}
+
+function noteDurableIdentity(
+  request: FastifyRequest,
+  body: unknown,
+  protocol: "openai-chat" | "openai-responses" | "anthropic-messages",
+  ownerHash: string,
+  inherited?: string
+): string | undefined {
+  const seed = durableIdentity({
+    headers: request.headers,
+    body,
+    protocol,
+    ownerHash,
+    ...(inherited ? { conversationSeed: inherited } : {})
+  });
+  if (explicitSessionIdFromHeaders(request.headers)) {
+    recordIdentitySource("header");
+    return seed;
+  }
+  if (!seed) {
+    recordIdentitySource("none");
+    return seed;
+  }
+  const fromBody = durableIdentity({ body, protocol, ownerHash });
+  const derived = conversationSeed(body, protocol, ownerHash);
+  if (fromBody && !(derived && identityStem(fromBody) === derived)) {
+    recordIdentitySource("body-field");
+    return seed;
+  }
+  recordIdentitySource("derived-L3");
+  return seed;
+}
+
+function identityStem(identity: string): string {
+  const sep = identity.indexOf("\0agent:");
+  return sep === -1 ? identity : identity.slice(0, sep);
+}
+
+function logSafeErrorText(error: string): string {
+  return error
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(sk-|crsr_)[A-Za-z0-9_-]{8,}/g, "[redacted]")
+    .slice(0, 500);
+}
+
+function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest, request: FastifyRequest): RequestLog {
+  const log: RequestLog = {
     endpoint,
     model: prepared.model,
     authMode: auth.mode,
@@ -688,22 +776,26 @@ function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest
     gatewayKeyLabel: auth.gatewayKeyLabel,
     ...(auth.mode === "direct" && auth.apiKey ? { directApiKey: auth.apiKey } : {})
   };
+  (request as RequestWithLog).gatewayRequestLog = log;
+  return log;
 }
 
 export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?: string): void {
   if (log.finished) return;
   log.finished = true;
-  if (status >= 500 || error) {
+  const safeError = error ? logSafeErrorText(error) : undefined;
+  if (status >= 400) {
     const key = [log.keyUsageRef.keyLabel, log.keyUsageRef.keyId].filter(Boolean).join("/");
     console.error(
       `[request] ${log.endpoint} status=${status} model=${log.model ?? "-"} auth=${log.authMode}` +
       (key ? ` key=${key}` : "") +
       ` durationMs=${Date.now() - log.startedAt}` +
-      (error ? ` error=${error.slice(0, 300)}` : "")
+      (safeError ? ` error=${safeError.slice(0, 300)}` : "")
     );
   }
   const id = compactId();
   const params = loggedModelParams(log);
+  const usageFields = loggedUsage(log.telemetryRef);
   void deps.store
     .insertRequestLog({
       id,
@@ -716,7 +808,7 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
       status,
       durationMs: Date.now() - log.startedAt,
       stream: log.stream,
-      error: error ? error.slice(0, 500) : undefined,
+      error: safeError,
       gatewayKeyId: log.gatewayKeyId,
       gatewayKeyLabel: log.gatewayKeyLabel,
       reasoningEffort: params.reasoningEffort,
@@ -725,8 +817,9 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
       ...(params.effectiveParams.length ? { effectiveParams: params.effectiveParams } : {}),
       agentMode: log.agentMode,
       clientType: log.telemetryRef.clientType,
+      ...(log.provider ? { provider: log.provider } : {}),
       modelParams: log.telemetryRef.modelParams,
-      ...loggedUsage(log.telemetryRef),
+      ...usageFields,
       cost: log.telemetryRef.cost
     })
     .then(() => scheduleCostBackfill(deps, log, id))
@@ -737,6 +830,15 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
         (error instanceof Error ? error.message.slice(0, 300) : String(error))
       );
     });
+  const usage = log.telemetryRef.usage;
+  if (usage) {
+    recordDurableCache({
+      inputTokens: usage.inputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      outputTokens: usage.outputTokens
+    });
+  }
 }
 
 /**
@@ -846,6 +948,7 @@ function loggedRunRequest(
     ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
     reuseDurableAgent: canReuseDurableAgent(input.conversationSeed),
     ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
+    ownerHash: input.auth.ownerHash,
     provider: selection.provider,
     // `connect/xxx` 只是选路命名空间，不是模型名的一部分。
     ...(selection.model && selection.model !== input.prepared.model ? { model: selection.model } : {}),
@@ -858,6 +961,7 @@ function loggedRunRequest(
   log.maxMode = run.maxMode;
   log.fast = run.fast;
   log.agentMode = run.mode;
+  log.provider = selection.provider;
   return run;
 }
 

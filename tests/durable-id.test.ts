@@ -8,11 +8,16 @@ import {
   shouldUseDurableHub
 } from "../src/config.js";
 import {
+  durableAgentId,
   durableIdentity,
   durableSessionId,
   normalizeExplicitId,
-  resolveConversationIdentity
+  resolveConversationIdentity,
+  stableUuid
 } from "../src/durable-id.js";
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const AGENT_ID_SHAPE = /^agent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 test("loadConfig defaults to durable with the session-resume kill switch off", () => {
   const config = loadConfig({});
@@ -177,14 +182,108 @@ test("conversationSeed or stickyKey is enough for a durable id", () => {
   );
 });
 
-test("durableSessionId mixes apiKey and model so different slots do not collide", () => {
+test("durableSessionId is stable across apiKeys and differs by model", () => {
   const headers = { "anthropic-session-id": "same-conversation" };
-  const left = durableSessionId({ headers, apiKey: "key-a", model: "composer-2.5" });
-  const right = durableSessionId({ headers, apiKey: "key-b", model: "composer-2.5" });
+  const left = durableSessionId({ headers, apiKey: "key-a", model: "composer-2.5", workingDirectory: "/a" });
+  const right = durableSessionId({ headers, apiKey: "key-b", model: "composer-2.5", workingDirectory: "/b" });
   const otherModel = durableSessionId({ headers, apiKey: "key-a", model: "grok-4" });
   assert.ok(left && right && otherModel);
-  assert.notEqual(left, right);
+  assert.equal(left, right);
   assert.notEqual(left, otherModel);
+});
+
+test("same identity two calls yield the same durableAgentId and durableSessionId", () => {
+  const input = {
+    headers: { "x-session-id": "same-session" },
+    ownerHash: "owner-a",
+    model: "composer-2.5",
+    apiKey: "k"
+  };
+  const first = durableSessionId(input);
+  const second = durableSessionId(input);
+  const agent = durableAgentId({ ownerHash: "owner-a", identity: "same-session", model: "composer-2.5" });
+  assert.ok(first);
+  assert.equal(first, second);
+  assert.equal(first, agent);
+  assert.equal(
+    durableAgentId({ ownerHash: "owner-a", identity: "same-session", model: "composer-2.5" }),
+    agent
+  );
+});
+
+test("same identity with different apiKey yields the same agentId", () => {
+  const identity = "same-conversation";
+  const headers = { "anthropic-session-id": identity };
+  const ownerHash = "owner-a";
+  const model = "composer-2.5";
+  const left = durableSessionId({ headers, ownerHash, model, apiKey: "key-a" });
+  const right = durableSessionId({ headers, ownerHash, model, apiKey: "key-b" });
+  const agent = durableAgentId({ ownerHash, identity, model });
+  assert.ok(left);
+  assert.equal(left, right);
+  assert.equal(left, agent);
+});
+
+test("same x-claude-code-session-id with different x-claude-code-agent-id splits identity and agentId", () => {
+  const session = "claude-code-parent";
+  const model = "composer-2.5";
+  const ownerHash = "owner-a";
+  const parentHeaders = { "x-claude-code-session-id": session };
+  const subA = { ...parentHeaders, "x-claude-code-agent-id": "sub-agent-a" };
+  const subB = { ...parentHeaders, "x-claude-code-agent-id": "sub-agent-b" };
+  const parentIdentity = durableIdentity({ headers: parentHeaders });
+  const identityA = durableIdentity({ headers: subA });
+  const identityB = durableIdentity({ headers: subB });
+  assert.ok(parentIdentity && identityA && identityB);
+  assert.equal(parentIdentity.includes("\0agent:"), false);
+  assert.notEqual(identityA, identityB);
+  assert.notEqual(identityA, parentIdentity);
+  assert.ok(identityA.includes("\0agent:sub-agent-a"));
+  assert.ok(identityB.includes("\0agent:sub-agent-b"));
+  const idA = durableSessionId({ headers: subA, ownerHash, model });
+  const idB = durableSessionId({ headers: subB, ownerHash, model });
+  assert.ok(idA && idB);
+  assert.notEqual(idA, idB);
+});
+
+test("parent session-id header without agent-id does not contain the agent suffix", () => {
+  const identity = durableIdentity({
+    headers: { "x-claude-code-session-id": "parent-only" }
+  });
+  assert.ok(identity);
+  assert.equal(identity.includes("\0agent:"), false);
+  assert.equal(durableIdentity({ headers: { "x-claude-code-agent-id": "orphan-sub" } }), undefined);
+});
+
+test("different ownerHash with the same x-session-id yields different agentId", () => {
+  const headers = { "x-session-id": "shared-client-session" };
+  const model = "composer-2.5";
+  const left = durableSessionId({ headers, ownerHash: "owner-a", model });
+  const right = durableSessionId({ headers, ownerHash: "owner-b", model });
+  assert.ok(left && right);
+  assert.notEqual(left, right);
+});
+
+test("stableUuid is RFC 4122 version 4 variant 1", () => {
+  const id = stableUuid("any-stable-input");
+  assert.match(id, UUID_SHAPE);
+  assert.equal(stableUuid("any-stable-input"), id);
+  assert.notEqual(stableUuid("other-input"), id);
+});
+
+test("durableAgentId is agent- prefixed UUID shape and never uses bc-", () => {
+  const id = durableAgentId({ ownerHash: "own", identity: "sess", model: "composer-2.5" });
+  assert.match(id, AGENT_ID_SHAPE);
+  assert.equal(id.startsWith("agent-"), true);
+  assert.equal(id.startsWith("bc-"), false);
+  const sessionId = durableSessionId({
+    headers: { "x-session-id": "sess" },
+    ownerHash: "own",
+    model: "composer-2.5"
+  });
+  assert.equal(sessionId, id);
+  assert.ok(sessionId);
+  assert.match(sessionId, AGENT_ID_SHAPE);
 });
 
 test("durableSessionId accepts the expanded explicit session headers", () => {

@@ -264,6 +264,19 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               <p class="note">chargedCents 单位是美分浮点数（USD cent）。套餐内 / BYOK / 赠额用量的 chargedCents 为 0 是正常现象，不是统计漏记。</p>
             </div>
           </div>
+          <div class="panel">
+            <div class="head"><h2>Durable 会话</h2><span class="hint">进程内计数，重启清零；不含提示词与完整会话 id</span></div>
+            <div class="body">
+              <div class="config-list" id="durable-summary"></div>
+              <p class="note" id="durable-identity"></p>
+              <div class="table-scroll" style="margin-top:12px">
+                <table>
+                  <thead><tr><th>时间</th><th>决策</th><th>原因</th><th>会话</th><th>增量</th></tr></thead>
+                  <tbody id="durable-recent"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section id="sec-keys" class="hidden" data-section="keys">
@@ -1196,7 +1209,35 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     html += cfgItem('自动禁用', cfg.autoDisableKeys ? '连续失败 ' + (cfg.autoDisableThreshold || 1) + ' 次' : '已关闭');
     $('cfg-summary').innerHTML = html;
 
+    renderDurable(data.durable);
     renderGwAvailability();
+  }
+  function renderDurable(durable){
+    durable = durable || {};
+    var cache = durable.cache || {};
+    var hit = cache.hitRatio == null ? '—' : ((Math.round(cache.hitRatio * 1000) / 10) + '%');
+    var dhtml = '';
+    dhtml += cfgItem('缓存命中率', hit);
+    dhtml += cfgItem('缓存样本', String(cache.requests || 0));
+    dhtml += cfgItem('活槽', String(durable.liveSessions || 0));
+    var decisions = durable.decisions || {};
+    var dkeys = Object.keys(decisions);
+    dhtml += cfgItem('决策', dkeys.length ? dkeys.map(function(k){ return k + ' ' + decisions[k]; }).join(' · ') : '暂无');
+    $('durable-summary').innerHTML = dhtml;
+    var ident = durable.identitySource || {};
+    $('durable-identity').textContent = '身份来源：header ' + (ident.header || 0)
+      + ' · body-field ' + (ident['body-field'] || 0)
+      + ' · derived-L3 ' + (ident['derived-L3'] || 0)
+      + ' · none ' + (ident.none || 0);
+    var recent = durable.recent || [];
+    var rows = recent.slice().reverse().map(function(item){
+      return '<tr><td class="mono">' + esc(fmtTime(item.at)) + '</td>'
+        + '<td>' + esc(item.decision || '') + '</td>'
+        + '<td class="muted">' + esc(item.reason || '—') + '</td>'
+        + '<td class="mono">' + esc(item.session || '—') + '</td>'
+        + '<td class="muted">' + esc(item.kind || '—') + '</td></tr>';
+    }).join('');
+    $('durable-recent').innerHTML = rows || '<tr><td colspan="5" class="empty">暂无决策</td></tr>';
   }
   function cfgItem(k, v){
     return '<div class="config-item"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div></div>';

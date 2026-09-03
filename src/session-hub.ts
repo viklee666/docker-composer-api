@@ -204,14 +204,13 @@ export function touchSlotHistory(slot: SessionSlot, lastUserText?: string): void
 export type DurableReplaceReason =
   | "incompatible"
   | "model"
-  | "apiKey"
   | "toolsFingerprint"
   | "history";
 
 /**
- * 本轮为何不能复用 live slot。`incompatible` / model / apiKey / toolsFingerprint /
+ * 本轮为何不能复用 live slot。`incompatible` / model / toolsFingerprint /
  * rewritten history → 调用方 drop+create（D11）。undefined = 留槽。
- * systemFingerprint 变化不换槽。
+ * systemFingerprint 变化不换槽。apiKey 变化不换槽（轮询换 key 必须复用同一 agent）。
  */
 export function durableSlotReplaceReason(
   slot: SessionSlot | undefined,
@@ -227,7 +226,6 @@ export function durableSlotReplaceReason(
 ): DurableReplaceReason | undefined {
   if (input.kind === "incompatible") return "incompatible";
   if (!slot) return undefined;
-  if (input.apiKey !== undefined && slot.apiKey !== input.apiKey) return "apiKey";
   if (input.model !== undefined && slot.model !== input.model) return "model";
   if (slot.toolsFingerprint && input.toolsFingerprint && slot.toolsFingerprint !== input.toolsFingerprint) {
     return "toolsFingerprint";

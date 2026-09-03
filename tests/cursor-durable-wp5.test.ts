@@ -38,7 +38,7 @@ test("historyChecksum is stable for issued ids + lastUserText", () => {
   assert.notEqual(historyChecksum(["a"], "hello"), historyChecksum(["a"], "hello!"));
 });
 
-test("durableSlotReplaceReason: incompatible / apiKey / model / toolsFingerprint; systemFingerprint does not replace", () => {
+test("durableSlotReplaceReason: incompatible / model / toolsFingerprint; apiKey and systemFingerprint do not replace", () => {
   const slot = createSessionSlot({
     agent: dummyAgent(),
     agentId: "agent-1",
@@ -48,7 +48,8 @@ test("durableSlotReplaceReason: incompatible / apiKey / model / toolsFingerprint
     toolsFingerprint: "tools-1"
   });
   assert.equal(durableSlotReplaceReason(slot, { kind: "incompatible" }), "incompatible");
-  assert.equal(durableSlotReplaceReason(slot, { apiKey: "key-b", model: "composer-2.5" }), "apiKey");
+  // Stage 1': apiKey rotation must reuse the live slot (Hub key no longer includes apiKey).
+  assert.equal(durableSlotReplaceReason(slot, { apiKey: "key-b", model: "composer-2.5" }), undefined);
   assert.equal(durableSlotReplaceReason(slot, { apiKey: "key-a", model: "composer-2" }), "model");
   assert.equal(durableSlotReplaceReason(slot, {
     apiKey: "key-a",
@@ -190,6 +191,8 @@ test("busy send drop+creates; next request does not resume the bad id", async ()
       return new TrackingAgent("agent-fresh");
     },
     resume: async (id) => {
+      // Stage 1' probes resume(sessionId) on a cold start; only record hits after create.
+      if (createCount === 0) throw new Error("agent not in store yet");
       resumedIds.push(id);
       return new TrackingAgent(id);
     }
@@ -426,7 +429,7 @@ test("mismatched tool_results while pending abort hung execute then path B", asy
   await hub.dropAll();
 });
 
-test("idle TTL deleteSession so the next request creates instead of resuming a disposed agent", async () => {
+test("idle TTL drop still resumes the deterministic agentId", async () => {
   let now = 1_000;
   const store = new MemoryStateStore();
   const hub = new SessionHub({
@@ -445,6 +448,7 @@ test("idle TTL deleteSession so the next request creates instead of resuming a d
     },
     resume: async (id) => {
       resumeCount += 1;
+      if (createCount === 0) throw new Error("agent not in store yet");
       return new TrackingAgent(id);
     }
   };
@@ -459,9 +463,12 @@ test("idle TTL deleteSession so the next request creates instead of resuming a d
     conversationSeed: seed,
     durableTurn: userTurn("after idle")
   }));
-  assert.equal(resumeCount, 0);
-  assert.equal(createCount, 2);
-  assert.equal(next.agentId, "agent-ttl-2");
+  // Hub TTL deletes sdk_sessions, but LocalAgentStore may still have the row.
+  // Deterministic agentId → resume(sessionId) even when the mapping is gone.
+  // resumeCount is 2: cold-start miss (createCount was 0) + post-TTL hit.
+  assert.equal(resumeCount, 2);
+  assert.equal(createCount, 1);
+  assert.equal(next.agentId, sessionHash(seed));
   await hub.dropAll();
 });
 

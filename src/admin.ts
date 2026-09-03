@@ -33,6 +33,7 @@ import {
   saveCursorSdkUseHttp1ForAgent,
   saveProxyUrl
 } from "./sdk-network.js";
+import { durableTelemetrySnapshot } from "./durable-telemetry.js";
 import type { AppDeps } from "./server.js";
 import type {
   CursorClientType,
@@ -140,7 +141,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         : {}),
       requests,
       models: modelList.models.map((model) => model.id),
-      modelSource: modelList.source
+      modelSource: modelList.source,
+      durable: durableTelemetrySnapshot()
     };
   });
 

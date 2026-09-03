@@ -345,6 +345,10 @@ export interface CursorRunRequest {
    */
   conversationSeed?: string;
   /**
+   * 入站网关密钥的 owner 散列。M1/M2 填入后参与 durableAgentId；缺省时 durableSessionId 从 stickyKey 前缀回退。
+   */
+  ownerHash?: string;
+  /**
    * 是否把本请求送进 SessionHub 复用本地 Agent。
    * false：即使有 conversationSeed / stickyKey 也走 stateless（create + 全文）。
    * Chat / Messages 有瀑布 identity 也会进 Hub；重叠由 Hub tryAcquire 改 stateless。
@@ -554,6 +558,8 @@ export interface RequestLogRecord {
   effectiveParams?: EffectiveParamField[];
   /** 实际使用的通道（sdk / sand）。 */
   clientType?: CursorClientType;
+  /** 本次请求走哪条推理路线（sdk / connect）。M3/M2 落库。 */
+  provider?: GatewayProvider;
   agentMode?: AgentMode;
   /** 实际下发给 Cursor 的 model.params，JSON 序列化后存库。 */
   modelParams?: ModelParameterValue[];

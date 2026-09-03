@@ -24,6 +24,10 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=8787
+ARG GIT_SHA=unknown
+ARG BUILT_AT=unknown
+ENV GIT_SHA=$GIT_SHA
+ENV BUILT_AT=$BUILT_AT
 COPY package.json package-lock.json ./
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

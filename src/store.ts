@@ -133,6 +133,7 @@ export class SqliteStateStore implements StateStore {
         fast INTEGER,
         effective_params TEXT,
         client_type TEXT,
+        provider TEXT,
         agent_mode TEXT,
         model_params TEXT,
         input_tokens INTEGER,
@@ -231,6 +232,7 @@ export class SqliteStateStore implements StateStore {
       ["fast", "INTEGER"],
       ["effective_params", "TEXT"],
       ["client_type", "TEXT"],
+      ["provider", "TEXT"],
       ["agent_mode", "TEXT"],
       ["model_params", "TEXT"],
       ["input_tokens", "INTEGER"],
@@ -598,11 +600,11 @@ export class SqliteStateStore implements StateStore {
       .prepare(
         `INSERT INTO request_logs (
            id, ts, endpoint, model, auth_mode, key_id, key_label, status, duration_ms, stream, error,
-           gateway_key_id, gateway_key_label, reasoning_effort, max_mode, fast, effective_params, client_type, agent_mode, model_params,
+           gateway_key_id, gateway_key_label, reasoning_effort, max_mode, fast, effective_params, client_type, provider, agent_mode, model_params,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
            usage_source, raw_cost_cents, charged_cents
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -623,6 +625,7 @@ export class SqliteStateStore implements StateStore {
         encodeBool(record.fast),
         encodeList(record.effectiveParams),
         record.clientType ?? null,
+        record.provider === "sdk" || record.provider === "connect" ? record.provider : null,
         record.agentMode ?? null,
         record.modelParams?.length ? JSON.stringify(record.modelParams) : null,
         record.usage?.inputTokens ?? null,
@@ -1443,6 +1446,7 @@ function rowToLog(row: Record<string, unknown>): RequestLogRecord {
     fast: decodeBool(row.fast),
     effectiveParams: decodeEffectiveParams(row.effective_params),
     clientType: row.client_type === "sand" ? "sand" : row.client_type === "sdk" ? "sdk" : undefined,
+    provider: row.provider === "connect" ? "connect" : row.provider === "sdk" ? "sdk" : undefined,
     agentMode: row.agent_mode === "plan" ? "plan" : row.agent_mode === "agent" ? "agent" : undefined,
     modelParams: decodeModelParams(row.model_params),
     ...(usage ? { usage } : {}),

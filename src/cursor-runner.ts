@@ -5,6 +5,7 @@ import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorC
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers, responseCallIds } from "./protocol.js";
 import { durableSessionId } from "./durable-id.js";
+import { recordDurableDecision } from "./durable-telemetry.js";
 import {
   EventPump,
   createSessionSlot,
@@ -129,20 +130,29 @@ export class CursorSdkRunner implements CursorRunner {
         return;
       }
       const hub = this.input.sessionHub;
-      // durableSessionId 必须在 KeyRotatingRunner 注入 apiKey 之后算，空 key 会撞槽。
+      // Hub 键 = durableAgentId(ownerHash \0 identity \0 model)。apiKey/cwd 不进混料。
       // reuseDurableAgent === false：seed 只给 key 粘性，不进 Hub（见 server canReuseDurableAgent）。
       const durableId = hub && input.reuseDurableAgent !== false ? durableSessionId({
         apiKey: input.apiKey,
         model: input.model,
         workingDirectory: input.workingDirectory || this.input.defaultWorkingDirectory,
         stickyKey: input.stickyKey,
-        conversationSeed: input.conversationSeed
+        conversationSeed: input.conversationSeed,
+        ownerHash: input.ownerHash
       }) : undefined;
       if (hub && durableId) {
         yield* iterateWithCursorClientType(clientType, this.streamDurable(hub, durableId, input, signal));
         return;
       }
       // D4: Hub 在但认不出会话 → 真 stateless（与 kill switch 相同）。禁止用 ownerHash/sessionKey 走旧 resume。
+      if (hub) {
+        recordDurableDecision({
+          decision: "fallback",
+          reason: input.reuseDurableAgent === false ? "reuse_disabled" : "unidentifiable",
+          kind: input.durableTurn?.kind,
+          liveSessions: hub.size
+        });
+      }
       yield* iterateWithCursorClientType(clientType, this.streamLocked({ ...input, forceStateless: true }, signal, id));
     } catch (error) {
       await this.recycleExecutorOnAuthFailure(input, error);
@@ -247,6 +257,13 @@ export class CursorSdkRunner implements CursorRunner {
       ? await hub.acquire(durableId, signal)
       : await hub.tryAcquire(durableId);
     if (!release) {
+      recordDurableDecision({
+        decision: "fallback",
+        reason: "locked",
+        session: durableId.slice(0, 12),
+        kind: input.durableTurn?.kind,
+        liveSessions: hub.size
+      });
       yield* this.streamLocked({ ...input, forceStateless: true }, signal, sessionId(input));
       return;
     }
@@ -301,6 +318,13 @@ export class CursorSdkRunner implements CursorRunner {
         if (isActiveRunError(error) || isRetryableStaleSessionError(error)) {
           const reason = isActiveRunError(error) ? "busy" : "stale";
           console.error(`[durable] drop+create ${reason} session=${sessionId.slice(0, 12)}`);
+          recordDurableDecision({
+            decision: "recreate",
+            reason,
+            session: sessionId.slice(0, 12),
+            kind: spec.kind,
+            liveSessions: hub.size
+          });
           await this.dropDurableSession(hub, sessionId);
           slot = await this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
           const recovered = spec.kind === "new_user"
@@ -398,13 +422,29 @@ export class CursorSdkRunner implements CursorRunner {
     });
     if (slot && replaceReason) {
       console.error(`[durable] drop+create ${replaceReason} session=${sessionId.slice(0, 12)}`);
+      recordDurableDecision({
+        decision: "recreate",
+        reason: replaceReason,
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
       await this.dropDurableSession(hub, sessionId);
       slot = undefined;
     }
-    if (slot) return slot;
+    if (slot) {
+      slot.apiKey = input.apiKey;
+      recordDurableDecision({
+        decision: "reuse",
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
+      return slot;
+    }
 
-    const existingAgentId = await this.store.getSession(sessionId);
-    if (existingAgentId && !replaceReason) {
+    if (!replaceReason) {
+      const existingAgentId = await this.store.getSession(sessionId);
       const resumed = await this.tryResumeDurableSlot(
         hub,
         sessionId,
@@ -412,7 +452,7 @@ export class CursorSdkRunner implements CursorRunner {
         resolved,
         signal,
         turn,
-        existingAgentId
+        existingAgentId ?? sessionId
       );
       if (resumed) return resumed;
     }
@@ -442,7 +482,7 @@ export class CursorSdkRunner implements CursorRunner {
     const customTools = this.durableCustomTools(hub, sessionId, input);
     try {
       const agent = await raceCreateAgent(
-        factory.resume(agentId, this.agentOptions(input, resolved, customTools)),
+        factory.resume(agentId, this.agentOptions(input, resolved, customTools, sessionId)),
         signal
       );
       // Restart cannot restore in-memory pending executes. Resume is always idle.
@@ -460,6 +500,12 @@ export class CursorSdkRunner implements CursorRunner {
       if (slot.agentId && slot.agentId !== agentId) {
         await this.store.saveSession(sessionId, slot.agentId);
       }
+      recordDurableDecision({
+        decision: "resume",
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
       console.error(
         `[durable] resume agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
       );
@@ -485,15 +531,32 @@ export class CursorSdkRunner implements CursorRunner {
   ): Promise<SessionSlot> {
     const factory = this.agentFactory ?? await this.loadAgentFactory();
     const customTools = this.durableCustomTools(hub, sessionId, input);
-    const agent = await raceCreateAgent(
-      factory.create(this.agentOptions(input, resolved, customTools)),
-      signal
-    ).catch((error) => {
-      throw keySemanticApiError(input.model, error) ?? modelUnavailableError(error) ?? error;
-    });
+    const options = this.agentOptions(input, resolved, customTools, sessionId);
+    let agent: AgentLike;
+    try {
+      agent = await raceCreateAgent(factory.create(options), signal);
+    } catch (error) {
+      const keyError = keySemanticApiError(input.model, error);
+      if (keyError) throw keyError;
+      const unavailable = modelUnavailableError(error);
+      if (unavailable) throw unavailable;
+      if (isAgentAlreadyExistsError(error)) {
+        const resumed = await this.tryResumeDurableSlot(
+          hub,
+          sessionId,
+          input,
+          resolved,
+          signal,
+          turn,
+          sessionId
+        );
+        if (resumed) return resumed;
+      }
+      throw error;
+    }
     const slot = createSessionSlot({
       agent,
-      agentId: agent.agentId ?? "",
+      agentId: agent.agentId || sessionId,
       apiKey: input.apiKey,
       model: input.model,
       toolsFingerprint: turn?.toolsFingerprint ?? "",
@@ -501,7 +564,13 @@ export class CursorSdkRunner implements CursorRunner {
       state: "running"
     });
     hub.put(sessionId, slot);
-    if (agent.agentId) await this.store.saveSession(sessionId, agent.agentId);
+    await this.store.saveSession(sessionId, slot.agentId);
+    recordDurableDecision({
+      decision: "create",
+      session: sessionId.slice(0, 12),
+      kind: turn?.kind,
+      liveSessions: hub.size
+    });
     console.error(
       `[durable] create agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
     );
@@ -648,6 +717,19 @@ export class CursorSdkRunner implements CursorRunner {
       }
     });
 
+    const parkKeepAlive = async (): Promise<void> => {
+      console.error(`[durable] keep-alive abort session=${sessionId.slice(0, 12)}`);
+      await withCleanupTimeout(slot.run?.cancel?.().catch(() => undefined));
+      recordIssuedToolCalls(slot, issuedIdsWithAliases(slot, toolCalls));
+      hub.markIdle(sessionId);
+      recordDurableDecision({
+        decision: "reuse",
+        reason: "keep-alive-abort",
+        session: sessionId.slice(0, 12),
+        liveSessions: hub.size
+      });
+    };
+
     const keepDeclaredOnly = (calls: GatewayToolCall[]): GatewayToolCall[] => calls.filter((toolCall) => {
       if (input.tools.length && matchesClientTool(toolCall, input.tools)) return true;
       logDeduped(
@@ -792,6 +874,7 @@ export class CursorSdkRunner implements CursorRunner {
       };
     };
 
+    try {
     for (;;) {
       const item = await nextHubItem(slot.pump, signal);
       if (item.kind === "http-abort") {
@@ -803,6 +886,13 @@ export class CursorSdkRunner implements CursorRunner {
         // Path B: tools already on the wire. Keep the agent idle; do not 499-drop.
         if (pathB && toolCalls.length) {
           parkPathB();
+          yield pathBDone();
+          return;
+        }
+        // Client abort after semantic output: cancel the Run, keep the agent, yield done.
+        // Idle-timeout 504 must not be converted to 200 even with partial text.
+        if ((textParts.length || toolCalls.length) && !isIdleTimeoutAbort(signal)) {
+          await parkKeepAlive();
           yield pathBDone();
           return;
         }
@@ -871,8 +961,14 @@ export class CursorSdkRunner implements CursorRunner {
       waited = await raceWithAbort(slot.waitPromise ?? slot.run?.wait() ?? Promise.resolve(undefined), signal);
     } catch (error) {
       if (error instanceof ApiError && error.code === "request_aborted") {
+        if (isIdleTimeoutAbort(signal)) throw error;
         if (pathB && toolCalls.length) {
           parkPathB();
+          yield pathBDone();
+          return;
+        }
+        if (textParts.length || toolCalls.length) {
+          await parkKeepAlive();
           yield pathBDone();
           return;
         }
@@ -924,6 +1020,17 @@ export class CursorSdkRunner implements CursorRunner {
         runId: slot.runId ?? slot.run?.id
       }
     };
+    } finally {
+      const live = hub.get(sessionId);
+      if (
+        live?.state === "running"
+        && live.pending.size === 0
+        && (textParts.length > 0 || toolCalls.length > 0)
+        && !isIdleTimeoutAbort(signal)
+      ) {
+        await parkKeepAlive();
+      }
+    }
   }
 
   private async *runWithAgent(
@@ -1249,12 +1356,14 @@ export class CursorSdkRunner implements CursorRunner {
   private agentOptions(
     input: CursorRunRequest,
     resolved: ResolvedModelRun,
-    customTools?: ReturnType<typeof createSdkCustomTools>
+    customTools?: ReturnType<typeof createSdkCustomTools>,
+    agentId?: string
   ): Record<string, unknown> {
     return {
       apiKey: input.apiKey,
       model: resolved.model,
       name: "Docker Composer API",
+      ...(agentId ? { agentId } : {}),
       // settingSources: [] 显式关闭环境规则加载，绝不把调用方机器/项目/团队的 Cursor 规则
       //（~/.cursor、.cursor/rules、AGENTS.md 等）注入到请求里，避免夹带额外提示词。
       local: {
@@ -1615,6 +1724,10 @@ export function parseSdkUsage(payload: unknown): RequestUsage | undefined {
   // 四个桶互斥，合计是四者之和（reasoning 是 output 的子集，不另计）。
   // 漏掉两个缓存桶会让历史里的合计显著偏小——缓存读取往往比未命中的输入还大一个量级。
   const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const sdkTotalField = finiteNumber(source.totalTokens);
+  console.error(
+    `[durable] turn-ended input=${inputTokens} cacheRead=${cacheReadTokens} cacheWrite=${cacheWriteTokens} output=${outputTokens} totalField=${sdkTotalField === undefined ? "absent" : sdkTotalField}`
+  );
   return {
     inputTokens,
     outputTokens,
@@ -1887,6 +2000,16 @@ function isActiveRunError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /already has active run|agent is busy|AgentBusyError/i.test(message)
     || /\b(CREATING|RUNNING)\b/.test(message);
+}
+
+function isIdleTimeoutAbort(signal: AbortSignal | undefined): boolean {
+  const reason = signal?.reason;
+  return reason instanceof ApiError && reason.statusCode === 504;
+}
+
+function isAgentAlreadyExistsError(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  return name === "UnknownAgentError" || /already exists/i.test(errorMessage(error));
 }
 
 export function toolCallsFromSdkEvent(event: unknown): GatewayToolCall[] {

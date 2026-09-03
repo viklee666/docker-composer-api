@@ -1,4 +1,5 @@
-import { createEphemeralAgentStore } from "./agent-store.js";
+import { dirname, join } from "node:path";
+import { AGENT_STORE_FILENAME, createSqliteAgentStore } from "./agent-store.js";
 import { loadConfig, shouldUseDurableHub } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
 import { SessionHub } from "./session-hub.js";
@@ -132,10 +133,11 @@ const executorLeases = new ExecutorWarmPool({
 // 放掉预热租约让引用计数归零，SDK 才会 dispose 旧执行器，下一个请求拿到的才是新协议的传输层。
 setAgentTransportResetter(() => executorLeases.releaseAll());
 
-// D9：无论 kill switch 还是 durable，都注入一份共享有界内存 store，禁止 omit 后落到 SDK 每 agent SQLite。
-// kill switch 打开：TTL 保持今日 10min（createEphemeralAgentStore 无参默认）。
-// kill switch 关闭（即便 WP7 前有人设 env）：idle TTL 用 cursorSdkSessionIdleTtlMs，仍有界。
-const localAgentStore = createEphemeralAgentStore(
+// 无论 kill switch 还是 durable，都注入一份共享有界 store，禁止 omit 后落到 SDK 每 agent SQLite。
+// kill switch 打开：TTL 保持今日 10min（无参默认）。kill switch 关闭：idle TTL 用 cursorSdkSessionIdleTtlMs，仍有界。
+// 路径与 state.sqlite 同目录，独立文件；不写进 state.sqlite（Connect 已对该文件另开连接）。
+const localAgentStore = createSqliteAgentStore(
+  join(dirname(config.sqlitePath), AGENT_STORE_FILENAME),
   config.cursorSdkDisableSessionResume
     ? undefined
     : {
@@ -306,6 +308,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
       // 关停 Connect worker 不是失败：它会把在途 run 放回 queued，重启后接着跑。
       await connectWorker?.stop();
       connectStore.close();
+      localAgentStore.close();
       process.exit(0);
     })();
   });
