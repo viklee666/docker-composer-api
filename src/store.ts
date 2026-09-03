@@ -38,7 +38,7 @@ export interface SqliteStoreOptions {
 
 export class SqliteStateStore implements StateStore {
   private readonly db: DatabaseSync;
-  private readonly requestLogKeep: number;
+  private requestLogKeep: number;
   private requestLogInsertCount = 0;
 
   constructor(path: string, options: SqliteStoreOptions = {}) {
@@ -175,6 +175,12 @@ export class SqliteStateStore implements StateStore {
     this.migrateResponseColumns();
     this.migrateAgentUsageBaselineColumns();
     // 启动时先裁剪一次：cleanup 每 100 条才跑，计数器重启归零后历史积压需要这里兜底。
+    this.trimRequestLogs();
+  }
+
+  /** 后台改保留条数后立刻裁剪；0 = 不再裁。 */
+  setRequestLogKeep(value: number): void {
+    this.requestLogKeep = normalizeKeep(value);
     this.trimRequestLogs();
   }
 

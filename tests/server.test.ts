@@ -732,6 +732,63 @@ test("manual enable clears the failure streak so the key is not re-disabled by t
   assert.equal((await keyPool.list()).find((key) => key.apiKey === "key-a")?.status, "active", "启用后一次失败不该立刻又被禁");
 });
 
+test("admin settings persist session mode and other runtime knobs", async () => {
+  const { app, store } = await createTestApp();
+  const adminHeaders = { authorization: "Bearer gateway-key" };
+
+  const saved = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: {
+      cursorSdkSessionMode: "durable",
+      allowDirectCursorKeys: false,
+      cursorAllowBuiltinTools: true,
+      requestTimeoutMs: 120000,
+      requestLogKeep: 50,
+      maxKeyAttempts: 4,
+      maxTransientAttempts: 2,
+      cursorReasoningEffort: "high",
+      cursorAgentMode: "plan",
+      cursorModelParams: "foo=bar"
+    }
+  });
+  assert.equal(saved.statusCode, 200);
+  const cfg = saved.json().config;
+  assert.equal(cfg.cursorSdkSessionMode, "durable");
+  assert.equal(cfg.allowDirectCursorKeys, false);
+  assert.equal(cfg.cursorAllowBuiltinTools, true);
+  assert.equal(cfg.requestTimeoutMs, 120000);
+  assert.equal(cfg.requestLogKeep, 50);
+  assert.equal(cfg.maxKeyAttempts, 4);
+  assert.equal(cfg.maxTransientAttempts, 2);
+  assert.equal(cfg.cursorReasoningEffort, "high");
+  assert.equal(cfg.cursorAgentMode, "plan");
+  assert.equal(cfg.cursorModelParams, "foo=bar");
+
+  const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
+  assert.equal(overview.json().config.cursorSdkSessionMode, "durable");
+  assert.equal(overview.json().config.host, "127.0.0.1");
+
+  const health = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(health.json().sessionMode, "durable");
+
+  const { loadCursorSdkSessionMode } = await import("../src/gateway-settings.js");
+  assert.deepEqual(await loadCursorSdkSessionMode(store, "stateless", true), {
+    mode: "durable",
+    disable: false,
+    stored: true
+  });
+
+  const invalid = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorSdkSessionMode: "whatever" }
+  });
+  assert.equal(invalid.statusCode, 400);
+});
+
 test("admin settings change the auto disable policy at runtime", async () => {
   const { app, keyPool } = await createTestApp();
   const adminHeaders = { authorization: "Bearer gateway-key" };

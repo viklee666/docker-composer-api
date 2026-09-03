@@ -26,6 +26,9 @@ export interface KeyRotatingOptions {
   maxKeyAttempts?: number;
   /** 单次请求软失败的最大次数，超过则不再换 key、直接透出上游错误。默认 3。 */
   maxTransientAttempts?: number;
+  /** 运行期从 config 读上限，后台改完不用重建 runner。 */
+  resolveMaxKeyAttempts?: () => number;
+  resolveMaxTransientAttempts?: () => number;
   /** 全局通道；未提供时读模块级总开关。测试里应绑到 config，避免并行用例互相污染。 */
   resolveGlobalClientType?: () => CursorClientType;
   /** 取用策略；未提供时读 key 池自己的策略（选 key 本来就以池上的策略为准）。 */
@@ -42,8 +45,8 @@ export interface KeyRotatingOptions {
  *  （换 key 会丢掉 held execute / 打爆前缀缓存）。首轮尚无绑定，仍允许轮换，成功后再 bindSession。
  */
 export class KeyRotatingRunner implements CursorRunner {
-  private readonly maxKeyAttempts: number;
-  private readonly maxTransientAttempts: number;
+  private readonly resolveMaxKeyAttempts: () => number;
+  private readonly resolveMaxTransientAttempts: () => number;
   private readonly resolveGlobalClientType?: () => CursorClientType;
   private readonly resolveRoutingPolicy?: () => RoutingPolicy;
 
@@ -52,10 +55,20 @@ export class KeyRotatingRunner implements CursorRunner {
     private readonly pool: CursorKeyPool,
     options: KeyRotatingOptions = {}
   ) {
-    this.maxKeyAttempts = positiveIntOr(options.maxKeyAttempts, DEFAULT_MAX_KEY_ATTEMPTS);
-    this.maxTransientAttempts = positiveIntOr(options.maxTransientAttempts, DEFAULT_MAX_TRANSIENT_ATTEMPTS);
+    const maxKeyAttempts = positiveIntOr(options.maxKeyAttempts, DEFAULT_MAX_KEY_ATTEMPTS);
+    const maxTransientAttempts = positiveIntOr(options.maxTransientAttempts, DEFAULT_MAX_TRANSIENT_ATTEMPTS);
+    this.resolveMaxKeyAttempts = options.resolveMaxKeyAttempts ?? (() => maxKeyAttempts);
+    this.resolveMaxTransientAttempts = options.resolveMaxTransientAttempts ?? (() => maxTransientAttempts);
     this.resolveGlobalClientType = options.resolveGlobalClientType;
     this.resolveRoutingPolicy = options.resolveRoutingPolicy;
+  }
+
+  private maxKeyAttempts(): number {
+    return positiveIntOr(this.resolveMaxKeyAttempts(), DEFAULT_MAX_KEY_ATTEMPTS);
+  }
+
+  private maxTransientAttempts(): number {
+    return positiveIntOr(this.resolveMaxTransientAttempts(), DEFAULT_MAX_TRANSIENT_ATTEMPTS);
   }
 
   private globalClientType(): CursorClientType {
@@ -122,7 +135,7 @@ export class KeyRotatingRunner implements CursorRunner {
         // 钉死后续不能把 sessionHash 交给 selectKey：粘性回落会在绑定 key 已试过/禁用时
         // 删绑定并改选下一把，正好丢掉 held execute。
         sessionHash: pinnedKeyId ? undefined : sessionHash
-      }, attempted.size < this.maxKeyAttempts);
+      }, attempted.size < this.maxKeyAttempts());
       if (!("key" in selection)) {
         if (pinnedKeyId) throw pinnedKeyUnavailable();
         if (softError) throw softError;
@@ -132,7 +145,7 @@ export class KeyRotatingRunner implements CursorRunner {
       if (pinnedKeyId && key.id !== pinnedKeyId) {
         throw pinnedKeyUnavailable();
       }
-      if (attempted.size >= this.maxKeyAttempts) {
+      if (attempted.size >= this.maxKeyAttempts()) {
         if (softError) throw softError;
         throw new ApiError(
           "Exhausted Cursor API key rotation attempts without success.",
@@ -192,7 +205,7 @@ export class KeyRotatingRunner implements CursorRunner {
         // 已向客户端吐出过内容时无法安全重试；非 key 级错误原样抛出。
         if (!failure || emitted || signal?.aborted) throw error;
         // 软失败累计到上限：停手透出上游错误，避免某模型在整池 key 上都不可用时把额度试个遍。
-        if (!disabled && softCount >= this.maxTransientAttempts) throw error;
+        if (!disabled && softCount >= this.maxTransientAttempts()) throw error;
       }
     }
   }

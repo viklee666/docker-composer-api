@@ -638,6 +638,10 @@ test("后台设置表单用三态控件承载 HTTP/1.1，不再用 checkbox 压�
   assert.match(ADMIN_HTML, /if \(http1ModeDirty\) body\.cursorSdkUseHttp1ForAgent = http1Mode === 'auto' \? null :/);
   // 回显要认来源，否则 stored:false 与「没配过」在界面上是同一个样子。
   assert.match(ADMIN_HTML, /cursorSdkUseHttp1Source/);
+  assert.match(ADMIN_HTML, /<select id="session-mode"/);
+  assert.match(ADMIN_HTML, /id="allow-direct-toggle"/);
+  assert.match(ADMIN_HTML, /id="boot-env-body"/);
+  assert.match(ADMIN_HTML, /CURSOR_SDK_SESSION_MODE/);
 });
 
 test("释放预热租约有时限，卡住的那份留在池里等下次重试", async (t) => {

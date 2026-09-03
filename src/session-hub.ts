@@ -276,9 +276,9 @@ export async function settleParallelTools(ms: number = PARALLEL_TOOL_SETTLE_MS):
  * → resolvePending → markIdle；不要的槽 drop。
  */
 export class SessionHub {
-  readonly holdTtlMs: number;
-  readonly idleTtlMs: number;
-  readonly maxLiveSessions: number;
+  holdTtlMs: number;
+  idleTtlMs: number;
+  maxLiveSessions: number;
   readonly parallelToolSettleMs: number;
   readonly recycleCleanupMs: number;
 
@@ -299,6 +299,13 @@ export class SessionHub {
     this.store = options.store;
     this.usesFakeClock = typeof options.now === "function";
     this.nowFn = options.now ?? Date.now;
+  }
+
+  /** 后台改 TTL / 上限后立即作用于后续 sweep / hold / 新槽，不丢现有会话。 */
+  configure(patch: { holdTtlMs?: number; idleTtlMs?: number; maxLiveSessions?: number }): void {
+    if (patch.holdTtlMs !== undefined) this.holdTtlMs = positiveBound(patch.holdTtlMs, this.holdTtlMs);
+    if (patch.idleTtlMs !== undefined) this.idleTtlMs = positiveBound(patch.idleTtlMs, this.idleTtlMs);
+    if (patch.maxLiveSessions !== undefined) this.maxLiveSessions = positiveBound(patch.maxLiveSessions, this.maxLiveSessions);
   }
 
   get size(): number {

@@ -8,8 +8,8 @@
  *
  * createEphemeralAgentStore 仍导出：tests/server.test.ts 在用，语义保持 upsert + 有界内存。
  *
- * 网关始终注入 store（禁止 omit 后落到 SDK 每 agent SQLite）。kill switch 只改 TTL：
- * 打开 → 无参默认 10min/256；关闭 → CURSOR_SDK_SESSION_IDLE_TTL_MS / CURSOR_SDK_MAX_LIVE_SESSIONS。
+ * 网关始终注入 store（禁止 omit 后落到 SDK 每 agent SQLite）。
+ * TTL 用 CURSOR_SDK_SESSION_IDLE_TTL_MS / CURSOR_SDK_MAX_LIVE_SESSIONS（后台「运行设置」可改）。
  * 两层回收：闲置超时 + 超量 LRU，SQL DELETE 行，不关连接、不 unlink 每 agent 文件。
  */
 

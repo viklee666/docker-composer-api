@@ -293,6 +293,15 @@ test("request history keeps everything by default and only trims once REQUEST_LO
   assert.equal((await capped.listRequestLogs({ limit: 1 })).total, 5);
 });
 
+test("setRequestLogKeep trims immediately when the admin changes the cap", async () => {
+  const path = tempDbPath();
+  const store = new SqliteStateStore(path, { requestLogKeep: 0 });
+  for (let i = 0; i < 20; i += 1) await store.insertRequestLog(log({ id: `live-keep-${i}` }));
+  assert.equal((await store.listRequestLogs({ limit: 1 })).total, 20);
+  store.setRequestLogKeep(7);
+  assert.equal((await store.listRequestLogs({ limit: 1 })).total, 7);
+});
+
 test("integer settings reject numeric prefixes instead of accepting parseInt leftovers", () => {
   const defaults = loadConfig({});
   assert.equal(loadConfig({ PORT: "500oops" }).port, defaults.port);

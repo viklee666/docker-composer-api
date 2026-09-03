@@ -5,10 +5,23 @@ import { CursorSdkRunner } from "./cursor-runner.js";
 import { SessionHub } from "./session-hub.js";
 import { ExecutorWarmPool, type WarmupPlatform } from "./executor-warmup.js";
 import {
+  loadAllowDirectCursorKeys,
   loadAutoDisableKeys,
   loadAutoDisableThreshold,
+  loadCursorAgentMode,
+  loadCursorAllowBuiltinTools,
   loadCursorFastDefault,
   loadCursorMaxModeDefault,
+  loadCursorModelParams,
+  loadCursorReasoningEffort,
+  loadCursorSdkMaxLiveSessions,
+  loadCursorSdkSessionIdleTtlMs,
+  loadCursorSdkSessionMode,
+  loadCursorSdkToolHoldTtlMs,
+  loadMaxKeyAttempts,
+  loadMaxTransientAttempts,
+  loadRequestLogKeep,
+  loadRequestTimeoutMs,
   loadRoutingStrategy,
   loadSandClientMode,
   loadSessionAffinity,
@@ -101,6 +114,26 @@ const systemPrompt = await loadSystemPromptSettings(store, {
 });
 config.systemPromptMode = systemPrompt.mode;
 config.systemPrompt = systemPrompt.text;
+const sessionMode = await loadCursorSdkSessionMode(
+  store,
+  config.cursorSdkSessionMode,
+  config.cursorSdkDisableSessionResume
+);
+config.cursorSdkSessionMode = sessionMode.mode;
+config.cursorSdkDisableSessionResume = sessionMode.disable;
+config.allowDirectCursorKeys = await loadAllowDirectCursorKeys(store, config.allowDirectCursorKeys);
+config.cursorAllowBuiltinTools = await loadCursorAllowBuiltinTools(store, config.cursorAllowBuiltinTools);
+config.requestTimeoutMs = await loadRequestTimeoutMs(store, config.requestTimeoutMs);
+config.requestLogKeep = await loadRequestLogKeep(store, config.requestLogKeep);
+store.setRequestLogKeep(config.requestLogKeep);
+config.cursorSdkToolHoldTtlMs = await loadCursorSdkToolHoldTtlMs(store, config.cursorSdkToolHoldTtlMs);
+config.cursorSdkSessionIdleTtlMs = await loadCursorSdkSessionIdleTtlMs(store, config.cursorSdkSessionIdleTtlMs);
+config.cursorSdkMaxLiveSessions = await loadCursorSdkMaxLiveSessions(store, config.cursorSdkMaxLiveSessions);
+config.maxKeyAttempts = await loadMaxKeyAttempts(store, config.maxKeyAttempts);
+config.maxTransientAttempts = await loadMaxTransientAttempts(store, config.maxTransientAttempts);
+config.cursorReasoningEffort = await loadCursorReasoningEffort(store, config.cursorReasoningEffort);
+config.cursorAgentMode = await loadCursorAgentMode(store, config.cursorAgentMode);
+config.cursorModelParams = await loadCursorModelParams(store, config.cursorModelParams);
 const keyPool = new CursorKeyPool(store, {
   enabled: config.autoDisableKeys,
   threshold: config.autoDisableThreshold
@@ -133,42 +166,37 @@ const executorLeases = new ExecutorWarmPool({
 // 放掉预热租约让引用计数归零，SDK 才会 dispose 旧执行器，下一个请求拿到的才是新协议的传输层。
 setAgentTransportResetter(() => executorLeases.releaseAll());
 
-// 无论 kill switch 还是 durable，都注入一份共享有界 store，禁止 omit 后落到 SDK 每 agent SQLite。
-// kill switch 打开：TTL 保持今日 10min（无参默认）。kill switch 关闭：idle TTL 用 cursorSdkSessionIdleTtlMs，仍有界。
-// 路径与 state.sqlite 同目录，独立文件；不写进 state.sqlite（Connect 已对该文件另开连接）。
+// 网关始终注入 store（禁止 omit 后落到 SDK 每 agent SQLite）。
+// TTL 跟后台/env 的 idle / maxLive；stateless 只是不用 Hub，store 仍有界。
 const localAgentStore = createSqliteAgentStore(
   join(dirname(config.sqlitePath), AGENT_STORE_FILENAME),
-  config.cursorSdkDisableSessionResume
-    ? undefined
-    : {
-        idleTtlMs: config.cursorSdkSessionIdleTtlMs,
-        maxAgents: config.cursorSdkMaxLiveSessions
-      }
+  {
+    idleTtlMs: config.cursorSdkSessionIdleTtlMs,
+    maxAgents: config.cursorSdkMaxLiveSessions
+  }
 );
-// 生产默认 durable（kill switch 关 + sessionMode=durable）→ 建 Hub。kill switch 打开则不建。
-const useDurableHub = shouldUseDurableHub(config);
-const sessionHub = useDurableHub
-  ? new SessionHub({
-      holdTtlMs: config.cursorSdkToolHoldTtlMs,
-      idleTtlMs: config.cursorSdkSessionIdleTtlMs,
-      maxLiveSessions: config.cursorSdkMaxLiveSessions,
-      store
-    })
-  : undefined;
+// 始终建 Hub：后台从 stateless 切回 durable 才不必重启。stateless / kill switch 只让 runner 不用它。
+const sessionHub = new SessionHub({
+  holdTtlMs: config.cursorSdkToolHoldTtlMs,
+  idleTtlMs: config.cursorSdkSessionIdleTtlMs,
+  maxLiveSessions: config.cursorSdkMaxLiveSessions,
+  store
+});
+const useDurableHub = () => shouldUseDurableHub(config);
 
 const sdkRunner = new CursorSdkRunner(store, {
   defaultWorkingDirectory: config.cursorWorkingDirectory,
   sdkClientVersion: config.sdkClientVersion,
-  disableSessionResume: config.cursorSdkDisableSessionResume,
-  allowBuiltinTools: config.cursorAllowBuiltinTools,
+  disableSessionResume: () => !useDurableHub(),
+  allowBuiltinTools: () => config.cursorAllowBuiltinTools,
   executorLeases,
   localAgentStore,
   getModelCatalog: getModelCatalogEntry,
   sessionHub
 });
 const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
-  maxKeyAttempts: config.maxKeyAttempts,
-  maxTransientAttempts: config.maxTransientAttempts,
+  resolveMaxKeyAttempts: () => config.maxKeyAttempts,
+  resolveMaxTransientAttempts: () => config.maxTransientAttempts,
   resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
 });
 
@@ -215,9 +243,8 @@ const runner = new ProviderRoutingRunner({ sdk: sdkRoute, connect });
  */
 const usageReconciler = new UsageReconciler({
   store,
-  // 只有 durable Hub 会跨请求复用 agent，才记增量基线。
-  // kill switch / SESSION_MODE=stateless 都是每请求 create+dispose，不落基线。
-  trackAgentBaseline: useDurableHub
+  // 只有 durable 会跨请求复用 agent，才记增量基线。后台切 mode 后立即跟上。
+  trackAgentBaseline: () => useDurableHub()
 });
 
 const app = createApp({
@@ -228,15 +255,19 @@ const app = createApp({
   gatewayKeyPool,
   usageReconciler,
   connect,
-  startedAt: Date.now()
+  startedAt: Date.now(),
+  runtime: {
+    setRequestLogKeep: (value) => store.setRequestLogKeep(value),
+    configureSessionHub: (patch) => sessionHub.configure(patch)
+  }
 });
 
 await app.listen({ host: config.host, port: config.port });
 console.log(`Docker Composer API listening on http://${config.host}:${config.port}`);
 console.log(`Admin panel available at /admin (${config.adminPassword ? "enabled" : "disabled: set ADMIN_PASSWORD"})`);
-if (config.cursorSdkDisableSessionResume) {
+if (config.cursorSdkDisableSessionResume && !sessionMode.stored) {
   console.log("Cursor SDK kill switch on: session resume disabled (stateless per request: create+full prompt+cancel+dispose)");
-} else if (useDurableHub) {
+} else if (useDurableHub()) {
   console.log(
     `Cursor SDK session mode: durable (idle ttl ${Math.round(config.cursorSdkSessionIdleTtlMs / 1000)}s, max ${config.cursorSdkMaxLiveSessions})`
   );

@@ -246,6 +246,10 @@ function applyBareSuffixToken(intent: ModelIntent, token: string): void {
 }
 
 /** 解析 `id=value,id2=value2`（或 `;` 分隔）或 JSON 数组形式的 model.params。 */
+export function formatModelParamsSpec(params: ModelParameterValue[] | undefined): string {
+  return (params ?? []).map((item) => `${item.id}=${item.value}`).join(",");
+}
+
 export function parseModelParamsSpec(value: unknown): ModelParameterValue[] | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   if (Array.isArray(value)) return normalizeParamArray(value);

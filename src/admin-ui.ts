@@ -102,6 +102,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 .callout{background:var(--panel-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:10px;padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.55}
 .callout strong{color:#fff}
 .callout.warn{border-left-color:var(--yellow)}
+.settings-block{margin:0 0 22px}
+.settings-block:last-child{margin-bottom:8px}
+.settings-block h3{font-size:13px;font-weight:650;margin:0 0 4px}
+.settings-block .lede{color:var(--muted);font-size:12px;line-height:1.5;margin-bottom:10px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px 16px}
+.setting-field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+.setting-field .env{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400}
+.setting-field .hint{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.45}
+.setting-field input[type="number"],.setting-field input[type="text"],.setting-field select{width:100%;max-width:100%}
+.setting-check{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--text);cursor:pointer}
+.setting-check input{margin-top:3px}
 .warn-loud{background:rgba(245,184,77,.12);border:1px solid rgba(245,184,77,.55);color:var(--yellow);
   border-radius:12px;padding:14px 16px;margin:12px 0;font-size:13.5px;line-height:1.55}
 .warn-loud strong{color:#ffd789}
@@ -235,6 +246,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           <span class="chip chip-extra" id="chip-version">v-</span>
           <span class="chip chip-extra" id="chip-uptime">运行 -</span>
           <span class="chip chip-extra" id="chip-direct">直传 key：-</span>
+          <span class="chip" id="chip-session">会话：-</span>
           <span class="chip" id="chip-http1">HTTP：-</span>
           <span class="chip" id="chip-autodisable">自动禁用：-</span>
           <span class="chip" id="chip-sand">通道：-</span>
@@ -620,18 +632,108 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
         <section id="sec-settings" class="hidden" data-section="settings">
           <div class="panel">
-            <div class="head"><h2>运行设置</h2><span class="hint">设置会保存到数据库并立即影响后续新建的 Cursor local agent</span></div>
+            <div class="head"><h2>运行设置</h2><span class="hint">保存到数据库，立即作用于后续请求；启动项（监听地址、库路径）只读，改 env 后重启</span></div>
             <div class="body">
-              <div class="row" style="margin-bottom:10px">
-                <label class="toggle" style="font-size:13px;color:var(--text)">
-                  <input type="checkbox" id="max-mode-toggle">
-                  支持的模型默认开启 Max Mode（大上下文 / 1M）
-                </label>
-                <label class="toggle" style="font-size:13px;color:var(--text)">
-                  <input type="checkbox" id="fast-toggle">
-                  支持的模型默认开启 Fast
-                </label>
+              <div class="settings-block">
+                <h3>会话与 prompt 缓存</h3>
+                <p class="lede">durable 才复用本地 Agent、打得中上游 prefix cache。<code>sessionMode</code> 必须是 durable；stateless 时 Cache Read 恒为 0，模型会像失忆一样重开每轮。Grok 的 Cache Write=0 是正常的。</p>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label>会话模式 <span class="env">CURSOR_SDK_SESSION_MODE</span></label>
+                    <select id="session-mode">
+                      <option value="durable">durable（复用 Agent，增量发送）</option>
+                      <option value="stateless">stateless（每请求新建，等同 kill switch）</option>
+                    </select>
+                    <div class="hint">Claude Code 主会话认 x-claude-code-session-id；子代理再带 x-claude-code-agent-id，不会抢同一槽。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>挂起工具最长等待（ms） <span class="env">CURSOR_SDK_TOOL_HOLD_TTL_MS</span></label>
+                    <input id="tool-hold-ttl" type="number" min="1000" step="1000">
+                  </div>
+                  <div class="setting-field">
+                    <label>空闲 Agent 回收（ms） <span class="env">CURSOR_SDK_SESSION_IDLE_TTL_MS</span></label>
+                    <input id="session-idle-ttl" type="number" min="10000" step="1000">
+                  </div>
+                  <div class="setting-field">
+                    <label>同时存活会话上限 <span class="env">CURSOR_SDK_MAX_LIVE_SESSIONS</span></label>
+                    <input id="max-live-sessions" type="number" min="1" max="10000" step="1">
+                  </div>
+                </div>
               </div>
+
+              <div class="settings-block">
+                <h3>请求与鉴权</h3>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label class="setting-check"><input type="checkbox" id="allow-direct-toggle"> 允许客户端直传 Cursor API key <span class="env">ALLOW_DIRECT_CURSOR_KEYS</span></label>
+                  </div>
+                  <div class="setting-field">
+                    <label class="setting-check"><input type="checkbox" id="builtin-tools-toggle"> 允许网关容器内使用 Cursor 内置工具 <span class="env">CURSOR_ALLOW_BUILTIN_TOOLS</span></label>
+                    <div class="hint">默认关。打开后 agent 能在网关侧跑 shell/edit，再转发给客户端会双重执行。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>上游空闲超时（ms） <span class="env">REQUEST_TIMEOUT_MS</span></label>
+                    <input id="request-timeout" type="number" min="5000" step="1000">
+                    <div class="hint">流式按无输出空闲计时，每写出一个 SSE chunk 重置。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>请求历史保留条数 <span class="env">REQUEST_LOG_KEEP</span></label>
+                    <input id="request-log-keep" type="number" min="0" step="1">
+                    <div class="hint">0 = 不裁剪。条数过大时状态库会一直涨。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>单次最多轮换 key 次数 <span class="env">MAX_KEY_ATTEMPTS</span></label>
+                    <input id="max-key-attempts" type="number" min="1" max="100" step="1">
+                  </div>
+                  <div class="setting-field">
+                    <label>软失败最多重试 <span class="env">MAX_TRANSIENT_KEY_ATTEMPTS</span></label>
+                    <input id="max-transient-attempts" type="number" min="1" max="50" step="1">
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-block">
+                <h3>模型默认（客户端显式指定时以客户端为准）</h3>
+                <div class="row" style="margin-bottom:10px">
+                  <label class="toggle" style="font-size:13px;color:var(--text)">
+                    <input type="checkbox" id="max-mode-toggle">
+                    支持的模型默认开启 Max Mode（大上下文 / 1M）
+                  </label>
+                  <label class="toggle" style="font-size:13px;color:var(--text)">
+                    <input type="checkbox" id="fast-toggle">
+                    支持的模型默认开启 Fast
+                  </label>
+                </div>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label>默认思考强度 <span class="env">CURSOR_REASONING_EFFORT</span></label>
+                    <select id="reasoning-effort">
+                      <option value="">未设置（跟客户端 / 模型）</option>
+                      <option value="none">none</option>
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                      <option value="xhigh">xhigh</option>
+                      <option value="max">max</option>
+                    </select>
+                  </div>
+                  <div class="setting-field">
+                    <label>默认 Cursor 会话模式 <span class="env">CURSOR_AGENT_MODE</span></label>
+                    <select id="agent-mode">
+                      <option value="">未设置</option>
+                      <option value="agent">agent</option>
+                      <option value="plan">plan</option>
+                    </select>
+                  </div>
+                  <div class="setting-field">
+                    <label>默认 model.params <span class="env">CURSOR_MODEL_PARAMS</span></label>
+                    <input id="model-params" type="text" placeholder="id=value,id2=value2 或 JSON 数组" autocomplete="off">
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-block">
+                <h3>通道、协议与自动禁用</h3>
               <div class="row" style="margin-bottom:10px">
                 <label class="toggle" style="font-size:13px;color:var(--text)">Cursor local agent 的 HTTP/1.1 + SSE
                   <select id="sdk-http1-mode" style="min-width:210px" title="HTTP/2 不支持代理，配了代理时模型流量必须走 HTTP/1.1">
@@ -660,9 +762,21 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                   次后才禁用
                 </label>
               </div>
+              </div>
               <div class="row">
                 <button id="btn-save-settings">保存设置</button>
                 <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="head"><h2>启动环境（只读）</h2><span class="hint">改这些必须改 env / compose 后重启进程</span></div>
+            <div class="body">
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>项</th><th>当前值</th><th>env</th></tr></thead>
+                  <tbody id="boot-env-body"></tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -1111,10 +1225,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('sdk-http1-mode').value = http1ModeOf(cfg);
     $('sdk-http1-hint').textContent = http1Hint(cfg);
   }
-  function applySettingsForm(cfg){
+  function applySettingsForm(cfg, force){
     if (!cfg) return;
     var el = document.activeElement;
-    if (el && el.closest && el.closest('#sec-settings')) return;
+    if (!force && el && el.closest && el.closest('#sec-settings')) return;
     applyHttp1Form(cfg);
     http1ModeDirty = false;
     $('max-mode-toggle').checked = !!cfg.cursorMaxMode;
@@ -1127,6 +1241,32 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('sand-hook-hint').textContent = sandClientMode && cfg.sandClientHookPatched === false
       ? '（SDK 尚未加载或注入未生效，重启后看启动日志）'
       : (cfg.sandClientHookPatched === true ? '（Sand hook 已生效）' : '');
+    $('session-mode').value = cfg.cursorSdkSessionMode === 'stateless' ? 'stateless' : 'durable';
+    $('tool-hold-ttl').value = cfg.cursorSdkToolHoldTtlMs || 900000;
+    $('session-idle-ttl').value = cfg.cursorSdkSessionIdleTtlMs || 3600000;
+    $('max-live-sessions').value = cfg.cursorSdkMaxLiveSessions || 256;
+    $('allow-direct-toggle').checked = cfg.allowDirectCursorKeys !== false;
+    $('builtin-tools-toggle').checked = !!cfg.cursorAllowBuiltinTools;
+    $('request-timeout').value = cfg.requestTimeoutMs || 180000;
+    $('request-log-keep').value = cfg.requestLogKeep == null ? 0 : cfg.requestLogKeep;
+    $('max-key-attempts').value = cfg.maxKeyAttempts || 10;
+    $('max-transient-attempts').value = cfg.maxTransientAttempts || 3;
+    $('reasoning-effort').value = cfg.cursorReasoningEffort || '';
+    $('agent-mode').value = cfg.cursorAgentMode || '';
+    $('model-params').value = cfg.cursorModelParams || '';
+    renderBootEnv(cfg);
+  }
+  function renderBootEnv(cfg){
+    var rows = [
+      ['监听地址', (cfg.host || '') + ':' + (cfg.port || ''), 'HOST / PORT'],
+      ['工作目录', cfg.workingDirectory || '', 'CURSOR_WORKING_DIRECTORY'],
+      ['状态库', cfg.sqlitePath || '', 'SQLITE_PATH'],
+      ['SDK 客户端版本', cfg.sdkClientVersion || '', 'CURSOR_SDK_CLIENT_VERSION'],
+      ['启动预热', cfg.cursorPrewarm === false ? '关' : '开', 'CURSOR_PREWARM']
+    ];
+    $('boot-env-body').innerHTML = rows.map(function(row){
+      return '<tr><td>' + esc(row[0]) + '</td><td class="mono">' + esc(row[1]) + '</td><td class="mono muted">' + esc(row[2]) + '</td></tr>';
+    }).join('');
   }
   function applyRoutingForm(cfg){
     if (!cfg) return;
@@ -1157,6 +1297,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('side-version').textContent = 'v' + data.version;
     $('side-uptime').textContent = '运行 ' + fmtUptime(data.uptimeSeconds);
     $('chip-direct').textContent = '直传 key：' + (cfg.allowDirectCursorKeys ? '允许' : '禁止');
+    $('chip-session').textContent = '会话：' + (cfg.cursorSdkSessionMode === 'stateless' ? 'stateless' : 'durable');
     $('chip-http1').textContent = 'HTTP：' + (cfg.cursorSdkUseHttp1ForAgent ? '1.1' : '默认');
     $('chip-autodisable').textContent = '自动禁用：'
       + (cfg.autoDisableKeys ? '连续失败 ' + (cfg.autoDisableThreshold || 1) + ' 次' : '已关闭');
@@ -1197,6 +1338,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
     var proxy = cfg.proxy || {};
     var html = '';
+    html += cfgItem('会话模式', cfg.cursorSdkSessionMode === 'stateless' ? 'stateless' : 'durable');
+    html += cfgItem('直传 Cursor key', cfg.allowDirectCursorKeys ? '允许' : '禁止');
+    html += cfgItem('上游超时', (cfg.requestTimeoutMs || 0) + ' ms');
     html += cfgItem('取用策略', strategyLabel(cfg.routingStrategy));
     html += cfgItem('会话粘性', cfg.sessionAffinity
       ? '开 · TTL ' + (cfg.sessionAffinityTtlMs || 0) + ' ms'
@@ -2206,13 +2350,40 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('btn-save-settings').addEventListener('click', function(){
     var threshold = parseInt($('auto-disable-threshold').value, 10);
     if (!(threshold >= 1 && threshold <= 50)) { toast('连续失败次数需为 1-50 的整数', true); return; }
+    var timeout = parseInt($('request-timeout').value, 10);
+    if (!(timeout >= 5000)) { toast('上游超时至少 5000 ms', true); return; }
+    var keep = parseInt($('request-log-keep').value, 10);
+    if (!(keep >= 0)) { toast('请求历史保留条数需为 ≥0 的整数', true); return; }
+    var hold = parseInt($('tool-hold-ttl').value, 10);
+    if (!(hold >= 1000)) { toast('工具挂起等待至少 1000 ms', true); return; }
+    var idle = parseInt($('session-idle-ttl').value, 10);
+    if (!(idle >= 10000)) { toast('空闲回收至少 10000 ms', true); return; }
+    var maxLive = parseInt($('max-live-sessions').value, 10);
+    if (!(maxLive >= 1 && maxLive <= 10000)) { toast('存活会话上限需为 1–10000', true); return; }
+    var maxAttempts = parseInt($('max-key-attempts').value, 10);
+    if (!(maxAttempts >= 1 && maxAttempts <= 100)) { toast('轮换次数需为 1–100', true); return; }
+    var transient = parseInt($('max-transient-attempts').value, 10);
+    if (!(transient >= 1 && transient <= 50)) { toast('软失败重试需为 1–50', true); return; }
     var http1Mode = $('sdk-http1-mode').value;
     var body = {
       cursorMaxMode: $('max-mode-toggle').checked,
       cursorFast: $('fast-toggle').checked,
       autoDisableKeys: $('auto-disable-toggle').checked,
       autoDisableThreshold: threshold,
-      sandClientMode: $('sand-mode-toggle').checked
+      sandClientMode: $('sand-mode-toggle').checked,
+      cursorSdkSessionMode: $('session-mode').value,
+      cursorSdkToolHoldTtlMs: hold,
+      cursorSdkSessionIdleTtlMs: idle,
+      cursorSdkMaxLiveSessions: maxLive,
+      allowDirectCursorKeys: $('allow-direct-toggle').checked,
+      cursorAllowBuiltinTools: $('builtin-tools-toggle').checked,
+      requestTimeoutMs: timeout,
+      requestLogKeep: keep,
+      maxKeyAttempts: maxAttempts,
+      maxTransientAttempts: transient,
+      cursorReasoningEffort: $('reasoning-effort').value,
+      cursorAgentMode: $('agent-mode').value,
+      cursorModelParams: $('model-params').value
     };
     // 只有真的操作过这个控件才提交 null/布尔值；未触碰时省略字段，
     // 否则旧页面把「未设置」送给后端会清掉另一位管理员刚保存的显式选择。
@@ -2227,7 +2398,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       if (data && data.executorResetWarning) toast(data.executorResetWarning, true);
       if (data.config) {
         applyHttp1Form(data.config);
-        applySettingsForm(data.config);
+        applySettingsForm(data.config, true);
       }
       loadAll();
     }).catch(function(err){

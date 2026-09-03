@@ -26,8 +26,9 @@ export interface UsageReconcilerOptions {
    * 关掉 session resume 时每个请求都是全新 agent，增量恒等于累计值，
    * 这时落基线只会让 `agent_usage_baselines` 跟着请求数一起无界增长，所以 index.ts 会显式关掉它。
    * durable / 旧 resume 必须开：`getUsage` 是 agent 累计值，本条 HTTP 只能记增量，不能把首轮金额再加一遍。
+   * 函数形式让后台切换会话模式后立即生效。
    */
-  trackAgentBaseline?: boolean;
+  trackAgentBaseline?: boolean | (() => boolean);
 }
 
 const DEFAULT_DELAY_MS = 15_000;
@@ -63,7 +64,7 @@ export class UsageReconciler {
   private readonly getUsageTimeoutMs: number;
   private readonly drainTimeoutMs: number;
   private readonly getUsage: (agentId: string, apiKey: string) => Promise<{ usage?: RequestUsage; cost?: RequestCost }>;
-  private readonly trackAgentBaseline: boolean;
+  private readonly resolveTrackAgentBaseline: () => boolean;
   private readonly timers = new Set<NodeJS.Timeout>();
   private readonly queue: PendingTask[] = [];
   private readonly drainWaiters: Array<() => void> = [];
@@ -80,7 +81,12 @@ export class UsageReconciler {
     this.getUsageTimeoutMs = positiveMs(options.getUsageTimeoutMs, DEFAULT_GET_USAGE_TIMEOUT_MS);
     this.drainTimeoutMs = positiveMs(options.drainTimeoutMs, DEFAULT_DRAIN_TIMEOUT_MS);
     this.getUsage = options.getUsage ?? fetchAgentUsage;
-    this.trackAgentBaseline = options.trackAgentBaseline ?? true;
+    const track = options.trackAgentBaseline ?? true;
+    this.resolveTrackAgentBaseline = typeof track === "function" ? track : () => track;
+  }
+
+  private trackAgentBaseline(): boolean {
+    return this.resolveTrackAgentBaseline();
   }
 
   /** 排入一次补写；不抛异常、不阻塞调用方。 */
@@ -155,7 +161,7 @@ export class UsageReconciler {
       const booked = cost ? await this.bookCost(task.input.logId, task.input.agentId, cost) : undefined;
       // getUsage 的 usage 是 agent 累计值，不属于这条 request log 的单次遥测；本次用量只认请求路径捕获的 usage。
       // tracked 模式的 store 方法已经把金额和基线放进同一事务，不能再用第二次 update 覆盖同一行的累计增量。
-      if (booked && !this.trackAgentBaseline) {
+      if (booked && !this.trackAgentBaseline()) {
         await this.store.updateRequestLogUsage(task.input.logId, undefined, booked);
       }
       // 累计值没有增长时，既可能是免费请求，也可能是计费副本尚未更新；
@@ -163,7 +169,7 @@ export class UsageReconciler {
       // 这会牺牲极晚到达的金额，但不会把累计总额再当成单次金额写进去。
       if (
         !booked &&
-        this.trackAgentBaseline &&
+        this.trackAgentBaseline() &&
         cost &&
         task.attempt >= this.maxAttempts
       ) {
@@ -177,7 +183,7 @@ export class UsageReconciler {
       // 一旦有新增金额便停止，避免同一 agent 的后续 run 在本条日志的有界轮询期间被误摊进来。
       if (
         task.attempt < this.maxAttempts &&
-        (this.trackAgentBaseline ? !booked : !cost)
+        (this.trackAgentBaseline() ? !booked : !cost)
       ) {
         this.enqueueAfter({ input: task.input, attempt: task.attempt + 1 }, this.backoffMs(task.attempt));
       }
@@ -217,7 +223,7 @@ export class UsageReconciler {
    * 后到的拿到 0，合计仍然正确——累计口径本来就没法把一笔钱摊回具体哪一次 run。
    */
   private async bookCost(logId: string, agentId: string, cost: RequestCost): Promise<RequestCost | undefined> {
-    if (!this.trackAgentBaseline) return cost;
+    if (!this.trackAgentBaseline()) return cost;
     return this.store.bookAgentUsageDeltaForRequest(logId, agentId, cost);
   }
 

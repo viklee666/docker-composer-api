@@ -9,11 +9,29 @@ import { CursorConnectService, connectSettings } from "./cursor-connect/service.
 import type { CcCredential } from "./cursor-connect/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { GatewayKeyPool } from "./gateway-key-pool.js";
+import { shouldUseDurableHub } from "./config.js";
+import { parseModelParamsSpec, formatModelParamsSpec } from "./model-params.js";
 import {
+  parseReasoningEffort,
+  REASONING_EFFORT_VALUES,
+  RUNTIME_SETTING_BOUNDS,
+  saveAllowDirectCursorKeys,
   saveAutoDisableKeys,
   saveAutoDisableThreshold,
+  saveCursorAgentMode,
+  saveCursorAllowBuiltinTools,
   saveCursorFastDefault,
   saveCursorMaxModeDefault,
+  saveCursorModelParams,
+  saveCursorReasoningEffort,
+  saveCursorSdkMaxLiveSessions,
+  saveCursorSdkSessionIdleTtlMs,
+  saveCursorSdkSessionMode,
+  saveCursorSdkToolHoldTtlMs,
+  saveMaxKeyAttempts,
+  saveMaxTransientAttempts,
+  saveRequestLogKeep,
+  saveRequestTimeoutMs,
   saveRoutingStrategy,
   saveSandClientMode,
   saveSessionAffinity,
@@ -36,9 +54,11 @@ import {
 import { durableTelemetrySnapshot } from "./durable-telemetry.js";
 import type { AppDeps } from "./server.js";
 import type {
+  AgentMode,
   CursorClientType,
   CursorKeyRecord,
   CursorRunRequest,
+  CursorSdkSessionMode,
   GatewayKeyPatch,
   GatewayKeyRecord,
   KeyUsageRef,
@@ -66,6 +86,54 @@ const HTTP1_AUTO_ENABLED_NOTICE =
   "HTTP/2 不支持代理，不开的话模型流量会绕过代理直连。" +
   "新建的会话立即按 HTTP/1.1 走；已经建好的连接仍是 HTTP/2，要等在途请求收尾才会被回收。" +
   "若模型请求仍然超时，重启网关最保险。";
+
+function publicRuntimeConfig(
+  deps: AppDeps,
+  extras: {
+    cursorSdkUseHttp1ForAgent: boolean;
+    cursorSdkUseHttp1Source: string;
+    proxy: ReturnType<typeof proxyStatus>;
+  }
+) {
+  const routing = deps.keyPool.routingPolicy;
+  return {
+    allowDirectCursorKeys: deps.config.allowDirectCursorKeys,
+    requestTimeoutMs: deps.config.requestTimeoutMs,
+    requestLogKeep: deps.config.requestLogKeep,
+    workingDirectory: deps.config.cursorWorkingDirectory,
+    host: deps.config.host,
+    port: deps.config.port,
+    sqlitePath: deps.config.sqlitePath,
+    sdkClientVersion: deps.config.sdkClientVersion,
+    cursorPrewarm: deps.config.cursorPrewarm,
+    cursorSdkSessionMode: shouldUseDurableHub(deps.config) ? "durable" : "stateless",
+    cursorSdkDisableSessionResume: deps.config.cursorSdkDisableSessionResume,
+    cursorSdkToolHoldTtlMs: deps.config.cursorSdkToolHoldTtlMs,
+    cursorSdkSessionIdleTtlMs: deps.config.cursorSdkSessionIdleTtlMs,
+    cursorSdkMaxLiveSessions: deps.config.cursorSdkMaxLiveSessions,
+    cursorAllowBuiltinTools: deps.config.cursorAllowBuiltinTools,
+    maxKeyAttempts: deps.config.maxKeyAttempts,
+    maxTransientAttempts: deps.config.maxTransientAttempts,
+    cursorReasoningEffort: deps.config.cursorReasoningEffort ?? "",
+    cursorAgentMode: deps.config.cursorAgentMode ?? "",
+    cursorModelParams: formatModelParamsSpec(deps.config.cursorModelParams),
+    cursorSdkUseHttp1ForAgent: extras.cursorSdkUseHttp1ForAgent,
+    cursorSdkUseHttp1Source: extras.cursorSdkUseHttp1Source,
+    cursorMaxMode: deps.config.cursorMaxMode === true,
+    cursorFast: deps.config.cursorFast === true,
+    autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
+    autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
+    sandClientMode: deps.config.sandClientMode === true,
+    sandClientHookPatched: isSandClientHookPatched(),
+    gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey),
+    routingStrategy: routing.strategy,
+    sessionAffinity: routing.sessionAffinity,
+    sessionAffinityTtlMs: routing.sessionAffinityTtlMs,
+    systemPromptMode: deps.config.systemPromptMode,
+    systemPromptSet: Boolean(deps.config.systemPrompt?.trim()),
+    proxy: extras.proxy
+  };
+}
 
 export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   app.get("/admin", async (_request, reply) => {
@@ -96,35 +164,17 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       fallback: deps.config.cursorSdkUseHttp1ForAgent
     });
     const cursorSdkUseHttp1ForAgent = http1.enabled;
-    const routing = deps.keyPool.routingPolicy;
     const gatewayKeys = deps.gatewayKeyPool ? await deps.gatewayKeyPool.list() : undefined;
     return {
       service: SERVICE_NAME,
       version: SERVICE_VERSION,
       uptimeSeconds: Math.floor((Date.now() - (deps.startedAt ?? Date.now())) / 1000),
       storage: "sqlite",
-      config: {
-        allowDirectCursorKeys: deps.config.allowDirectCursorKeys,
-        requestTimeoutMs: deps.config.requestTimeoutMs,
-        workingDirectory: deps.config.cursorWorkingDirectory,
+      config: publicRuntimeConfig(deps, {
         cursorSdkUseHttp1ForAgent,
-        // 后台的开关是三态的，光给布尔值它分不出「运维亲手设的」与「网关按代理替他决定的」，
-        // 于是只能拿一个 checkbox 回显，一保存就把「没表过态」写成了显式取值。
         cursorSdkUseHttp1Source: http1.source,
-        cursorMaxMode: deps.config.cursorMaxMode === true,
-        cursorFast: deps.config.cursorFast === true,
-        autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
-        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
-        sandClientMode: deps.config.sandClientMode === true,
-        sandClientHookPatched: isSandClientHookPatched(),
-        gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey),
-        routingStrategy: routing.strategy,
-        sessionAffinity: routing.sessionAffinity,
-        sessionAffinityTtlMs: routing.sessionAffinityTtlMs,
-        systemPromptMode: deps.config.systemPromptMode,
-        systemPromptSet: Boolean(deps.config.systemPrompt?.trim()),
         proxy: proxyStatus({ useHttp1ForAgent: cursorSdkUseHttp1ForAgent })
-      },
+      }),
       keys: {
         total: keys.length,
         active: keys.filter((key) => key.status === "active").length,
@@ -323,6 +373,136 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       touched = true;
     }
 
+    if (body.cursorSdkSessionMode !== undefined) {
+      const mode = parseSessionModeBody(body.cursorSdkSessionMode);
+      deps.config.cursorSdkSessionMode = mode;
+      deps.config.cursorSdkDisableSessionResume = false;
+      await saveCursorSdkSessionMode(deps.store, mode);
+      touched = true;
+    }
+
+    if (body.allowDirectCursorKeys !== undefined) {
+      if (typeof body.allowDirectCursorKeys !== "boolean") {
+        throw new ApiError("allowDirectCursorKeys must be a boolean.", 400, "invalid_request_error", "allowDirectCursorKeys");
+      }
+      deps.config.allowDirectCursorKeys = body.allowDirectCursorKeys;
+      await saveAllowDirectCursorKeys(deps.store, body.allowDirectCursorKeys);
+      touched = true;
+    }
+
+    if (body.cursorAllowBuiltinTools !== undefined) {
+      if (typeof body.cursorAllowBuiltinTools !== "boolean") {
+        throw new ApiError("cursorAllowBuiltinTools must be a boolean.", 400, "invalid_request_error", "cursorAllowBuiltinTools");
+      }
+      deps.config.cursorAllowBuiltinTools = body.cursorAllowBuiltinTools;
+      await saveCursorAllowBuiltinTools(deps.store, body.cursorAllowBuiltinTools);
+      touched = true;
+    }
+
+    if (body.requestTimeoutMs !== undefined) {
+      const value = parseBoundedInt(body.requestTimeoutMs, "requestTimeoutMs", RUNTIME_SETTING_BOUNDS.requestTimeoutMs);
+      deps.config.requestTimeoutMs = value;
+      await saveRequestTimeoutMs(deps.store, value);
+      touched = true;
+    }
+
+    if (body.requestLogKeep !== undefined) {
+      const value = parseBoundedInt(body.requestLogKeep, "requestLogKeep", RUNTIME_SETTING_BOUNDS.requestLogKeep);
+      deps.config.requestLogKeep = value;
+      await saveRequestLogKeep(deps.store, value);
+      deps.runtime?.setRequestLogKeep?.(value);
+      touched = true;
+    }
+
+    if (body.cursorSdkToolHoldTtlMs !== undefined || body.cursorSdkSessionIdleTtlMs !== undefined || body.cursorSdkMaxLiveSessions !== undefined) {
+      const hold = body.cursorSdkToolHoldTtlMs !== undefined
+        ? parseBoundedInt(body.cursorSdkToolHoldTtlMs, "cursorSdkToolHoldTtlMs", RUNTIME_SETTING_BOUNDS.toolHoldTtlMs)
+        : deps.config.cursorSdkToolHoldTtlMs;
+      const idle = body.cursorSdkSessionIdleTtlMs !== undefined
+        ? parseBoundedInt(body.cursorSdkSessionIdleTtlMs, "cursorSdkSessionIdleTtlMs", RUNTIME_SETTING_BOUNDS.idleTtlMs)
+        : deps.config.cursorSdkSessionIdleTtlMs;
+      const maxLive = body.cursorSdkMaxLiveSessions !== undefined
+        ? parseBoundedInt(body.cursorSdkMaxLiveSessions, "cursorSdkMaxLiveSessions", RUNTIME_SETTING_BOUNDS.maxLiveSessions)
+        : deps.config.cursorSdkMaxLiveSessions;
+      if (body.cursorSdkToolHoldTtlMs !== undefined) {
+        deps.config.cursorSdkToolHoldTtlMs = hold;
+        await saveCursorSdkToolHoldTtlMs(deps.store, hold);
+      }
+      if (body.cursorSdkSessionIdleTtlMs !== undefined) {
+        deps.config.cursorSdkSessionIdleTtlMs = idle;
+        await saveCursorSdkSessionIdleTtlMs(deps.store, idle);
+      }
+      if (body.cursorSdkMaxLiveSessions !== undefined) {
+        deps.config.cursorSdkMaxLiveSessions = maxLive;
+        await saveCursorSdkMaxLiveSessions(deps.store, maxLive);
+      }
+      deps.runtime?.configureSessionHub?.({ holdTtlMs: hold, idleTtlMs: idle, maxLiveSessions: maxLive });
+      touched = true;
+    }
+
+    if (body.maxKeyAttempts !== undefined) {
+      const value = parseBoundedInt(body.maxKeyAttempts, "maxKeyAttempts", RUNTIME_SETTING_BOUNDS.maxKeyAttempts);
+      deps.config.maxKeyAttempts = value;
+      await saveMaxKeyAttempts(deps.store, value);
+      touched = true;
+    }
+
+    if (body.maxTransientAttempts !== undefined) {
+      const value = parseBoundedInt(body.maxTransientAttempts, "maxTransientAttempts", RUNTIME_SETTING_BOUNDS.maxTransientAttempts);
+      deps.config.maxTransientAttempts = value;
+      await saveMaxTransientAttempts(deps.store, value);
+      touched = true;
+    }
+
+    if (body.cursorReasoningEffort !== undefined) {
+      if (typeof body.cursorReasoningEffort !== "string") {
+        throw new ApiError("cursorReasoningEffort must be a string.", 400, "invalid_request_error", "cursorReasoningEffort");
+      }
+      const effort = parseReasoningEffort(body.cursorReasoningEffort);
+      if (body.cursorReasoningEffort.trim() && !effort) {
+        throw new ApiError(
+          `cursorReasoningEffort must be one of: ${REASONING_EFFORT_VALUES.join(", ")}.`,
+          400,
+          "invalid_request_error",
+          "cursorReasoningEffort"
+        );
+      }
+      deps.config.cursorReasoningEffort = effort;
+      await saveCursorReasoningEffort(deps.store, effort);
+      touched = true;
+    }
+
+    if (body.cursorAgentMode !== undefined) {
+      const mode = parseOptionalAgentMode(body.cursorAgentMode);
+      deps.config.cursorAgentMode = mode;
+      await saveCursorAgentMode(deps.store, mode);
+      touched = true;
+    }
+
+    if (body.cursorModelParams !== undefined) {
+      if (typeof body.cursorModelParams !== "string") {
+        throw new ApiError("cursorModelParams must be a string.", 400, "invalid_request_error", "cursorModelParams");
+      }
+      const trimmed = body.cursorModelParams.trim();
+      if (!trimmed) {
+        deps.config.cursorModelParams = undefined;
+        await saveCursorModelParams(deps.store, "");
+      } else {
+        const parsed = parseModelParamsSpec(trimmed);
+        if (!parsed) {
+          throw new ApiError(
+            "cursorModelParams must be id=value pairs or a JSON array.",
+            400,
+            "invalid_request_error",
+            "cursorModelParams"
+          );
+        }
+        deps.config.cursorModelParams = parsed;
+        await saveCursorModelParams(deps.store, trimmed);
+      }
+      touched = true;
+    }
+
     if (!touched) throw new ApiError("No settings provided.", 400, "invalid_request_error");
 
     // HTTP/2 不支持代理：HTTP/1.1 开关一变，模型流量是否真走代理必须按新值重算告警。
@@ -330,9 +510,6 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const proxy = http1Toggled && deps.config.proxyUrl
       ? applyProxyConfig(deps.config.proxyUrl, { useHttp1ForAgent: http1 })
       : proxyStatus({ useHttp1ForAgent: http1 });
-    const routing = deps.keyPool.routingPolicy;
-    // 回显来源而不只是布尔值：后台的三态控件靠它决定该停在「未设置」还是「强制开/关」，
-    // 回一个布尔就等于逼前端把状态压平，正是这个开关被悄悄写死的起点。
     const http1Source = (await loadCursorSdkUseHttp1ForAgent(deps.store, {
       proxyConfigured: Boolean(deps.config.proxyUrl)
     })).source;
@@ -342,20 +519,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       ...(http1AutoEnabled ? { http1AutoEnabled: true, notice: HTTP1_AUTO_ENABLED_NOTICE } : {}),
       ...(executorResetWarning ? { executorResetWarning } : {}),
       config: {
-        cursorSdkUseHttp1ForAgent: deps.config.cursorSdkUseHttp1ForAgent,
-        cursorSdkUseHttp1Source: http1Source,
-        cursorMaxMode: deps.config.cursorMaxMode === true,
-        cursorFast: deps.config.cursorFast === true,
-        autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
-        autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
-        sandClientMode: deps.config.sandClientMode === true,
-        sandClientHookPatched: isSandClientHookPatched(),
-        routingStrategy: routing.strategy,
-        sessionAffinity: routing.sessionAffinity,
-        sessionAffinityTtlMs: routing.sessionAffinityTtlMs,
-        systemPromptMode: deps.config.systemPromptMode,
+        ...publicRuntimeConfig(deps, {
+          cursorSdkUseHttp1ForAgent: deps.config.cursorSdkUseHttp1ForAgent,
+          cursorSdkUseHttp1Source: http1Source,
+          proxy
+        }),
         systemPrompt: deps.config.systemPrompt ?? "",
-        proxy,
         warnings: proxy.warnings
       }
     };
@@ -1161,6 +1330,48 @@ function parseWeight(value: unknown): number {
     );
   }
   return weight;
+}
+
+function parseSessionModeBody(value: unknown): CursorSdkSessionMode {
+  if (value === "durable" || value === "stateless") return value;
+  throw new ApiError(
+    "cursorSdkSessionMode must be durable or stateless.",
+    400,
+    "invalid_request_error",
+    "cursorSdkSessionMode"
+  );
+}
+
+function parseOptionalAgentMode(value: unknown): AgentMode | undefined {
+  if (typeof value !== "string") {
+    throw new ApiError("cursorAgentMode must be a string.", 400, "invalid_request_error", "cursorAgentMode");
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (trimmed === "agent" || trimmed === "plan") return trimmed;
+  throw new ApiError(
+    "cursorAgentMode must be agent, plan, or empty.",
+    400,
+    "invalid_request_error",
+    "cursorAgentMode"
+  );
+}
+
+function parseBoundedInt(
+  value: unknown,
+  field: string,
+  bounds: { min: number; max: number }
+): number {
+  const parsed = typeof value === "number" ? value : Number.NaN;
+  if (!Number.isInteger(parsed) || parsed < bounds.min || parsed > bounds.max) {
+    throw new ApiError(
+      `${field} must be an integer between ${bounds.min} and ${bounds.max}.`,
+      400,
+      "invalid_request_error",
+      field
+    );
+  }
+  return parsed;
 }
 
 function parseRoutingStrategy(value: unknown): RoutingStrategy {

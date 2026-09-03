@@ -15,13 +15,13 @@ export interface GatewayConfig {
   sdkClientVersion: string;
   /**
    * Kill switch：为 true 时强制 `cursorSdkSessionMode=stateless`（每请求 create+全文+假成功+cancel+dispose）。
-   * 默认 false；设 `CURSOR_SDK_DISABLE_SESSION_RESUME=true` 后须重启才会生效（无热切换）。
+   * 默认 false。后台「运行设置」保存过会话模式后，以库里的值为准，不再看这个 env。
    * env: CURSOR_SDK_DISABLE_SESSION_RESUME。
    */
   cursorSdkDisableSessionResume: boolean;
   /**
-   * Agent 会话模式。未设置时默认 durable。kill switch 为 true 时强制 stateless，忽略本字段的 env 值。
-   * 显式 `stateless` 仍有效。改 mode 只能改 env 后重启。
+   * Agent 会话模式。未设置时默认 durable。kill switch 为 true 且后台未保存过 mode 时强制 stateless。
+   * 后台「运行设置」可改，落库后立即作用于后续请求（进程内始终建着 Hub，只是 stateless 不用它）。
    * env: CURSOR_SDK_SESSION_MODE。
    */
   cursorSdkSessionMode: CursorSdkSessionMode;

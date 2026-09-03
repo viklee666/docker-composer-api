@@ -75,9 +75,9 @@ export class CursorSdkRunner implements CursorRunner {
       defaultWorkingDirectory: string;
       sdkClientVersion: string;
       /** 为 API 网关默认使用“每次请求 fresh agent”，避免远端 agent 会话长期累积/污染后所有请求持续 502。 */
-      disableSessionResume?: boolean;
+      disableSessionResume?: boolean | (() => boolean);
       /** 允许 agent 在网关容器内使用内置工具（默认 false：SDK >=1.0.27 下用 tools 限制为纯文本/仅 MCP）。 */
-      allowBuiltinTools?: boolean;
+      allowBuiltinTools?: boolean | (() => boolean);
       /**
        * 注入给每个 agent 的共享 LocalAgentStore。SDK 默认的 SqliteLocalAgentStore 按 agent 各开一份，
        * 每次请求泄漏约 7~8 个内核句柄且 dispose 不回收；stateless 模式下传入网关的有界内存 store 规避。
@@ -1376,7 +1376,7 @@ export class CursorSdkRunner implements CursorRunner {
       // SDK >=1.0.27 的内置工具限制：无客户端工具 → []（纯文本，agent 不能动网关容器的文件/命令）；
       // 有客户端工具 → 只留 "mcp" 元工具通道（send 时注入的 customTools 经 custom-user-tools MCP server 暴露）。
       // 这从根上阻止 agent 在网关侧真实执行 shell/edit 后又把调用转发给客户端造成双重执行。
-      ...(this.input.allowBuiltinTools ? {} : { tools: input.tools.length ? ["mcp"] : [] }),
+      ...(liveFlag(this.input.allowBuiltinTools) ? {} : { tools: input.tools.length ? ["mcp"] : [] }),
       ...(resolved.mode ? { mode: resolved.mode } : {})
     };
   }
@@ -1387,8 +1387,12 @@ export class CursorSdkRunner implements CursorRunner {
 
   /** 进程级 kill switch、单请求 forceStateless、或未注入 Hub：跳过 Hub 与旧 resume 的 get/save。 */
   private isStateless(input: CursorRunRequest): boolean {
-    return Boolean(this.input.disableSessionResume || input.forceStateless || !this.input.sessionHub);
+    return Boolean(liveFlag(this.input.disableSessionResume) || input.forceStateless || !this.input.sessionHub);
   }
+}
+
+function liveFlag(value: boolean | (() => boolean) | undefined): boolean {
+  return typeof value === "function" ? value() : Boolean(value);
 }
 
 /** 相同 key 的日志 10 分钟内只打一次，避免高流量刷屏。 */

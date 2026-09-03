@@ -10,6 +10,7 @@ import {
   selectProvider
 } from "./cursor-connect/router.js";
 import type { CursorConnectService } from "./cursor-connect/service.js";
+import { shouldUseDurableHub } from "./config.js";
 import { durableIdentity, explicitSessionIdFromHeaders } from "./durable-id.js";
 import {
   recordDurableCache,
@@ -120,6 +121,14 @@ export interface AppDeps {
   connect?: CursorConnectService;
   /** SDK 网络配置应用器，测试时可注入桩以避免加载真实 SDK。 */
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
+  /**
+   * 后台改 TTL / 日志保留条数时落到 Hub 与 sqlite 裁剪器。
+   * 测试可不提供：那些字段只改 config 也能从 overview 回显。
+   */
+  runtime?: {
+    setRequestLogKeep?: (value: number) => void;
+    configureSessionHub?: (patch: { holdTtlMs?: number; idleTtlMs?: number; maxLiveSessions?: number }) => void;
+  };
 }
 
 /**
@@ -206,7 +215,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
       storage: "sqlite",
       gitCommit: process.env.GIT_SHA ?? "unknown",
       builtAt: process.env.BUILT_AT ?? "unknown",
-      sessionMode: deps.config.cursorSdkDisableSessionResume ? "stateless" : deps.config.cursorSdkSessionMode,
+      sessionMode: shouldUseDurableHub(deps.config) ? "durable" : "stateless",
       uptimeSeconds: Math.floor((Date.now() - (deps.startedAt ?? Date.now())) / 1000),
       durable: {
         hitRatio: durable.cache.hitRatio,
