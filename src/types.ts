@@ -56,10 +56,16 @@ export interface GatewayConfig {
   autoDisableThreshold: number;
   /** 客户端未显式指定时的默认思考强度/推理强度（env: CURSOR_REASONING_EFFORT），如 low/medium/high/max。 */
   cursorReasoningEffort?: string;
-  /** 客户端未显式指定时是否默认开启 Max Mode / 大上下文（env: CURSOR_MAX_MODE）。 */
-  cursorMaxMode?: boolean;
-  /** 客户端未显式指定时是否默认使用 fast 变体（env: CURSOR_FAST）。 */
-  cursorFast?: boolean;
+  /**
+   * Max Mode / 大上下文的三态网关策略（客户端未表态时如何处置）。env: CURSOR_MAX_MODE / CURSOR_MAX_MODE_MODELS。
+   * passthrough 下发显式 false（最小 context）——Claude / GPT 目录默认档常为 1M，省略参数仍按 1M 计费。
+   */
+  cursorMaxModePolicy?: ModelParamPolicy;
+  /**
+   * Fast 变体的三态网关策略。env: CURSOR_FAST / CURSOR_FAST_MODELS。
+   * passthrough 下发显式 false——Composer / Grok 的上游默认档就是 Fast，省略参数等于开 Fast。
+   */
+  cursorFastPolicy?: ModelParamPolicy;
   /** 透传给所有请求的默认 Cursor model.params（env: CURSOR_MODEL_PARAMS，`id=value,id2=value2` 或 JSON）。 */
   cursorModelParams?: ModelParameterValue[];
   /** 默认 Cursor 会话模式 agent/plan（env: CURSOR_AGENT_MODE）。 */
@@ -134,6 +140,23 @@ export type SystemPromptMode = "off" | "append" | "override";
 export interface SystemPromptSettings {
   mode: SystemPromptMode;
   text?: string;
+}
+
+/**
+ * Fast / Max Mode 这类模型参数维度的三态策略档位：
+ * - passthrough：客户端未表态时网关下发显式 false（透传 = 不加速 / 最小上下文）；
+ * - force-all：对全部支持的模型下发 true；
+ * - force-selected：名单内的模型下发 true，其余同 passthrough。
+ * 「支持」指该模型目录 parameters / variants（或家族兜底）里有对应参数；
+ * 不支持的模型由 resolveModelParams dropped，与强制 Max Mode 打到 Composer 上是同一现行为。
+ */
+export type ModelParamPolicyMode = "passthrough" | "force-all" | "force-selected";
+
+/** 单个模型参数维度（Fast / Max Mode）的网关策略。 */
+export interface ModelParamPolicy {
+  mode: ModelParamPolicyMode;
+  /** 仅 force-selected 有意义；其它档保留名单，切回该档时勾选不丢。 */
+  models: string[];
 }
 
 /**

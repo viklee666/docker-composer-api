@@ -376,7 +376,14 @@ export function resolveModelParams(
   }
 
   const defaultVariant = catalog?.variants?.find((variant) => variant.isDefault);
-  for (const param of defaultVariant?.params ?? []) result.set(param.id, param.value);
+  for (const param of defaultVariant?.params ?? []) {
+    // 客户端/网关没表态的维不拷默认档：Composer 默认档 fast=true、Claude/GPT 默认档常是
+    // context=1m，原样拷会把「没表态」变成「按上游默认档 Fast / 1M 计费」。
+    // thinking / effort / 其它参数照旧拷，避免「只发部分参数掉到第一允许值」。
+    if (intent.fast === undefined && /fast/i.test(param.id)) continue;
+    if (intent.maxMode === undefined && MAX_MODE_PARAM.test(param.id)) continue;
+    result.set(param.id, param.value);
+  }
 
   if (intent.reasoningEffort !== undefined && !applyReasoning(result, defs, intent.reasoningEffort)) {
     dropped.push(`reasoningEffort=${intent.reasoningEffort}`);

@@ -10,6 +10,7 @@ import type { CcCredential } from "./cursor-connect/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { GatewayKeyPool } from "./gateway-key-pool.js";
 import { shouldUseDurableHub } from "./config.js";
+import { isModelParamPolicyMode, policyIntent } from "./model-param-policy.js";
 import { parseModelParamsSpec, formatModelParamsSpec } from "./model-params.js";
 import {
   parseReasoningEffort,
@@ -20,8 +21,8 @@ import {
   saveAutoDisableThreshold,
   saveCursorAgentMode,
   saveCursorAllowBuiltinTools,
-  saveCursorFastDefault,
-  saveCursorMaxModeDefault,
+  saveCursorFastPolicy,
+  saveCursorMaxModePolicy,
   saveCursorModelParams,
   saveCursorReasoningEffort,
   saveCursorSdkMaxLiveSessions,
@@ -62,6 +63,8 @@ import type {
   GatewayKeyPatch,
   GatewayKeyRecord,
   KeyUsageRef,
+  ModelParamPolicy,
+  ModelParameterDefinition,
   RequestLogQuery,
   RoutingStrategy,
   SystemPromptMode
@@ -119,8 +122,10 @@ function publicRuntimeConfig(
     cursorModelParams: formatModelParamsSpec(deps.config.cursorModelParams),
     cursorSdkUseHttp1ForAgent: extras.cursorSdkUseHttp1ForAgent,
     cursorSdkUseHttp1Source: extras.cursorSdkUseHttp1Source,
-    cursorMaxMode: deps.config.cursorMaxMode === true,
-    cursorFast: deps.config.cursorFast === true,
+    cursorFastPolicy: deps.config.cursorFastPolicy?.mode ?? "passthrough",
+    cursorFastModels: deps.config.cursorFastPolicy?.models ?? [],
+    cursorMaxModePolicy: deps.config.cursorMaxModePolicy?.mode ?? "passthrough",
+    cursorMaxModeModels: deps.config.cursorMaxModePolicy?.models ?? [],
     autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
     autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
     sandClientMode: deps.config.sandClientMode === true,
@@ -246,22 +251,31 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       touched = true;
     }
 
-    // Max Mode / Fast 默认开关：开启→网关对支持的模型强制默认；关闭→网关不强加默认（交回客户端/模型）。
-    if (body.cursorMaxMode !== undefined) {
-      if (typeof body.cursorMaxMode !== "boolean") {
-        throw new ApiError("cursorMaxMode must be a boolean.", 400, "invalid_request_error", "cursorMaxMode");
-      }
-      deps.config.cursorMaxMode = body.cursorMaxMode ? true : undefined;
-      await saveCursorMaxModeDefault(deps.store, body.cursorMaxMode);
+    // Fast / Max Mode 三态策略：passthrough = 客户端未表态时下发显式 false（透传不是「不管」，
+    // Composer/Grok 上游默认档就是 Fast，省略参数只会按 Fast 计费）。
+    const fastPolicy = parseModelParamPolicySetting(
+      body,
+      "cursorFastPolicy",
+      "cursorFastModels",
+      "cursorFast",
+      deps.config.cursorFastPolicy
+    );
+    if (fastPolicy) {
+      deps.config.cursorFastPolicy = fastPolicy;
+      await saveCursorFastPolicy(deps.store, fastPolicy);
       touched = true;
     }
 
-    if (body.cursorFast !== undefined) {
-      if (typeof body.cursorFast !== "boolean") {
-        throw new ApiError("cursorFast must be a boolean.", 400, "invalid_request_error", "cursorFast");
-      }
-      deps.config.cursorFast = body.cursorFast ? true : undefined;
-      await saveCursorFastDefault(deps.store, body.cursorFast);
+    const maxModePolicy = parseModelParamPolicySetting(
+      body,
+      "cursorMaxModePolicy",
+      "cursorMaxModeModels",
+      "cursorMaxMode",
+      deps.config.cursorMaxModePolicy
+    );
+    if (maxModePolicy) {
+      deps.config.cursorMaxModePolicy = maxModePolicy;
+      await saveCursorMaxModePolicy(deps.store, maxModePolicy);
       touched = true;
     }
 
@@ -992,6 +1006,10 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
         "keyId"
       );
     }
+    // 联通性测试也带上按测试模型解析出的策略意图（fast/Max Mode 等），
+    // 否则仪表盘里这些测试请求永远显示非 fast，误导排查。
+    const testMaxMode = policyIntent(deps.config.cursorMaxModePolicy, route.model);
+    const testFast = policyIntent(deps.config.cursorFastPolicy, route.model);
     // 每次测试用唯一 sessionKey，并强制本请求 stateless：不得进 Hub / 旧 resume，避免粘到用户会话或坏 agent。
     const run: CursorRunRequest = {
       protocol: "openai-chat",
@@ -1005,10 +1023,9 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       workingDirectory: deps.config.cursorWorkingDirectory,
       images: [],
       tools: [],
-      // 联通性测试也带上网关默认意图（fast/Max Mode 等），否则仪表盘里这些测试请求永远显示非 fast，误导排查。
       reasoningEffort: deps.config.cursorReasoningEffort,
-      maxMode: deps.config.cursorMaxMode,
-      fast: deps.config.cursorFast,
+      maxMode: testMaxMode,
+      fast: testFast,
       modelParams: deps.config.cursorModelParams,
       mode: deps.config.cursorAgentMode,
       provider: route.provider
@@ -1156,11 +1173,12 @@ function requireGatewayKeyPool(deps: AppDeps): GatewayKeyPool {
   return deps.gatewayKeyPool;
 }
 
-/** 后台模型选择器的一条：只要 id / 名称 / 别名，参数定义与 variants 对勾选没用。 */
+/** 后台模型选择器的一条。parameters 供「支持 Fast / 支持 context」的列表过滤（force-selected 档）。 */
 interface CatalogueEntry {
   id: string;
   name: string;
   aliases: string[];
+  parameters?: ModelParameterDefinition[];
 }
 
 /**
@@ -1212,12 +1230,23 @@ function mergeCatalogueEntry(merged: Map<string, CatalogueEntry>, model: Catalog
   if (!id) return;
   const existing = merged.get(id.toLowerCase());
   if (!existing) {
-    merged.set(id.toLowerCase(), { id, name: model.name || id, aliases: [...new Set(model.aliases ?? [])] });
+    merged.set(id.toLowerCase(), {
+      id,
+      name: model.name || id,
+      aliases: [...new Set(model.aliases ?? [])],
+      ...(model.parameters?.length ? { parameters: model.parameters.map((def) => ({ ...def })) } : {})
+    });
     return;
   }
   for (const alias of model.aliases ?? []) {
     if (alias && !existing.aliases.includes(alias)) existing.aliases.push(alias);
   }
+  // parameters 按 id 去重并集：不同账号目录的参数定义可能有先后，勾选过滤只需要「有没有这个参数」。
+  const byId = new Map((existing.parameters ?? []).map((def) => [def.id.toLowerCase(), def]));
+  for (const def of model.parameters ?? []) {
+    if (!byId.has(def.id.toLowerCase())) byId.set(def.id.toLowerCase(), def);
+  }
+  if (byId.size) existing.parameters = [...byId.values()];
 }
 
 function publicKey(record: CursorKeyRecord): Record<string, unknown> {
@@ -1382,6 +1411,54 @@ function parseRoutingStrategy(value: unknown): RoutingStrategy {
     "invalid_request_error",
     "routingStrategy"
   );
+}
+
+/**
+ * Fast / Max Mode 三态策略字段（{policy, models}）的解析。
+ * 兼容旧版布尔 payload 一个版本（true → force-all / false → passthrough），减少半截前端的 400。
+ * 只给 models 不给 policy 时保留当前档位，避免一次部分保存把 force-all 悄悄洗成 passthrough。
+ * `force-selected` 允许空名单（≡ 透传），不要 400。
+ */
+function parseModelParamPolicySetting(
+  body: Record<string, unknown>,
+  policyField: string,
+  modelsField: string,
+  legacyField: string,
+  current: ModelParamPolicy | undefined
+): ModelParamPolicy | undefined {
+  if (body[policyField] !== undefined || body[modelsField] !== undefined) {
+    const mode = body[policyField];
+    if (mode !== undefined && !isModelParamPolicyMode(mode)) {
+      throw new ApiError(
+        `${policyField} must be passthrough, force-all, or force-selected.`,
+        400,
+        "invalid_request_error",
+        policyField
+      );
+    }
+    const models = body[modelsField];
+    if (models !== undefined && !Array.isArray(models)) {
+      throw new ApiError(
+        `${modelsField} must be an array of model ids.`,
+        400,
+        "invalid_request_error",
+        modelsField
+      );
+    }
+    return {
+      mode: mode ?? current?.mode ?? "passthrough",
+      // 对称保护：只给 models 保留当前档位，只给 policy 也保留当前名单——
+      // 否则脚本 POST {cursorFastPolicy:"force-selected"} 会把已保存的名单洗成空。
+      models: models !== undefined ? normalizeModelList(models) : (current?.models ?? [])
+    };
+  }
+  if (body[legacyField] !== undefined) {
+    if (typeof body[legacyField] !== "boolean") {
+      throw new ApiError(`${legacyField} must be a boolean.`, 400, "invalid_request_error", legacyField);
+    }
+    return { mode: body[legacyField] ? "force-all" : "passthrough", models: current?.models ?? [] };
+  }
+  return undefined;
 }
 
 function parseSystemPromptMode(value: unknown): SystemPromptMode {

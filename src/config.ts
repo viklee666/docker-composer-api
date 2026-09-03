@@ -1,6 +1,7 @@
 import { DEFAULT_CONNECT_BASE_URL } from "./cursor-connect/client.js";
 import { DEFAULT_READ_MAX_BYTES } from "./cursor-connect/envelope.js";
 import { DEFAULT_AUTO_DISABLE_THRESHOLD } from "./key-pool.js";
+import { parseModelParamPolicyEnv } from "./model-param-policy.js";
 import { parseModelParamsSpec } from "./model-params.js";
 import { DEFAULT_REQUEST_LOG_KEEP } from "./store.js";
 import type {
@@ -50,8 +51,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     autoDisableKeys: booleanValue(env.AUTO_DISABLE_KEYS, true),
     autoDisableThreshold: integerValue(env.AUTO_DISABLE_THRESHOLD, DEFAULT_AUTO_DISABLE_THRESHOLD),
     cursorReasoningEffort: optionalString(env.CURSOR_REASONING_EFFORT),
-    cursorMaxMode: optionalBoolean(env.CURSOR_MAX_MODE),
-    cursorFast: optionalBoolean(env.CURSOR_FAST),
+    cursorMaxModePolicy: parseModelParamPolicyEnv(env.CURSOR_MAX_MODE, env.CURSOR_MAX_MODE_MODELS),
+    cursorFastPolicy: parseModelParamPolicyEnv(env.CURSOR_FAST, env.CURSOR_FAST_MODELS),
     cursorModelParams: parseModelParamsSpec(env.CURSOR_MODEL_PARAMS),
     cursorAgentMode: optionalAgentMode(env.CURSOR_AGENT_MODE),
     sandClientMode: booleanValue(env.SAND_CLIENT_MODE, false),

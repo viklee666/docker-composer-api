@@ -1,7 +1,9 @@
+import { isModelParamPolicyMode } from "./model-param-policy.js";
 import { parseModelParamsSpec } from "./model-params.js";
 import type {
   AgentMode,
   CursorSdkSessionMode,
+  ModelParamPolicy,
   ModelParameterValue,
   RoutingStrategy,
   StateStore,
@@ -9,6 +11,11 @@ import type {
   SystemPromptSettings
 } from "./types.js";
 
+const MAX_MODE_POLICY_SETTING = "cursorMaxModePolicy";
+const MAX_MODE_MODELS_SETTING = "cursorMaxModeModels";
+const FAST_POLICY_SETTING = "cursorFastPolicy";
+const FAST_MODELS_SETTING = "cursorFastModels";
+// 旧二态键只作迁移来源与兼容投影，不再承载新语义（checkbox 存布尔会毁掉第三态）。
 const MAX_MODE_DEFAULT_SETTING = "cursorMaxModeDefault";
 const FAST_DEFAULT_SETTING = "cursorFastDefault";
 const AUTO_DISABLE_KEYS_SETTING = "autoDisableKeys";
@@ -46,36 +53,81 @@ export const RUNTIME_SETTING_BOUNDS = {
 
 export const REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 
-/**
- * 读取管理后台持久化的“默认开启”状态：
- * - on  → true（网关对支持的模型强制默认开启）
- * - off → undefined（网关不强加默认，交回客户端/模型决定）
- * - 未设置 → 回退到 env 默认值（fallback）
- */
-async function loadDefault(store: StateStore, key: string, fallback: boolean | undefined): Promise<boolean | undefined> {
-  const stored = await store.getSetting(key);
-  if (stored === undefined) return fallback;
-  return stored === "on" ? true : undefined;
-}
-
 async function saveDefault(store: StateStore, key: string, enabled: boolean): Promise<void> {
   await store.setSetting(key, enabled ? "on" : "off");
 }
 
-export function loadCursorMaxModeDefault(store: StateStore, fallback: boolean | undefined): Promise<boolean | undefined> {
-  return loadDefault(store, MAX_MODE_DEFAULT_SETTING, fallback);
+/**
+ * 三态策略的启动加载，读取顺序：
+ * 1. 新键存在且合法 → 用它（名单一并读；非法档位按 passthrough 落，不回退 env）；
+ * 2. 旧二态键 → `on` 升级为 force-all（今天勾上的行为），`off` 升级为 passthrough；
+ * 3. 都没有 → env（loadConfig 已解析好的 fallback）。
+ */
+async function loadModelParamPolicy(
+  store: StateStore,
+  policyKey: string,
+  modelsKey: string,
+  legacyKey: string,
+  fallback: ModelParamPolicy
+): Promise<ModelParamPolicy> {
+  const stored = await store.getSetting(policyKey);
+  if (stored !== undefined) {
+    return {
+      mode: isModelParamPolicyMode(stored) ? stored : "passthrough",
+      models: await loadPolicyModels(store, modelsKey)
+    };
+  }
+  const legacy = await store.getSetting(legacyKey);
+  if (legacy === "on") return { mode: "force-all", models: [] };
+  if (legacy === "off") return { mode: "passthrough", models: [] };
+  return fallback;
 }
 
-export function saveCursorMaxModeDefault(store: StateStore, enabled: boolean): Promise<void> {
-  return saveDefault(store, MAX_MODE_DEFAULT_SETTING, enabled);
+/** 名单存 JSON 数组；非法 JSON / 非数组一律当空名单，不让一条坏数据把请求路径打挂。 */
+async function loadPolicyModels(store: StateStore, key: string): Promise<string[]> {
+  const stored = await store.getSetting(key);
+  if (stored === undefined) return [];
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && id.trim() !== "") : [];
+  } catch {
+    return [];
+  }
 }
 
-export function loadCursorFastDefault(store: StateStore, fallback: boolean | undefined): Promise<boolean | undefined> {
-  return loadDefault(store, FAST_DEFAULT_SETTING, fallback);
+async function saveModelParamPolicy(
+  store: StateStore,
+  policyKey: string,
+  modelsKey: string,
+  legacyKey: string,
+  policy: ModelParamPolicy
+): Promise<void> {
+  await store.setSetting(policyKey, policy.mode);
+  await store.setSetting(modelsKey, JSON.stringify(policy.models));
+  // 兼容投影：回滚到旧二进制时至少保留「强制开 / 不强制」的信息，不至于全空白。
+  await store.setSetting(legacyKey, policy.mode === "force-all" ? "on" : "off");
 }
 
-export function saveCursorFastDefault(store: StateStore, enabled: boolean): Promise<void> {
-  return saveDefault(store, FAST_DEFAULT_SETTING, enabled);
+export function loadCursorMaxModePolicy(
+  store: StateStore,
+  fallback: ModelParamPolicy
+): Promise<ModelParamPolicy> {
+  return loadModelParamPolicy(store, MAX_MODE_POLICY_SETTING, MAX_MODE_MODELS_SETTING, MAX_MODE_DEFAULT_SETTING, fallback);
+}
+
+export function saveCursorMaxModePolicy(store: StateStore, policy: ModelParamPolicy): Promise<void> {
+  return saveModelParamPolicy(store, MAX_MODE_POLICY_SETTING, MAX_MODE_MODELS_SETTING, MAX_MODE_DEFAULT_SETTING, policy);
+}
+
+export function loadCursorFastPolicy(
+  store: StateStore,
+  fallback: ModelParamPolicy
+): Promise<ModelParamPolicy> {
+  return loadModelParamPolicy(store, FAST_POLICY_SETTING, FAST_MODELS_SETTING, FAST_DEFAULT_SETTING, fallback);
+}
+
+export function saveCursorFastPolicy(store: StateStore, policy: ModelParamPolicy): Promise<void> {
+  return saveModelParamPolicy(store, FAST_POLICY_SETTING, FAST_MODELS_SETTING, FAST_DEFAULT_SETTING, policy);
 }
 
 /** 自动禁用开关：与 Max Mode 不同，off 是明确的"永不自动禁用"，不是"交回默认"。 */

@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 import { AGENT_STORE_FILENAME, createSqliteAgentStore } from "./agent-store.js";
 import { loadConfig, shouldUseDurableHub } from "./config.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
+import { DEFAULT_MODEL_PARAM_POLICY } from "./model-param-policy.js";
 import { SessionHub } from "./session-hub.js";
 import { ExecutorWarmPool, type WarmupPlatform } from "./executor-warmup.js";
 import {
@@ -10,8 +11,8 @@ import {
   loadAutoDisableThreshold,
   loadCursorAgentMode,
   loadCursorAllowBuiltinTools,
-  loadCursorFastDefault,
-  loadCursorMaxModeDefault,
+  loadCursorFastPolicy,
+  loadCursorMaxModePolicy,
   loadCursorModelParams,
   loadCursorReasoningEffort,
   loadCursorSdkMaxLiveSessions,
@@ -98,9 +99,15 @@ if (http1.source === "proxy") {
 if (config.cursorSdkUseHttp1ForAgent) {
   await applyCursorSdkNetworkConfig(true);
 }
-// 管理后台持久化的模型默认开关优先于 env 默认值。
-config.cursorMaxMode = await loadCursorMaxModeDefault(store, config.cursorMaxMode);
-config.cursorFast = await loadCursorFastDefault(store, config.cursorFast);
+// 管理后台持久化的模型参数策略优先于 env 默认值（含旧二态键的一次性迁移）。
+config.cursorMaxModePolicy = await loadCursorMaxModePolicy(
+  store,
+  config.cursorMaxModePolicy ?? DEFAULT_MODEL_PARAM_POLICY
+);
+config.cursorFastPolicy = await loadCursorFastPolicy(
+  store,
+  config.cursorFastPolicy ?? DEFAULT_MODEL_PARAM_POLICY
+);
 // 自动禁用策略同样以后台持久化设置优先，改完即时生效且重启后保留。
 config.autoDisableKeys = await loadAutoDisableKeys(store, config.autoDisableKeys);
 config.autoDisableThreshold = await loadAutoDisableThreshold(store, config.autoDisableThreshold);

@@ -9,8 +9,10 @@ import { anthropicError, anthropicErrorType, ApiError, newRequestId, openAiError
 import { CursorSdkRunner, toolCallsFromSdkEvent, upstreamRunError, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
 import { ExecutorWarmPool } from "../src/executor-warmup.js";
 import { GatewayKeyPool } from "../src/gateway-key-pool.js";
+import { loadCursorFastPolicy, loadCursorMaxModePolicy } from "../src/gateway-settings.js";
 import { CursorKeyPool, classifyKeyFailure, indicatesUpstreamAuthFailure, type AutoDisablePolicy } from "../src/key-pool.js";
 import { KeyRotatingRunner, type KeyRotatingOptions } from "../src/key-rotating-runner.js";
+import { parseModelParamPolicyEnv, policyIntent } from "../src/model-param-policy.js";
 import { parseModelSpec, resolveModelParams, type ModelCatalog } from "../src/model-params.js";
 import type { ModelLister } from "../src/models.js";
 import { parseToolMarkers } from "../src/protocol.js";
@@ -2286,28 +2288,129 @@ test("admin can add a key already pinned to Sand", async () => {
   assert.equal(stored?.clientType, "sand");
 });
 
-test("admin settings can toggle default Max Mode and Fast and they flow into requests", async () => {
-  const runner = new FakeRunner({ text: "ok" });
-  const { app, store } = await createTestApp({ runner });
+test("admin settings persist the three-state Fast / Max Mode policy and echo all four fields", async () => {
+  const { app, store } = await createTestApp({ runner: new FakeRunner({ text: "ok" }) });
   const adminHeaders = { authorization: "Bearer gateway-key" };
+
+  // 旧版布尔 payload 仍被接受一个版本：true → force-all，减少半截前端的 400。
+  const legacy = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorFast: true, cursorMaxMode: false }
+  });
+  assert.equal(legacy.statusCode, 200);
+  assert.equal(legacy.json().config.cursorFastPolicy, "force-all");
+  assert.equal(legacy.json().config.cursorMaxModePolicy, "passthrough");
 
   const saved = await app.inject({
     method: "POST",
     url: "/admin/api/settings",
     headers: adminHeaders,
-    payload: { cursorMaxMode: true, cursorFast: true }
+    payload: {
+      cursorFastPolicy: "force-selected",
+      cursorFastModels: ["composer-2.5", "grok-4.6"],
+      cursorMaxModePolicy: "force-all",
+      cursorMaxModeModels: []
+    }
   });
   assert.equal(saved.statusCode, 200);
-  assert.equal(saved.json().config.cursorMaxMode, true);
-  assert.equal(saved.json().config.cursorFast, true);
+  assert.equal(saved.json().config.cursorFastPolicy, "force-selected");
+  assert.deepEqual(saved.json().config.cursorFastModels, ["composer-2.5", "grok-4.6"]);
+  assert.equal(saved.json().config.cursorMaxModePolicy, "force-all");
+  assert.deepEqual(saved.json().config.cursorMaxModeModels, []);
+  assert.equal(await store.getSetting("cursorFastPolicy"), "force-selected");
+  assert.deepEqual(JSON.parse((await store.getSetting("cursorFastModels")) ?? "[]"), ["composer-2.5", "grok-4.6"]);
+  // 兼容投影：回滚到旧二进制时仍能读出「强制开 / 不强制」。
+  assert.equal(await store.getSetting("cursorFastDefault"), "off");
   assert.equal(await store.getSetting("cursorMaxModeDefault"), "on");
-  assert.equal(await store.getSetting("cursorFastDefault"), "on");
 
   const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
-  assert.equal(overview.json().config.cursorMaxMode, true);
-  assert.equal(overview.json().config.cursorFast, true);
+  assert.equal(overview.json().config.cursorFastPolicy, "force-selected");
+  assert.deepEqual(overview.json().config.cursorFastModels, ["composer-2.5", "grok-4.6"]);
+  assert.equal(overview.json().config.cursorMaxModePolicy, "force-all");
 
-  // 默认开关应流入实际请求（客户端未显式指定时）。
+  // 非法档位 400；force-selected 空名单允许保存（≡ 透传）。
+  const invalid = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorFastPolicy: "sometimes" }
+  });
+  assert.equal(invalid.statusCode, 400);
+  const emptyList = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorFastPolicy: "force-selected", cursorFastModels: [] }
+  });
+  assert.equal(emptyList.statusCode, 200);
+
+  // 对称保护：只发 policy 不发 models 时保留已保存名单（脚本/curl 部分保存不洗掉勾选）。
+  const policyOnly = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorMaxModePolicy: "force-selected" }
+  });
+  assert.equal(policyOnly.statusCode, 200);
+  assert.deepEqual(policyOnly.json().config.cursorMaxModeModels, [], "当前无名单时保持空");
+  const withList = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorMaxModePolicy: "force-selected", cursorMaxModeModels: ["claude-opus-4-8"] }
+  });
+  assert.deepEqual(withList.json().config.cursorMaxModeModels, ["claude-opus-4-8"]);
+  const keepList = await app.inject({
+    method: "POST",
+    url: "/admin/api/settings",
+    headers: adminHeaders,
+    payload: { cursorMaxModePolicy: "force-all" }
+  });
+  assert.equal(keepList.json().config.cursorMaxModePolicy, "force-all");
+  assert.deepEqual(keepList.json().config.cursorMaxModeModels, ["claude-opus-4-8"], "只换档位不动名单");
+});
+
+test("legacy cursorFastDefault / cursorMaxModeDefault settings migrate into the three-state policy", async () => {
+  const passthrough = { mode: "passthrough" as const, models: [] };
+
+  // 旧「勾上」→ force-all；旧「取消勾选」→ passthrough（不再是「不管」）。
+  const on = new MemoryStateStore();
+  await on.setSetting("cursorFastDefault", "on");
+  assert.deepEqual(await loadCursorFastPolicy(on, passthrough), { mode: "force-all", models: [] });
+
+  const off = new MemoryStateStore();
+  await off.setSetting("cursorMaxModeDefault", "off");
+  assert.deepEqual(await loadCursorMaxModePolicy(off, passthrough), { mode: "passthrough", models: [] });
+
+  // 都没表态 → env fallback（loadConfig 已解析）。
+  const fresh = new MemoryStateStore();
+  assert.deepEqual(await loadCursorFastPolicy(fresh, { mode: "force-all", models: [] }), { mode: "force-all", models: [] });
+
+  // 新键优先于旧键，名单随新键一并读。
+  const modern = new MemoryStateStore();
+  await modern.setSetting("cursorFastPolicy", "force-selected");
+  await modern.setSetting("cursorFastModels", JSON.stringify(["composer-2.5", 42, ""]));
+  await modern.setSetting("cursorFastDefault", "off");
+  assert.deepEqual(await loadCursorFastPolicy(modern, passthrough), { mode: "force-selected", models: ["composer-2.5"] });
+
+  // 非法档位按 passthrough 落、非法 JSON 名单当空名单，不让坏数据把请求路径打挂。
+  const broken = new MemoryStateStore();
+  await broken.setSetting("cursorFastPolicy", "sometimes");
+  await broken.setSetting("cursorFastModels", "{not json");
+  assert.deepEqual(await loadCursorFastPolicy(broken, passthrough), { mode: "passthrough", models: [] });
+});
+
+test("Fast passthrough lands as explicit false in the intent layer, not undefined", async () => {
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({
+    runner,
+    config: {
+      cursorFastPolicy: { mode: "passthrough", models: [] },
+      cursorMaxModePolicy: { mode: "passthrough", models: [] }
+    }
+  });
   const chat = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
@@ -2315,27 +2418,216 @@ test("admin settings can toggle default Max Mode and Fast and they flow into req
     payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
   });
   assert.equal(chat.statusCode, 200);
-  assert.equal(runner.lastInput?.maxMode, true);
-  assert.equal(runner.lastInput?.fast, true);
+  // passthrough 是显式 false：undefined 会被 resolveModelParams 当成「没表态」，默认档的 fast=true 原样出门。
+  assert.equal(runner.lastInput?.fast, false);
+  assert.equal(runner.lastInput?.maxMode, false);
 
-  // 关闭后网关不再强加默认（交回客户端/模型）。
-  const off = await app.inject({
+  const forced = await app.inject({
     method: "POST",
     url: "/admin/api/settings",
-    headers: adminHeaders,
-    payload: { cursorMaxMode: false, cursorFast: false }
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { cursorFastPolicy: "force-all", cursorMaxModePolicy: "force-all" }
   });
-  assert.equal(off.json().config.cursorMaxMode, false);
-  assert.equal(off.json().config.cursorFast, false);
-
+  assert.equal(forced.statusCode, 200);
   await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
     headers: { authorization: "Bearer gateway-key" },
     payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hi" }] }
   });
-  assert.equal(runner.lastInput?.maxMode, undefined);
-  assert.equal(runner.lastInput?.fast, undefined);
+  assert.equal(runner.lastInput?.fast, true);
+  assert.equal(runner.lastInput?.maxMode, true);
+});
+
+// ===== Fast / Max Mode 三态策略：纯函数 =====
+
+test("policyIntent resolves passthrough / force-all / force-selected with alias-aware matching", () => {
+  const passthrough = { mode: "passthrough" as const, models: [] };
+  assert.equal(policyIntent(passthrough, "composer-2.5"), false);
+  assert.equal(policyIntent(undefined, "composer-2.5"), false);
+  assert.equal(policyIntent({ mode: "force-all", models: [] }, "composer-2.5"), true);
+
+  const selected = { mode: "force-selected" as const, models: ["composer-2.5", "Grok-4.6"] };
+  assert.equal(policyIntent(selected, "composer-2.5"), true, "canonical id 命中");
+  assert.equal(policyIntent(selected, "COMPOSER-2.5"), true, "大小写不敏感");
+  assert.equal(policyIntent(selected, "composer"), true, "静态别名命中（composer → composer-2.5）");
+  assert.equal(policyIntent(selected, "grok-4.6"), true, "名单里的大小写差异不影响命中");
+  assert.equal(policyIntent(selected, "claude-opus-4-8"), false, "未点名 → false");
+  // 空名单 ≡ 透传。
+  assert.equal(policyIntent({ mode: "force-selected", models: [] }, "composer-2.5"), false);
+});
+
+test("parseModelParamPolicyEnv maps legacy booleans and the three modes", () => {
+  assert.deepEqual(parseModelParamPolicyEnv(undefined, undefined), { mode: "passthrough", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("", ""), { mode: "passthrough", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("false", undefined), { mode: "passthrough", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("off", undefined), { mode: "passthrough", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("passthrough", undefined), { mode: "passthrough", models: [] });
+  // 旧 env「默认开启」的语义升级为 force-all。
+  assert.deepEqual(parseModelParamPolicyEnv("true", undefined), { mode: "force-all", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("force-all", undefined), { mode: "force-all", models: [] });
+  assert.deepEqual(parseModelParamPolicyEnv("force-selected", "composer-2.5, grok-4.6\nclaude-opus-4-8"), {
+    mode: "force-selected",
+    models: ["composer-2.5", "grok-4.6", "claude-opus-4-8"]
+  });
+});
+
+// ===== Fast / Max Mode 三态策略：请求路径（断言真正下发的 model.params） =====
+
+// Composer：唯一参数 fast，默认档就是 fast=true —— 本次账单偏差的上游形状。
+const composerFastCatalog: ModelCatalog = {
+  parameters: [{ id: "fast", values: [{ value: "false" }, { value: "true" }] }],
+  variants: [{ displayName: "Composer 2.5", isDefault: true, params: [{ id: "fast", value: "true" }] }]
+};
+
+/**
+ * 走真实 CursorSdkRunner（注入目录桩与假 agent 工厂）的测试 app：
+ * 只有它会把语义意图解析成真正下发的 model.params，FakeRunner 只能断言意图层。
+ */
+async function createPolicyTestApp(options: {
+  config?: Partial<GatewayConfig>;
+  catalogFor: (modelId: string) => ModelCatalog | undefined;
+}): Promise<{
+  app: ReturnType<typeof createApp>;
+  sentModels: Array<{ id: string; params: Array<{ id: string; value: string }> }>;
+}> {
+  const sentModels: Array<{ id: string; params: Array<{ id: string; value: string }> }> = [];
+  const factory: AgentFactory = {
+    create: async () => ({
+      agentId: "agent-policy",
+      send: async (_message: string, sendOptions: Record<string, unknown>) => {
+        sentModels.push(sendOptions.model as { id: string; params: Array<{ id: string; value: string }> });
+        return new FakeSdkRun({ waitResult: { status: "finished", result: "ok" } });
+      }
+    })
+  };
+  const inner = new CursorSdkRunner(
+    new MemoryStateStore(),
+    {
+      defaultWorkingDirectory: "/workspace",
+      sdkClientVersion: "test",
+      getModelCatalog: async (modelId) => options.catalogFor(modelId)
+    },
+    factory
+  );
+  const { app } = await createTestApp({ runner: inner, config: options.config });
+  return { app, sentModels };
+}
+
+async function policyChat(
+  app: ReturnType<typeof createApp>,
+  model: string,
+  body: Record<string, unknown> = {}
+): Promise<void> {
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: { model, messages: [{ role: "user", content: "Hello" }], ...body }
+  });
+  assert.equal(response.statusCode, 200);
+}
+
+test("Composer default-variant fast=true + passthrough Fast + force-all Max Mode sends outbound fast=false", async () => {
+  // 本 bug 的最小复现：以前 passthrough 被存成 undefined，Composer 默认档的 fast=true 原样发给上游。
+  const { app, sentModels } = await createPolicyTestApp({
+    config: {
+      cursorFastPolicy: { mode: "passthrough", models: [] },
+      cursorMaxModePolicy: { mode: "force-all", models: [] }
+    },
+    catalogFor: (modelId) => (modelId === "composer-2.5" ? composerFastCatalog : undefined)
+  });
+  await policyChat(app, "composer-2.5");
+  assert.equal(sentModels.length, 1);
+  // Max Mode 对 composer 没有 context 档位，被 dropped（现行为）；fast 必须是显式 false。
+  assert.deepEqual(paramsMap(sentModels[0].params), { fast: "false" });
+});
+
+test("client fast=true / :fast suffix overrides the passthrough policy for Composer", async () => {
+  const { app, sentModels } = await createPolicyTestApp({
+    config: { cursorFastPolicy: { mode: "passthrough", models: [] } },
+    catalogFor: (modelId) => (modelId === "composer-2.5" ? composerFastCatalog : undefined)
+  });
+  await policyChat(app, "composer-2.5", { fast: true });
+  await policyChat(app, "composer-2.5:fast");
+  assert.deepEqual(paramsMap(sentModels[0].params), { fast: "true" });
+  assert.deepEqual(paramsMap(sentModels[1].params), { fast: "true" });
+});
+
+test("force-all keeps sending fast=true to Composer (the old checkbox-on behavior)", async () => {
+  const { app, sentModels } = await createPolicyTestApp({
+    config: { cursorFastPolicy: { mode: "force-all", models: [] } },
+    catalogFor: (modelId) => (modelId === "composer-2.5" ? composerFastCatalog : undefined)
+  });
+  await policyChat(app, "composer-2.5");
+  assert.deepEqual(paramsMap(sentModels[0].params), { fast: "true" });
+});
+
+test("force-selected forces fast only for the listed models", async () => {
+  const { app, sentModels } = await createPolicyTestApp({
+    config: { cursorFastPolicy: { mode: "force-selected", models: ["composer-2.5"] } },
+    catalogFor: (modelId) =>
+      modelId === "composer-2.5" ? composerFastCatalog
+      : modelId === "claude-opus-4-8" ? claudeCatalog
+      : undefined
+  });
+  await policyChat(app, "composer-2.5");
+  await policyChat(app, "claude-opus-4-8");
+  assert.deepEqual(paramsMap(sentModels[0].params), { fast: "true" }, "名单内 → true");
+  // 名单外断言的是策略下发的显式 false（最小 context），不是「碰巧拷了默认档」。
+  assert.deepEqual(paramsMap(sentModels[1].params), {
+    cyber: "false",
+    thinking: "true",
+    context: "300k",
+    effort: "high",
+    fast: "false"
+  });
+});
+
+test("force-all Fast + force-all Max Mode on GPT still trades fast for 1M", async () => {
+  const { app, sentModels } = await createPolicyTestApp({
+    config: {
+      cursorFastPolicy: { mode: "force-all", models: [] },
+      cursorMaxModePolicy: { mode: "force-all", models: [] }
+    },
+    catalogFor: (modelId) => (modelId === "gpt-5.6-sol" ? gptCatalog : undefined)
+  });
+  await policyChat(app, "gpt-5.6-sol");
+  // GPT 的 1M 与 fast 互斥：Max Mode 优先，fast 被打成 false（现行为，冲突测试保留）。
+  assert.deepEqual(paramsMap(sentModels[0].params), { context: "1m", reasoning: "medium", fast: "false" });
+});
+
+test("admin model catalogue unions parameters across keys for the force-selected picker", async () => {
+  // 两把 key 的目录各缺一半参数定义：并集后 force-selected 的「支持 Fast / 支持 context」过滤才不会漏。
+  const fastOnly: ModelCatalog = { parameters: [{ id: "fast", values: [{ value: "false" }, { value: "true" }] }] };
+  const contextOnly: ModelCatalog = { parameters: [{ id: "context", values: [{ value: "300k" }, { value: "1m" }] }] };
+  const { app } = await createTestApp({
+    keys: ["key-a", "key-b"],
+    modelLister: async (apiKey) => ({
+      models: [
+        {
+          id: "composer-2.5",
+          name: "Composer",
+          aliases: [],
+          ...(apiKey === "key-a" ? { parameters: fastOnly.parameters } : { parameters: contextOnly.parameters })
+        }
+      ],
+      source: "cursor"
+    })
+  });
+  const response = await app.inject({
+    method: "GET",
+    url: "/admin/api/models",
+    headers: { authorization: "Bearer gateway-key" }
+  });
+  assert.equal(response.statusCode, 200);
+  const models = response.json().models as Array<{ id: string; parameters?: Array<{ id: string }> }>;
+  assert.equal(models.length, 1);
+  assert.deepEqual(
+    (models[0].parameters ?? []).map((def) => def.id).sort(),
+    ["context", "fast"],
+    "parameters 按 id 去重并集"
+  );
 });
 
 test("requests are recorded into admin logs and overview stats", async () => {
@@ -2413,12 +2705,12 @@ function paramsMap(params: Array<{ id: string; value: string }>): Record<string,
 
 test("resolveModelParams maps effort/maxMode onto Claude catalog and keeps the default-variant baseline", () => {
   const resolved = resolveModelParams(claudeCatalog, { reasoningEffort: "xhigh", maxMode: true }, "claude-opus-4-8");
+  // fast 没表态 → 不拷默认档的 fast=false：省略后上游落到第一允许值（false），与拷过去等效。
   assert.deepEqual(paramsMap(resolved.params), {
     cyber: "false",
     thinking: "true",
     context: "1m",
-    effort: "xhigh",
-    fast: "false"
+    effort: "xhigh"
   });
   assert.deepEqual(resolved.dropped, []);
   assert.equal(resolved.usedFallback, false);
@@ -2450,10 +2742,11 @@ test("resolveModelParams keeps Max Mode over fast when a GPT model cannot combin
   assert.ok(resolved.dropped.some((entry) => entry.includes("fast=true")));
 });
 
-test("resolveModelParams downgrades context to keep fast when only fast is requested on GPT", () => {
+test("resolveModelParams omits unrequested context when only fast is requested on GPT", () => {
   const resolved = resolveModelParams(gptCatalog, { fast: true }, "gpt-5.6-sol");
   assert.equal(paramsMap(resolved.params).fast, "true");
-  assert.equal(paramsMap(resolved.params).context, "272k");
+  // maxMode 没表态 → 不拷默认档的 context=1m：省略后上游落到第一允许值 272k，与 fast=true 合法共存。
+  assert.equal(paramsMap(resolved.params).context, undefined);
 });
 
 test("resolveModelParams allows 1m + fast together on Claude models that support it", () => {
@@ -2659,12 +2952,12 @@ test("CursorSdkRunner sends resolved model.params to the SDK agent", async () =>
   assert.equal(result.text, "params ok");
   const sentModel = sendOptions[0].model as { id: string; params: Array<{ id: string; value: string }> };
   assert.equal(sentModel.id, "claude-opus-4-8");
+  // fast 没表态 → 不拷默认档（见 resolveModelParams 基线跳过）。
   assert.deepEqual(paramsMap(sentModel.params), {
     cyber: "false",
     thinking: "true",
     context: "1m",
-    effort: "xhigh",
-    fast: "false"
+    effort: "xhigh"
   });
   const createdModel = (createOptions[0] as { model: { params?: Array<{ id: string; value: string }> } }).model;
   assert.deepEqual(paramsMap(createdModel.params ?? []), paramsMap(sentModel.params));

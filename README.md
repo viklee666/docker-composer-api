@@ -190,9 +190,13 @@ composer-2.5:fast                 # fast 变体
 
 请求头（适合能配自定义 header 的客户端）：`x-cursor-reasoning-effort`、`x-cursor-max-mode`、`x-cursor-fast`、`x-cursor-mode`（agent/plan）、`x-cursor-model-params`。
 
-环境变量默认值（客户端未显式指定时生效）：`CURSOR_REASONING_EFFORT`、`CURSOR_MAX_MODE`、`CURSOR_FAST`、`CURSOR_MODEL_PARAMS`、`CURSOR_AGENT_MODE`。
+环境变量默认值（客户端未显式指定时生效）：`CURSOR_REASONING_EFFORT`、`CURSOR_MODEL_PARAMS`、`CURSOR_AGENT_MODE`，以及 Fast / Max Mode 的三态策略 `CURSOR_FAST` / `CURSOR_MAX_MODE`（后台「运行设置」可改，落库优先于 env）：
 
-优先级（低 → 高）：env 默认 < 请求头 < 请求体语义字段 < 模型 id 后缀 < 显式 `model_params`。
+- `passthrough`（默认）：透传客户端——没表态的请求网关下发显式关（`fast=false` / 最小 context）。Composer / Grok 的上游默认档就是 Fast、Claude / GPT 默认档常是 1M，「省略参数让上游默认档生效」等于按 Fast / 1M 计费，所以透传必须显式关；
+- `force-all`：全部支持的模型强制开启（旧 `CURSOR_FAST=true` 仍等价于这一档）；
+- `force-selected`：仅 `CURSOR_FAST_MODELS` / `CURSOR_MAX_MODE_MODELS` 名单里的模型强制开启（逗号/换行分隔，存 canonical id，别名也认；空名单等同透传）。
+
+优先级（低 → 高）：网关策略（按当前请求的模型解析）< 请求头 < 请求体语义字段 < 模型 id 后缀 < 显式 `model_params`。`CURSOR_MODEL_PARAMS=fast=true` 这类显式 params 仍能盖过策略。
 
 ### Claude Code 的 Max Mode / 1M 特别说明
 
@@ -207,12 +211,12 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 注意：
 
 - Max Mode 需要模型本身带 `context` 参数（claude 系、gpt-5.x 系等）。`composer-2.5` 只有 `fast`、**没有 context 档位，无法开 Max Mode**，带 `[1m]` 也会被忽略。
-- 想全局强制开启，也可以在网关侧设 `CURSOR_MAX_MODE=true`（对所有请求生效）。
+- 想全局强制开启，把 `CURSOR_MAX_MODE=force-all`（或后台「运行设置」选「全部支持的模型强制开启」）；只给部分模型开就用 `force-selected` + `CURSOR_MAX_MODE_MODELS`。
 - 用 `GET /v1/models` 看某模型的 `cursor_parameters` 是否包含 `context`，即可判断它能否 Max Mode。
 
 说明：
 
-- 映射基于 `Cursor.models.list()` 返回的该模型参数定义与默认 variant（补全默认参数组合，避免只发部分参数时其余参数掉到首个允许值）；目录发现失败或目录条目缺参数定义时按模型家族已知惯例兜底映射，命中不了的意图会记入服务日志（`[model-params]`）而不是静默丢弃；实际下发的参数也会打 `[model-params] sending params` 日志（同组合 10 分钟内一条）。
+- 映射基于 `Cursor.models.list()` 返回的该模型参数定义与默认 variant（补全默认参数组合，避免只发部分参数时其余参数掉到首个允许值；**客户端/网关没表态的 fast / context 维不拷默认档**——Composer 默认档是 `fast=true`、Claude/GPT 默认档常是 `context=1m`，拷了会把「没表态」变成按默认档计费）；目录发现失败或目录条目缺参数定义时按模型家族已知惯例兜底映射，命中不了的意图会记入服务日志（`[model-params]`）而不是静默丢弃；实际下发的参数也会打 `[model-params] sending params` 日志（同组合 10 分钟内一条）。
 - 模型目录缓存 10 分钟；请求了缓存里没有的模型会立刻强刷一次目录（30 秒限频），新上线的模型无需等缓存过期。
 - 上游 run 失败时透传 SDK（>=1.0.23）的结构化错误详情；命中区域限制（如 "This model provider is not supported in your region"，Claude 系模型在部分出口区域不可用）时返回 403 `model_unavailable` 并附原文，而不是笼统的 502。命中上游按 key 限速（如 get_models 每分钟 30 次，单 key 并发突发时常见）时返回 429 `rate_limit_exceeded`，客户端可按标准语义退避重试。
 - 所有对上游 SDK 的调用（agent 创建、发送、目录拉取、结果等待）都与请求级超时/断连信号竞速：即使上游传输层完全挂死（不返回也不报错），请求也会在 `REQUEST_TIMEOUT_MS`（空闲超时）内以 504 收尾并释放资源，不会永久悬挂堆积拖垮服务器；取消/释放等清理调用另有 5 秒上限，清理挂死不会阻塞请求收尾。

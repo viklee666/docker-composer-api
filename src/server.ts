@@ -30,6 +30,7 @@ import {
 } from "./errors.js";
 import type { GatewayKeyPool } from "./gateway-key-pool.js";
 import type { CursorKeyPool } from "./key-pool.js";
+import { policyIntent } from "./model-param-policy.js";
 import { errorMessage } from "./key-pool.js";
 import type { UsageReconciler } from "./usage-reconciler.js";
 import { resolveCursorClientType, runWithCursorClientType } from "./sand-client.js";
@@ -946,7 +947,7 @@ function loggedRunRequest(
       sessionKey: input.sessionKey,
       workingDirectory: deps.config.cursorWorkingDirectory,
       keyUsageRef: log.keyUsageRef,
-      controls: requestModelControls(input.request, deps.config)
+      controls: requestModelControls(input.request, deps.config, input.prepared.model)
     }),
     telemetryRef: log.telemetryRef,
     modelIdentity: input.identity,
@@ -1602,12 +1603,16 @@ async function saveResponse(deps: AppDeps, auth: AuthContext, id: string, respon
 /**
  * 网关默认值（env）+ 请求头推导的模型运行意图，优先级低于请求体 / 模型 id 后缀。
  * 请求头支持：anthropic-beta（含 context-1m → Max Mode）、x-cursor-reasoning-effort/max-mode/fast/mode/model-params。
+ *
+ * Fast / Max Mode 走三态策略按当前请求的模型解析成显式布尔：passthrough 就是 false——
+ * 留 undefined 会被 resolveModelParams 当成「没表态」，Composer 默认档的 fast=true 原样出门。
+ * `CURSOR_MODEL_PARAMS=fast=true` 仍在最上层（显式 params），可以盖过策略。
  */
-function requestModelControls(request: FastifyRequest, config: GatewayConfig): ModelIntent {
+function requestModelControls(request: FastifyRequest, config: GatewayConfig, model: string): ModelIntent {
   const configDefaults: ModelIntent = {
     reasoningEffort: config.cursorReasoningEffort,
-    maxMode: config.cursorMaxMode,
-    fast: config.cursorFast,
+    maxMode: policyIntent(config.cursorMaxModePolicy, model),
+    fast: policyIntent(config.cursorFastPolicy, model),
     mode: config.cursorAgentMode,
     params: config.cursorModelParams
   };

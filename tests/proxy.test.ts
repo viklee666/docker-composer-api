@@ -644,6 +644,31 @@ test("后台设置表单用三态控件承载 HTTP/1.1，不再用 checkbox 压�
   assert.match(ADMIN_HTML, /CURSOR_SDK_SESSION_MODE/);
 });
 
+test("Fast / Max Mode 用三态下拉承载，不再用 checkbox 压平", () => {
+  // checkbox 存不了第三档：「没表态」会被存成「显式关」，再被实现成「不管」——正是账单偏差的形状。
+  assert.doesNotMatch(ADMIN_HTML, /max-mode-toggle/);
+  assert.doesNotMatch(ADMIN_HTML, /fast-toggle/);
+  assert.match(ADMIN_HTML, /<select id="fast-policy">/);
+  assert.match(ADMIN_HTML, /<select id="max-mode-policy">/);
+  // passthrough 必须是第一个 option：表单未回填时浏览器默认选中的就是它。
+  assert.match(ADMIN_HTML, /<select id="fast-policy"[^>]*>\s*<option value="passthrough">/);
+  assert.match(ADMIN_HTML, /<select id="max-mode-policy"[^>]*>\s*<option value="passthrough">/);
+  // 保存 payload 带四个新字段；第三档才有条件名单。
+  assert.match(ADMIN_HTML, /cursorFastPolicy: \$\('fast-policy'\)\.value/);
+  assert.match(ADMIN_HTML, /cursorFastModels: collectPolicyModels\('fast'\)/);
+  assert.match(ADMIN_HTML, /cursorMaxModePolicy: \$\('max-mode-policy'\)\.value/);
+  assert.match(ADMIN_HTML, /cursorMaxModeModels: collectPolicyModels\('max-mode'\)/);
+  assert.match(ADMIN_HTML, /id="fast-models-field"/);
+  assert.match(ADMIN_HTML, /id="max-mode-models-field"/);
+  // 第三档才显示名单；列表按「目录显示支持该参数」过滤并允许手动添加。
+  assert.match(ADMIN_HTML, /\$\(dim \+ '-models-field'\)\.classList\.toggle\('hidden', \$\(dim \+ '-policy'\)\.value !== 'force-selected'\)/);
+  assert.match(ADMIN_HTML, /id="fast-models-extra"/);
+  assert.match(ADMIN_HTML, /id="max-mode-models-extra"/);
+  // 目录轮询刷新重建列表前必须先把 DOM 勾选现状写回，否则用户刚勾的 10 秒内被静默洗掉。
+  assert.match(ADMIN_HTML, /syncPolicySelection\('fast'\);\s*syncPolicySelection\('max-mode'\);/);
+  assert.match(ADMIN_HTML, /function syncPolicySelection\(dim\)\{/);
+});
+
 test("释放预热租约有时限，卡住的那份留在池里等下次重试", async (t) => {
   const warn = t.mock.method(console, "warn", () => undefined);
   const pool = new ExecutorWarmPool({

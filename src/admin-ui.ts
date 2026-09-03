@@ -694,17 +694,41 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
               <div class="settings-block">
                 <h3>模型默认（客户端显式指定时以客户端为准）</h3>
-                <div class="row" style="margin-bottom:10px">
-                  <label class="toggle" style="font-size:13px;color:var(--text)">
-                    <input type="checkbox" id="max-mode-toggle">
-                    支持的模型默认开启 Max Mode（大上下文 / 1M）
-                  </label>
-                  <label class="toggle" style="font-size:13px;color:var(--text)">
-                    <input type="checkbox" id="fast-toggle">
-                    支持的模型默认开启 Fast
-                  </label>
-                </div>
                 <div class="settings-grid">
+                  <div class="setting-field">
+                    <label>Fast 策略 <span class="env">CURSOR_FAST</span></label>
+                    <select id="fast-policy">
+                      <option value="passthrough">透传客户端（默认不加速）</option>
+                      <option value="force-all">全部支持的模型强制开启</option>
+                      <option value="force-selected">仅下列模型强制开启</option>
+                    </select>
+                    <div class="hint">Composer / Grok 目录默认档就是 Fast；「透传」时网关下发 fast=false，否则客户端没写也会按 Fast 计费。请求里显式指定仍以客户端为准。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>Max Mode 策略 <span class="env">CURSOR_MAX_MODE</span></label>
+                    <select id="max-mode-policy">
+                      <option value="passthrough">透传客户端（默认不大上下文）</option>
+                      <option value="force-all">全部支持的模型强制开启</option>
+                      <option value="force-selected">仅下列模型强制开启</option>
+                    </select>
+                    <div class="hint">Claude / GPT 目录默认档常为 1M；「透传」会下发最小 context。GPT 的 1M 与 Fast 不能共存时 Max Mode 优先。</div>
+                  </div>
+                  <div class="setting-field hidden" id="fast-models-field">
+                    <label>强制开启 Fast 的模型</label>
+                    <div class="scope-list" id="fast-models-list"></div>
+                    <div class="row" style="margin-top:8px">
+                      <input id="fast-models-extra" placeholder="目录外的模型 id" style="flex:1">
+                      <button type="button" id="fast-models-add">添加</button>
+                    </div>
+                  </div>
+                  <div class="setting-field hidden" id="max-mode-models-field">
+                    <label>强制开启 Max Mode 的模型</label>
+                    <div class="scope-list" id="max-mode-models-list"></div>
+                    <div class="row" style="margin-top:8px">
+                      <input id="max-mode-models-extra" placeholder="目录外的模型 id" style="flex:1">
+                      <button type="button" id="max-mode-models-add">添加</button>
+                    </div>
+                  </div>
                   <div class="setting-field">
                     <label>默认思考强度 <span class="env">CURSOR_REASONING_EFFORT</span></label>
                     <select id="reasoning-effort">
@@ -728,6 +752,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                   <div class="setting-field">
                     <label>默认 model.params <span class="env">CURSOR_MODEL_PARAMS</span></label>
                     <input id="model-params" type="text" placeholder="id=value,id2=value2 或 JSON 数组" autocomplete="off">
+                    <div class="hint">显式 params 优先级最高（高于两侧策略），fast=true 会盖过 Fast 策略。</div>
                   </div>
                 </div>
               </div>
@@ -765,7 +790,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
               <div class="row">
                 <button id="btn-save-settings">保存设置</button>
-                <span class="muted small">Max Mode / Fast 仅对支持对应参数的模型生效（如 gpt-5.x / claude 系；composer 无 context 档位）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
+                <span class="muted small">Fast / Max Mode 各自三态独立：透传 = 客户端未表态时网关下发显式关（fast=false / 最小 context），因为 Composer / Grok 上游默认档就是 Fast、Claude / GPT 默认档常是 1M，省略参数只会按默认档计费；强制开启只对支持对应参数的模型生效（composer 无 context 档位，Max Mode 会被 dropped）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
               </div>
             </div>
           </div>
@@ -995,9 +1020,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   function setModelCatalog(data){
     var list = (data && data.models) ? data.models : [];
     modelCatalog = list.map(function(m){
-      return typeof m === 'string' ? { id: m, name: m } : { id: m.id, name: m.name || m.id };
+      return typeof m === 'string'
+        ? { id: m, name: m, parameters: [] }
+        : { id: m.id, name: m.name || m.id, parameters: m.parameters || [] };
     });
     fillModelSelects();
+    // 目录数据晚到 / 轮询刷新都会重建列表：先把 DOM 里的勾选现状收集回来，
+    // 否则用户刚勾的会被旧的 policySelected 静默洗掉，之后点保存就存进洗掉的状态。
+    syncPolicySelection('fast');
+    syncPolicySelection('max-mode');
+    renderPolicyModels('fast');
+    renderPolicyModels('max-mode');
   }
 
   function applyInitialSection(){
@@ -1225,14 +1258,81 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('sdk-http1-mode').value = http1ModeOf(cfg);
     $('sdk-http1-hint').textContent = http1Hint(cfg);
   }
+  // Fast / Max Mode 三态策略的表单状态。selected 保留当前勾选（含目录外手动添加项），
+  // 目录晚到 / 轮询刷新时重渲染列表不会把勾选洗掉。
+  var policySelected = { fast: [], 'max-mode': [] };
+  // 与后端 model-params.ts 的 /fast/i、MAX_MODE_PARAM 同口径的参数维度匹配。
+  function policyParamRegex(dim){
+    return dim === 'fast' ? /fast/i : /max.?mode|context|window|long|token|length|^1m$/i;
+  }
+  // 勾选列表只列「目录显示支持该参数」的模型；允许手动加尚未出现在目录里的 id。
+  function policyCandidateIds(dim){
+    var re = policyParamRegex(dim);
+    var ids = [];
+    modelCatalog.forEach(function(m){
+      if ((m.parameters || []).some(function(p){ return re.test(p.id); })) ids.push(m.id);
+    });
+    return ids;
+  }
+  function applyPolicyForm(dim, mode, models){
+    policySelected[dim] = (models || []).slice();
+    var select = $(dim + '-policy');
+    select.value = mode === 'force-all' || mode === 'force-selected' ? mode : 'passthrough';
+    togglePolicyModelsField(dim);
+    renderPolicyModels(dim);
+  }
+  function togglePolicyModelsField(dim){
+    $(dim + '-models-field').classList.toggle('hidden', $(dim + '-policy').value !== 'force-selected');
+  }
+  function renderPolicyModels(dim){
+    var list = $(dim + '-models-list');
+    if (!list) return;
+    var selected = policySelected[dim] || [];
+    var seen = {};
+    var ids = [];
+    policyCandidateIds(dim).forEach(function(id){ if (!seen[id]) { ids.push(id); seen[id] = true; } });
+    selected.forEach(function(id){ if (id && !seen[id]) { ids.push(id); seen[id] = true; } });
+    if (!ids.length) {
+      list.innerHTML = '<div class="muted small">目录里暂无支持该参数的模型，可用下方输入框手动添加</div>';
+      return;
+    }
+    var html = '';
+    ids.forEach(function(id){
+      html += '<label class="toggle"><input type="checkbox" data-policy="' + dim + '" value="' + esc(id) + '"'
+        + (selected.indexOf(id) !== -1 ? ' checked' : '') + '> ' + esc(id) + '</label>';
+    });
+    list.innerHTML = html;
+  }
+  function addPolicyModel(dim){
+    var input = $(dim + '-models-extra');
+    var id = input.value.trim();
+    if (!id) return;
+    if (policySelected[dim].indexOf(id) === -1) policySelected[dim].push(id);
+    input.value = '';
+    renderPolicyModels(dim);
+  }
+  function collectPolicyModels(dim){
+    var out = [];
+    var boxes = $(dim + '-models-list').querySelectorAll('input[type="checkbox"]');
+    for (var i = 0; i < boxes.length; i++) if (boxes[i].checked) out.push(boxes[i].value);
+    return out;
+  }
+  // 重建列表前把 DOM 勾选现状写回 policySelected。只在列表已渲染（有 checkbox）时收集：
+  // 列表还没建过（空目录占位）时 DOM 里没有用户可改的东西，回写空数组反而会清掉手动添加项。
+  function syncPolicySelection(dim){
+    if ($(dim + '-models-list').querySelector('input[type="checkbox"]')) {
+      policySelected[dim] = collectPolicyModels(dim);
+    }
+  }
+
   function applySettingsForm(cfg, force){
     if (!cfg) return;
     var el = document.activeElement;
     if (!force && el && el.closest && el.closest('#sec-settings')) return;
     applyHttp1Form(cfg);
     http1ModeDirty = false;
-    $('max-mode-toggle').checked = !!cfg.cursorMaxMode;
-    $('fast-toggle').checked = !!cfg.cursorFast;
+    applyPolicyForm('fast', cfg.cursorFastPolicy, cfg.cursorFastModels);
+    applyPolicyForm('max-mode', cfg.cursorMaxModePolicy, cfg.cursorMaxModeModels);
     autoDisableThreshold = cfg.autoDisableThreshold || 1;
     $('auto-disable-toggle').checked = !!cfg.autoDisableKeys;
     $('auto-disable-threshold').value = autoDisableThreshold;
@@ -2322,6 +2422,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('sdk-http1-mode').addEventListener('change', function(){
     http1ModeDirty = true;
   });
+  $('fast-policy').addEventListener('change', function(){ togglePolicyModelsField('fast'); });
+  $('max-mode-policy').addEventListener('change', function(){ togglePolicyModelsField('max-mode'); });
+  $('fast-models-add').addEventListener('click', function(){ addPolicyModel('fast'); });
+  $('max-mode-models-add').addEventListener('click', function(){ addPolicyModel('max-mode'); });
   $('btn-test-proxy').addEventListener('click', function(){
     var url = $('proxy-url').value.trim();
     var result = $('proxy-test-result');
@@ -2366,8 +2470,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (!(transient >= 1 && transient <= 50)) { toast('软失败重试需为 1–50', true); return; }
     var http1Mode = $('sdk-http1-mode').value;
     var body = {
-      cursorMaxMode: $('max-mode-toggle').checked,
-      cursorFast: $('fast-toggle').checked,
+      cursorFastPolicy: $('fast-policy').value,
+      cursorFastModels: collectPolicyModels('fast'),
+      cursorMaxModePolicy: $('max-mode-policy').value,
+      cursorMaxModeModels: collectPolicyModels('max-mode'),
       autoDisableKeys: $('auto-disable-toggle').checked,
       autoDisableThreshold: threshold,
       sandClientMode: $('sand-mode-toggle').checked,
