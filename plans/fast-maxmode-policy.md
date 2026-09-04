@@ -1,4 +1,4 @@
-# Fast / Max Mode：三态策略（透传 · 全量强制 · 指定模型）
+# Fast / Max Mode：三态策略（默认关闭 · 全量强制 · 指定模型）
 
 > 目标：后台不再用「勾上=强制开 / 取消勾=不管」的二态。Fast 与 Max Mode 各自变成三种策略；日常默认不加速，但客户端和按模型强制仍然随时能打开。
 > 本文只给**一个**方案。被否决的替代路线在 §6。
@@ -24,21 +24,21 @@ Fast 与 Max Mode **各有一份独立策略**，互不合并。客户端显式�
 
 | 档位 | 后台文案 | 网关在客户端未表态时做什么 |
 |---|---|---|
-| `passthrough` | 透传客户端（默认不加速 / 默认不大上下文） | 对该维下发 **显式 false**（Fast → `fast=false`；Max Mode → 最小 context / `maxMode=false`） |
+| `passthrough` | 默认关闭（客户端可覆盖） | 对该维下发 **显式 false**（Fast → `fast=false`；Max Mode → 最小 context / `maxMode=false`） |
 | `force-all` | 全部支持的模型强制开启 | 对该维下发 **显式 true**（即今天勾上 checkbox 的行为） |
-| `force-selected` | 仅下列模型强制开启 | 命中名单 → true；未命中 → 与 `passthrough` 相同（false） |
+| `force-selected` | 仅下列模型强制开启 | 命中名单 → true；未命中 → 与第一档相同（false） |
 
-「支持」= 该模型目录 `parameters` / `variants` 里有对应参数，目录缺失时用 `model-params.ts` 的家族兜底（composer/grok/claude/gpt/codex 有 Fast；claude/gpt 有 context。composer 无 context，Max Mode 强制会被 dropped，这是现行为）。
+「支持」= 该模型目录 `parameters` / `variants` 里有对应参数，目录缺失时用 `model-params.ts` 的家族兜底（composer/grok/claude/gpt/codex 有 Fast；claude/gpt 有 context。composer 无 context，**强制开** Max Mode 会被 dropped，这是现行为；默认关闭档在它上面是空操作，不记 dropped）。
 
-### 1.1 「透传」为什么不是「什么都不写」
+### 1.1 第一档为什么不叫「透传」、也不是「什么都不写」
 
-字面透传（`intent.fast = undefined`、出站省略 `fast`）对 Composer **等于开 Fast**：上游默认档就是 Fast。用户目标是「一般不用 Fast，但需要能开」，所以 `passthrough` 的操作定义是：
+键名沿用 `passthrough`（已落库，不改），但**语义是「默认关闭、客户端可覆盖」，不是字面透传**。字面透传（`intent.fast = undefined`、出站省略 `fast`）对 Composer **等于开 Fast**：上游默认档就是 Fast。用户目标是「一般不用 Fast，但需要能开」，所以这一档的操作定义是：
 
 - 客户端没要 Fast → 网关写 `fast=false`（支持该参数的模型）
 - 客户端要了 Fast（请求体 `fast`、头 `x-cursor-fast`、模型后缀 `:fast` / `#fast=true` / `[fast]`）→ 覆盖为 true
-- 不支持 Fast 的模型（如 glm）→ 不写该维，避免 `dropped` 噪声
+- 不支持 Fast 的模型（如 glm）→ 不写该维，也不记 `dropped`（关掉一个不存在的维是空操作，记了会让每条请求都刷日志）
 
-Max Mode 同理：Claude/GPT 目录默认档经常是 `context=1m`。省略参数 = 仍是 1M。`passthrough` 必须显式关掉，客户端再用 `@1m` / `[1m]` / `anthropic-beta: context-1m` / `max_mode` 打开。
+Max Mode 同理：Claude/GPT 目录默认档经常是 `context=1m`。省略参数 = 仍是 1M。第一档必须显式关掉，客户端再用 `@1m` / `[1m]` / `anthropic-beta: context-1m` / `max_mode` 打开。
 
 ### 1.2 优先级（低 → 高，保持现有 merge 顺序）
 
@@ -92,7 +92,7 @@ Max Mode 对称（`CURSOR_MAX_MODE` / `CURSOR_MAX_MODE_MODELS` / `cursorMaxModeD
 
 首次用新 API 保存后写入新键。同时把旧键写成兼容投影，方便回滚到旧二进制时不至于全空白：`force-all` → `on`，其余 → `off`。
 
-**行为变化（有意的）：** 旧「Fast 关闭」从「不管 → Composer 仍 Fast」变成「透传 → 下发 `fast=false`」。这就是本需求要修的账单问题。
+**行为变化（有意的）：** 旧「Fast 关闭」从「不管 → Composer 仍 Fast」变成「默认关闭 → 下发 `fast=false`」。这就是本需求要修的账单问题。
 
 ### 2.3 `GatewayConfig`
 
@@ -114,7 +114,7 @@ function policyIntent(policy: ModelParamPolicy, modelId: string): boolean
 // passthrough / 未点名 → false；force-all / 点名 → true
 ```
 
-不支持该维的模型由 `resolveModelParams` dropped，派生函数不必查目录。
+不支持该维的模型在 `resolveModelParams` 里是空操作（不写参数、不记 dropped），派生函数不必查目录。
 
 ### 2.4 管理 API
 
@@ -135,7 +135,7 @@ function policyIntent(policy: ModelParamPolicy, modelId: string): boolean
 
 联通性测试（`POST /admin/api/test`）按**测试所选模型**走 `policyIntent`，不要再读已经不存在的全局布尔。
 
-## 3. 解析层（必须一起改，否则透传仍会漏 Fast）
+## 3. 解析层（必须一起改，否则第一档仍会漏 Fast）
 
 `requestModelControls` 增加当前 `model` 参数（`prepared.model`，已经是去后缀的 canonical id）：
 
@@ -154,7 +154,9 @@ maxMode: policyIntent(config.cursorMaxModePolicy, model)
 
 两层一起做的原因：只改意图、不改拷贝，将来任何路径再留下 `fast === undefined`（测试、admin test、漏传 model）Composer 仍会漏；只改拷贝、意图仍是 undefined，则出站省略 `fast`，上游 Composer 仍按默认档 Fast 计费。
 
-`hasSemantic` 在 `passthrough` 下会因 `false` 为真而走解析——这是我们要的，因为必须把 `fast=false` 写出去。
+`hasSemantic` 在第一档下会因 `false` 为真而走解析——这是我们要的，因为必须把 `fast=false` 写出去。代价：每条请求都会取一次模型目录（10 分钟缓存），并且 `resolveModelParams` 不再走空返回。
+
+同时改 `dropped` 的记账口径：**只有「要求开启却没落到任何参数」才算丢**。默认关闭档会给每条请求带上 `maxMode=false` / `fast=false`，按旧口径 glm（两维都没有）与 composer（没有 context）每条请求都会刷一行 `[model-params]` 日志。关掉一个模型根本没有的维是空操作，不是意图被丢弃。
 
 ## 4. 后台 UI
 
@@ -162,13 +164,13 @@ maxMode: policyIntent(config.cursorMaxModePolicy, model)
 
 运行设置里 Fast / Max Mode 各一块：
 
-1. 下拉：透传客户端（默认不加速） / 全部支持的模型强制开启 / 仅下列模型强制开启
+1. 下拉：默认关闭（客户端可覆盖） / 全部支持的模型强制开启 / 仅下列模型强制开启
 2. 第三档才显示勾选列表（目录过滤 + 手动添加），交互抄 `openScopeModal` 的 checkbox 列表，但只是单列「强制开启」，没有黑名单。
-3. hint（短）：
-   - Fast：Composer / Grok 目录默认档就是 Fast；选「透传」时网关会下发 `fast=false`，否则客户端没写也会按 Fast 计费。请求里显式指定仍以客户端为准。
-   - Max Mode：Claude / GPT 目录默认档常为 1M；「透传」会下发最小 context。GPT 的 1M 与 Fast 不能共存时 Max Mode 优先。
+3. hint（短）：文案不能出现「透传」二字，否则会被读成「网关不插手」，而第一档恰恰是插手了（下发显式关）。
+   - Fast：「默认关闭」= 客户端没表态时下发 `fast=false`，不是「不管」；省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast）。请求里显式指定仍以客户端为准。
+   - Max Mode：「默认关闭」会下发最小 context 档位（Claude / GPT 目录默认档常为 1M）。Claude Code 用 `anthropic-beta: context-1m` 或 `[1m]` 仍能开。GPT 的 1M 与 Fast 不能共存时 Max Mode 优先。
 
-保存 payload 带四个新字段。`force-selected` 但列表为空时允许保存（≡透传），不要 400。
+保存 payload 带四个新字段。`force-selected` 但列表为空时允许保存（≡ 第一档），不要 400。
 
 ## 5. 实施顺序
 
@@ -200,15 +202,16 @@ maxMode: policyIntent(config.cursorMaxModePolicy, model)
 4. `force-selected` 仅 `composer-2.5`：该模型 true，`claude-opus-4-8` 出站 `fast=false`（默认档虽是 false，断言的是策略 false 而不是「碰巧拷了默认档」）。
 5. 旧库 `cursorFastDefault=on` 启动后策略为 `force-all`；`off` 启动后为 `passthrough`。
 6. GPT `force-all` Fast + `force-all` Max Mode → 仍降 Fast 保 1M（现有冲突测试保留）。
-7. 管理 API 回显四个新字段，不再把 `passthrough` 显示成 `cursorFast: false` 那种「关了其实不管」。
-8. 原「关 Fast 后 `lastInput.fast === undefined`」作废：透传时意图层应是 `false`，并且要断言 **resolved params**，不能只断言 intent。
+7. 管理 API 回显四个新字段，不再把第一档显示成 `cursorFast: false` 那种「关了其实不管」。
+8. 原「关 Fast 后 `lastInput.fast === undefined`」作废：第一档下意图层应是 `false`，并且要断言 **resolved params**，不能只断言 intent。
+9. 关掉一个模型没有的维不记 `dropped`：glm `{maxMode:false,fast:false}` → 空 params 且空 dropped；composer 同组合 → `fast=false` 且空 dropped；composer `maxMode:true` → 仍记 `maxMode=true`。
 
 ## 6. 否决的替代
 
 | 方案 | 否决原因 |
 |---|---|
 | 只把 off 改成 `fast=false`，UI 仍是 checkbox | 满足「一般不用 Fast」，但没有「只给某几个模型强制 Fast」；Max Mode 同理。用户点名要第三档。 |
-| 真三态含「省略参数、让上游默认档生效」 | Composer/Grok 上游默认就是 Fast，等于把 bug 做成一档。 |
+| 第一档做成字面透传「省略参数、让上游默认档生效」 | Composer/Grok 上游默认就是 Fast，等于把 bug 做成一档。**注意这条依赖一个未实测的前提**：不发任何 `model.params` 时 Composer 是否按 Fast 计费。要推翻这一档，先发一条不带任何后缀的 Composer 请求对一下 Cursor 仪表盘。 |
 | 按模型存独立布尔表（每个模型一行 Fast/MaxMode） | 与已有 settings 键模型不一致；目录一抖就出现幽灵行。策略 + id 名单够用。 |
 | 用模型 id 后缀代替后台（人人写 `:slow`） | 客户端（Claude Code）管不了；网关默认必须自己把 false 发出去。 |
 | 改 `CURSOR_MODEL_PARAMS=fast=false` 当全局默认 | 优先级最高，客户端再也开不了 Fast，和「需要提供」相反。 |
@@ -216,8 +219,9 @@ maxMode: policyIntent(config.cursorMaxModePolicy, model)
 
 ## 7. 验收
 
-- 后台 Fast = 透传、Max Mode = 全部强制（迁移后你的现网形状）：Composer 请求日志 Fast 为否且无 `?`；Max Mode 在支持的模型上为是。
+- 后台 Fast = 默认关闭、Max Mode = 全部强制（迁移后你的现网形状）：Composer 请求日志 Fast 为否且无 `?`；Max Mode 在支持的模型上为是。
 - 同一客户端给 Composer 发 `fast: true` 或 `composer-2.5:fast`：该条为 Fast，其它条仍否。
 - 切到「仅下列模型」只勾 Grok：Grok Fast、Composer 否。
 - GPT 同时强制 1M 与 Fast：日志里 Fast 被互斥打成否，dropped 有说明（现行为）。
+- Composer / glm 的稳态请求不再出现 `[model-params] ... dropped: maxMode=false` 这类噪声。
 - 重启进程后策略与勾选名单仍在。

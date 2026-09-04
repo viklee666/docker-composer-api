@@ -17,11 +17,12 @@ export function isModelParamPolicyMode(value: unknown): value is ModelParamPolic
 
 /**
  * 策略在单个模型上解析出的显式取值：
- * passthrough / 未点名 → false；force-all / 点名 → true。
+ * `passthrough`（= 默认关闭）/ 未点名 → false；force-all / 点名 → true。
  *
- * 永远返回布尔而不是 undefined——「透传」的操作定义就是把 fast=false / 最小 context 写出去，
- * 留 undefined 会被 resolveModelParams 当成「没表态」跳过 applyFast，默认档的 fast=true 原样出门。
- * 不支持该参数的模型由 resolveModelParams dropped，这里不必查目录。
+ * 永远返回布尔而不是 undefined：第一档的操作定义是「客户端没表态就显式关」，
+ * 留 undefined 会被 resolveModelParams 当成「没表态」跳过 applyFast，目录默认档原样出门。
+ * 不支持该参数的模型在 resolveModelParams 里是空操作（关掉一个不存在的维不写任何参数、
+ * 也不记 dropped），所以这里不必查目录，保持纯函数。
  */
 export function policyIntent(policy: ModelParamPolicy | undefined, modelId: string): boolean {
   if (policy?.mode === "force-all") return true;

@@ -698,20 +698,20 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                   <div class="setting-field">
                     <label>Fast 策略 <span class="env">CURSOR_FAST</span></label>
                     <select id="fast-policy">
-                      <option value="passthrough">透传客户端（默认不加速）</option>
+                      <option value="passthrough">默认关闭（客户端可覆盖）</option>
                       <option value="force-all">全部支持的模型强制开启</option>
                       <option value="force-selected">仅下列模型强制开启</option>
                     </select>
-                    <div class="hint">Composer / Grok 目录默认档就是 Fast；「透传」时网关下发 fast=false，否则客户端没写也会按 Fast 计费。请求里显式指定仍以客户端为准。</div>
+                    <div class="hint">「默认关闭」= 客户端没表态时网关下发 fast=false，不是「不管」：省略参数会让上游按目录默认档计费（Composer / Grok 的默认档就是 Fast）。请求里显式指定仍以客户端为准。</div>
                   </div>
                   <div class="setting-field">
                     <label>Max Mode 策略 <span class="env">CURSOR_MAX_MODE</span></label>
                     <select id="max-mode-policy">
-                      <option value="passthrough">透传客户端（默认不大上下文）</option>
+                      <option value="passthrough">默认关闭（客户端可覆盖）</option>
                       <option value="force-all">全部支持的模型强制开启</option>
                       <option value="force-selected">仅下列模型强制开启</option>
                     </select>
-                    <div class="hint">Claude / GPT 目录默认档常为 1M；「透传」会下发最小 context。GPT 的 1M 与 Fast 不能共存时 Max Mode 优先。</div>
+                    <div class="hint">「默认关闭」会下发最小 context 档位（Claude / GPT 目录默认档常为 1M，省略参数仍按 1M 计费）。Claude Code 用 anthropic-beta: context-1m 或模型后缀 [1m] 仍能开。GPT 的 1M 与 Fast 不能共存时 Max Mode 优先。</div>
                   </div>
                   <div class="setting-field hidden" id="fast-models-field">
                     <label>强制开启 Fast 的模型</label>
@@ -790,7 +790,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
               <div class="row">
                 <button id="btn-save-settings">保存设置</button>
-                <span class="muted small">Fast / Max Mode 各自三态独立：透传 = 客户端未表态时网关下发显式关（fast=false / 最小 context），因为 Composer / Grok 上游默认档就是 Fast、Claude / GPT 默认档常是 1M，省略参数只会按默认档计费；强制开启只对支持对应参数的模型生效（composer 无 context 档位，Max Mode 会被 dropped）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
+                <span class="muted small">Fast / Max Mode 各自三态独立：默认关闭 = 客户端未表态时网关下发显式关（fast=false / 最小 context），不是「不管」——省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast、Claude / GPT 默认档常是 1M）；强制开启只对支持对应参数的模型生效（composer 没有 context 档位，Max Mode 对它是空操作）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
               </div>
             </div>
           </div>

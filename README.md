@@ -192,9 +192,9 @@ composer-2.5:fast                 # fast 变体
 
 环境变量默认值（客户端未显式指定时生效）：`CURSOR_REASONING_EFFORT`、`CURSOR_MODEL_PARAMS`、`CURSOR_AGENT_MODE`，以及 Fast / Max Mode 的三态策略 `CURSOR_FAST` / `CURSOR_MAX_MODE`（后台「运行设置」可改，落库优先于 env）：
 
-- `passthrough`（默认）：透传客户端——没表态的请求网关下发显式关（`fast=false` / 最小 context）。Composer / Grok 的上游默认档就是 Fast、Claude / GPT 默认档常是 1M，「省略参数让上游默认档生效」等于按 Fast / 1M 计费，所以透传必须显式关；
+- `passthrough`（默认）：默认关闭、客户端可覆盖——没表态的请求网关下发显式关（`fast=false` / 最小 context）。注意这不是字面「不写参数」：省略参数会让上游按目录默认档计费（Composer / Grok 的默认档就是 Fast、Claude / GPT 默认档常是 1M）；
 - `force-all`：全部支持的模型强制开启（旧 `CURSOR_FAST=true` 仍等价于这一档）；
-- `force-selected`：仅 `CURSOR_FAST_MODELS` / `CURSOR_MAX_MODE_MODELS` 名单里的模型强制开启（逗号/换行分隔，存 canonical id，别名也认；空名单等同透传）。
+- `force-selected`：仅 `CURSOR_FAST_MODELS` / `CURSOR_MAX_MODE_MODELS` 名单里的模型强制开启（逗号/换行分隔，存 canonical id，别名也认；名单外的模型与 `passthrough` 同处理，空名单等同 `passthrough`）。
 
 优先级（低 → 高）：网关策略（按当前请求的模型解析）< 请求头 < 请求体语义字段 < 模型 id 后缀 < 显式 `model_params`。`CURSOR_MODEL_PARAMS=fast=true` 这类显式 params 仍能盖过策略。
 

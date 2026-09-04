@@ -2789,6 +2789,22 @@ test("resolveModelParams reports dropped intent for models without matching para
   assert.deepEqual(resolved.dropped, ["reasoningEffort=high", "maxMode=true"]);
 });
 
+test("turning a dimension off on a model that lacks it is a no-op, not a dropped intent", () => {
+  // 默认关闭档给每条请求都带 maxMode=false / fast=false。把这些记成 dropped 会让
+  // glm（两维都没有）和 composer（没有 context）每条请求都刷一行 [model-params] 日志。
+  const glm = resolveModelParams(undefined, { maxMode: false, fast: false }, "glm-4.6");
+  assert.deepEqual(paramsMap(glm.params), {}, "两维都不支持 → 不写任何参数");
+  assert.deepEqual(glm.dropped, [], "关掉一个不存在的维不算意图被丢掉");
+
+  const composer = resolveModelParams(undefined, { maxMode: false, fast: false }, "composer-2.5");
+  assert.deepEqual(paramsMap(composer.params), { fast: "false" });
+  assert.deepEqual(composer.dropped, [], "composer 没有 context 档位，关 Max Mode 是空操作");
+
+  // 反过来，要求「开启」却没落到参数上仍然是真丢了，必须留在 dropped 里供日志排查。
+  const forced = resolveModelParams(undefined, { maxMode: true, fast: false }, "composer-2.5");
+  assert.deepEqual(forced.dropped, ["maxMode=true"]);
+});
+
 test("parseModelSpec supports ACP bracket params plus @/:/# suffixes", () => {
   const bracket = parseModelSpec("claude-opus-4-8[thinking=true,context=1m,effort=xhigh]");
   assert.equal(bracket.model, "claude-opus-4-8");

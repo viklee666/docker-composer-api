@@ -388,11 +388,16 @@ export function resolveModelParams(
   if (intent.reasoningEffort !== undefined && !applyReasoning(result, defs, intent.reasoningEffort)) {
     dropped.push(`reasoningEffort=${intent.reasoningEffort}`);
   }
-  if (intent.maxMode !== undefined && !applyMaxMode(result, defs, intent.maxMode)) {
-    dropped.push(`maxMode=${intent.maxMode}`);
+  // 关掉一个模型根本没有的维是空操作，不算「意图被丢掉」：默认关闭档会给每条请求带上
+  // maxMode=false / fast=false，记成 dropped 只会让 glm（两维都没有）、composer（没有 context）
+  // 每条请求都刷一行日志。要求「开启」却没落到参数上才是真丢了，必须留在 dropped 里。
+  if (intent.maxMode !== undefined) {
+    const applied = applyMaxMode(result, defs, intent.maxMode);
+    if (!applied && intent.maxMode) dropped.push(`maxMode=${intent.maxMode}`);
   }
-  if (intent.fast !== undefined && !applyFast(result, defs, intent.fast)) {
-    dropped.push(`fast=${intent.fast}`);
+  if (intent.fast !== undefined) {
+    const applied = applyFast(result, defs, intent.fast);
+    if (!applied && intent.fast) dropped.push(`fast=${intent.fast}`);
   }
 
   resolveContextFastConflict(result, defs, catalog?.variants, family, intent, dropped);
