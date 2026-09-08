@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Docker-deployable OpenAI and Anthropic compatible API gateway for Cursor Composer.",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "start": "node dist/src/index.js"
