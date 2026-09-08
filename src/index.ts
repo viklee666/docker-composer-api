@@ -24,7 +24,6 @@ import {
   loadRequestLogKeep,
   loadRequestTimeoutMs,
   loadRoutingStrategy,
-  loadSandClientMode,
   loadSessionAffinity,
   loadSessionAffinityTtlMs,
   loadSystemPromptSettings
@@ -35,14 +34,6 @@ import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
 import { applyProxyConfig } from "./proxy.js";
 import { closeAppThenDrainUsage, UsageReconciler } from "./usage-reconciler.js";
-import {
-  installSandClientHeaderHook,
-  isSandClientHookPatched,
-  resolveCursorClientType,
-  runWithCursorClientType,
-  setGlobalCursorClientType,
-  waitForSandClientHook
-} from "./sand-client.js";
 import {
   applyCursorSdkNetworkConfig,
   loadCursorSdkUseHttp1ForAgent,
@@ -56,9 +47,6 @@ import { ProviderRoutingRunner } from "./cursor-connect/routing-runner.js";
 import { CursorConnectService, connectSettings, seedConnectCredential } from "./cursor-connect/service.js";
 import { CursorConnectStore } from "./cursor-connect/store.js";
 
-// 必须在任何 import("@cursor/sdk") 之前挂上 loader，否则硬编码的 client-type 头无法按请求改写。
-installSandClientHeaderHook();
-
 // Cursor SDK 在云端流以 end-stream error 收场时，底层 ConnectError 可能以 unhandledRejection 形式逃逸
 //（官方已确认的 SDK 行为）。兜底记录并截断，避免拖垮进程或在未来 Node 版本触发非零退出；不打印完整堆栈以免泄露敏感上下文。
 process.on("unhandledRejection", (reason) => {
@@ -68,10 +56,6 @@ process.on("unhandledRejection", (reason) => {
 
 const config = loadConfig();
 const store = new SqliteStateStore(config.sqlitePath, { requestLogKeep: config.requestLogKeep });
-// Sand 总开关必须在任何 @cursor/sdk import 之前落到 __cursorClientType。
-// HTTP/1 配置会动态 import SDK，不能放在 setGlobal 前面。
-config.sandClientMode = await loadSandClientMode(store, config.sandClientMode);
-setGlobalCursorClientType(config.sandClientMode ? "sand" : "sdk");
 
 /*
  * 代理必须在第一次 import("@cursor/sdk") 之前装好。
@@ -203,8 +187,7 @@ const sdkRunner = new CursorSdkRunner(store, {
 });
 const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
   resolveMaxKeyAttempts: () => config.maxKeyAttempts,
-  resolveMaxTransientAttempts: () => config.maxTransientAttempts,
-  resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
+  resolveMaxTransientAttempts: () => config.maxTransientAttempts
 });
 
 /*
@@ -282,7 +265,6 @@ if (config.cursorSdkDisableSessionResume && !sessionMode.stored) {
   console.log("Cursor SDK session mode: stateless (create+full prompt+cancel+dispose; same as kill switch)");
 }
 if (config.cursorSdkUseHttp1ForAgent) console.log("Cursor SDK local agent HTTP/1.1 mode enabled");
-if (config.sandClientMode) console.log("Cursor Sand channel enabled globally (per-key overrides still apply)");
 console.log(
   `Key routing: ${config.routingStrategy}` +
   (config.sessionAffinity ? `, session affinity on (ttl ${Math.round(config.sessionAffinityTtlMs / 1000)}s)` : ", session affinity off")
@@ -303,10 +285,7 @@ if (config.systemPromptMode !== "off" && config.systemPrompt) {
 void (async () => {
   try {
     await import("@cursor/sdk");
-    const hooked = await waitForSandClientHook();
-    console.log(hooked || isSandClientHookPatched()
-      ? "Cursor SDK preloaded (client-type hook applied)"
-      : "Cursor SDK preloaded (client-type hook not confirmed; Sand requests will fail closed)");
+    console.log("Cursor SDK preloaded");
     // 原生工作区扫描在部分宿主会以 access violation 打挂进程，而这是 try/catch 抓不到的，
     // 所以这里必须能整块跳过；跳过只是让首请求多花一次冷启动，功能不受影响。
     if (!config.cursorPrewarm) {
@@ -316,8 +295,7 @@ void (async () => {
     const poolKey = (await keyPool.list()).find((key) => key.status === "active");
     if (!poolKey) return;
     // 预扫描工作区（规则/忽略文件等），让首个 send() 少一段准备时间。
-    const clientType = resolveCursorClientType(poolKey.clientType, config.sandClientMode ? "sand" : "sdk");
-    await runWithCursorClientType(clientType, () => executorLeases.warm(poolKey.apiKey, config.cursorWorkingDirectory));
+    await executorLeases.warm(poolKey.apiKey, config.cursorWorkingDirectory);
     console.log("Cursor workspace prewarmed");
   } catch (error) {
     console.error(`[prewarm] Cursor SDK preload failed (first request will lazy-load): ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);

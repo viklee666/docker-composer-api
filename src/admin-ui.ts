@@ -249,7 +249,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           <span class="chip" id="chip-session">会话：-</span>
           <span class="chip" id="chip-http1">HTTP：-</span>
           <span class="chip" id="chip-autodisable">自动禁用：-</span>
-          <span class="chip" id="chip-sand">通道：-</span>
         </div>
         <div class="spacer"></div>
         <label class="toggle"><input type="checkbox" id="auto-refresh" checked> 10s 自动刷新</label>
@@ -301,11 +300,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               <div class="row" style="margin-bottom:14px">
                 <input id="new-key" placeholder="粘贴 Cursor API Key（crsr_...）" style="flex:2;min-width:220px" autocomplete="off">
                 <input id="new-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
-                <select id="new-channel" style="min-width:120px" title="该 key 的 Cursor 通道">
-                  <option value="inherit">跟随全局</option>
-                  <option value="sdk">强制 SDK</option>
-                  <option value="sand">强制 Sand</option>
-                </select>
                 <input id="new-weight" class="weight-input" type="number" min="1" max="1000000" step="1" value="1" title="权重，仅 round-robin 生效" style="width:88px">
                 <button class="primary" id="btn-add-key">添加 Key</button>
               </div>
@@ -316,7 +310,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               <div class="table-scroll">
                 <table>
                   <thead><tr>
-                    <th>优先级</th><th>备注</th><th>掩码 key</th><th>状态</th><th>通道</th><th>可用模型范围</th><th>权重</th><th>请求数</th><th>失败数</th><th>最后使用</th><th>最后错误</th><th>操作</th>
+                    <th>优先级</th><th>备注</th><th>掩码 key</th><th>状态</th><th>可用模型范围</th><th>权重</th><th>请求数</th><th>失败数</th><th>最后使用</th><th>最后错误</th><th>操作</th>
                   </tr></thead>
                   <tbody id="keys-body"></tbody>
                 </table>
@@ -771,13 +765,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
               <div class="row" style="margin-bottom:10px">
                 <label class="toggle" style="font-size:13px;color:var(--text)">
-                  <input type="checkbox" id="sand-mode-toggle">
-                  全局默认走 Sand 通道（x-cursor-client-type: sand）
-                </label>
-                <span class="muted small" id="sand-hook-hint"></span>
-              </div>
-              <div class="row" style="margin-bottom:10px">
-                <label class="toggle" style="font-size:13px;color:var(--text)">
                   <input type="checkbox" id="auto-disable-toggle">
                   额度不足 / key 失效时自动禁用 key
                 </label>
@@ -790,7 +777,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
               <div class="row">
                 <button id="btn-save-settings">保存设置</button>
-                <span class="muted small">Fast / Max Mode 各自三态独立：默认关闭 = 客户端未表态时网关下发显式关（fast=false / 最小 context），不是「不管」——省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast、Claude / GPT 默认档常是 1M）；强制开启只对支持对应参数的模型生效（composer 没有 context 档位，Max Mode 对它是空操作）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。Sand 通道只改 client-type 头，走 Grok Bot 额度，不解除账号级限制（发票 / hard limit / Grok 额度）。总开关作用于所有「跟随全局」的 key；单个 key 可强制 SDK 或 Sand。</span>
+                <span class="muted small">Fast / Max Mode 各自三态独立：默认关闭 = 客户端未表态时网关下发显式关（fast=false / 最小 context），不是「不管」——省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast、Claude / GPT 默认档常是 1M）；强制开启只对支持对应参数的模型生效（composer 没有 context 档位，Max Mode 对它是空操作）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。</span>
               </div>
             </div>
           </div>
@@ -843,7 +830,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   var modelCatalog = [];
   var connectCatalog = [];
   var autoDisableThreshold = 1;
-  var sandClientMode = false;
   var gwPoolEnabled = false;
   var revealedGwKey = '';
   var currentSection = 'dashboard';
@@ -1336,11 +1322,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     autoDisableThreshold = cfg.autoDisableThreshold || 1;
     $('auto-disable-toggle').checked = !!cfg.autoDisableKeys;
     $('auto-disable-threshold').value = autoDisableThreshold;
-    sandClientMode = !!cfg.sandClientMode;
-    $('sand-mode-toggle').checked = sandClientMode;
-    $('sand-hook-hint').textContent = sandClientMode && cfg.sandClientHookPatched === false
-      ? '（SDK 尚未加载或注入未生效，重启后看启动日志）'
-      : (cfg.sandClientHookPatched === true ? '（Sand hook 已生效）' : '');
     $('session-mode').value = cfg.cursorSdkSessionMode === 'stateless' ? 'stateless' : 'durable';
     $('tool-hold-ttl').value = cfg.cursorSdkToolHoldTtlMs || 900000;
     $('session-idle-ttl').value = cfg.cursorSdkSessionIdleTtlMs || 3600000;
@@ -1401,8 +1382,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('chip-http1').textContent = 'HTTP：' + (cfg.cursorSdkUseHttp1ForAgent ? '1.1' : '默认');
     $('chip-autodisable').textContent = '自动禁用：'
       + (cfg.autoDisableKeys ? '连续失败 ' + (cfg.autoDisableThreshold || 1) + ' 次' : '已关闭');
-    sandClientMode = !!cfg.sandClientMode;
-    $('chip-sand').textContent = '通道：' + (sandClientMode ? 'Sand' : 'SDK');
     applySettingsForm(cfg);
     applyRoutingForm(cfg);
     applySysForm(cfg);
@@ -1449,7 +1428,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     html += cfgItem('代理', proxy.enabled
       ? ((proxy.scheme || '') + ' ' + (proxy.url || '') + (proxy.modelTrafficProxied ? ' · 模型流量已走代理' : ' · 模型流量仍直连'))
       : '未启用');
-    html += cfgItem('通道', sandClientMode ? 'Sand' : 'SDK');
     html += cfgItem('自动禁用', cfg.autoDisableKeys ? '连续失败 ' + (cfg.autoDisableThreshold || 1) + ' 次' : '已关闭');
     $('cfg-summary').innerHTML = html;
 
@@ -1487,26 +1465,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     return '<div class="config-item"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div></div>';
   }
 
-  function channelLabel(value){
-    if (value === 'sand') return 'Sand';
-    if (value === 'sdk') return 'SDK';
-    return '跟随全局';
-  }
-  function resolvedChannel(key){
-    if (key.clientType === 'sand' || key.clientType === 'sdk') return key.clientType;
-    return sandClientMode ? 'sand' : 'sdk';
-  }
-  function channelSelect(key){
-    var current = key.clientType === 'sand' || key.clientType === 'sdk' ? key.clientType : 'inherit';
-    var html = '<select data-action="channel" data-id="' + esc(key.id) + '" title="该 key 的 Cursor 通道" style="padding:4px 8px;font-size:12px">';
-    [['inherit','跟随全局'],['sdk','强制 SDK'],['sand','强制 Sand']].forEach(function(item){
-      html += '<option value="' + item[0] + '"' + (current === item[0] ? ' selected' : '') + '>' + item[1] + '</option>';
-    });
-    html += '</select>';
-    var resolved = resolvedChannel(key);
-    html += ' <span class="badge ' + resolved + '">' + (resolved === 'sand' ? 'Sand' : 'SDK') + '</span>';
-    return html;
-  }
   function scopeSummary(scope){
     var a = (scope && scope.allowed) || [];
     var e = (scope && scope.excluded) || [];
@@ -1587,7 +1545,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '<td>' + esc(key.label) + '</td>'
         + '<td class="mono">' + esc(key.maskedKey) + '</td>'
         + '<td><span class="badge ' + esc(key.status) + '">' + (key.status === 'active' ? '可用' : '已禁用') + '</span></td>'
-        + '<td>' + channelSelect(key) + '</td>'
         + '<td>' + scopeSummary(key.modelScope) + '</td>'
         + '<td><input class="weight-input" type="number" min="1" max="1000000" step="1" data-action="weight" data-id="' + esc(key.id) + '" value="' + esc(key.weight || 1) + '" title="仅 round-robin 生效"></td>'
         + '<td>' + fmtNum(key.requestCount) + '</td>'
@@ -2314,7 +2271,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var body = {
       key: key,
       label: label || undefined,
-      clientType: $('new-channel').value || 'inherit',
       weight: weight
     };
     if (allowed.length) body.allowed = allowed;
@@ -2322,7 +2278,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     api('POST', '/admin/api/keys', body).then(function(){
       $('new-key').value = '';
       $('new-label').value = '';
-      $('new-channel').value = 'inherit';
       $('new-weight').value = '1';
       $('new-allowed').value = '';
       $('new-excluded').value = '';
@@ -2476,7 +2431,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       cursorMaxModeModels: collectPolicyModels('max-mode'),
       autoDisableKeys: $('auto-disable-toggle').checked,
       autoDisableThreshold: threshold,
-      sandClientMode: $('sand-mode-toggle').checked,
       cursorSdkSessionMode: $('session-mode').value,
       cursorSdkToolHoldTtlMs: hold,
       cursorSdkSessionIdleTtlMs: idle,
@@ -2517,20 +2471,6 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   });
 
   $('keys-body').addEventListener('change', function(event){
-    var select = event.target.closest('select[data-action="channel"]');
-    if (select) {
-      var id = select.getAttribute('data-id');
-      var clientType = select.value;
-      select.disabled = true;
-      api('POST', '/admin/api/keys/' + id + '/channel', { clientType: clientType }).then(function(){
-        toast('已切换为' + channelLabel(clientType));
-        loadAll();
-      }).catch(function(err){
-        if (err.message !== 'unauthorized') toast('切换通道失败：' + err.message, true);
-        loadAll();
-      }).finally(function(){ select.disabled = false; });
-      return;
-    }
     var weight = event.target.closest('input[data-action="weight"]');
     if (weight) {
       var n = parseInt(weight.value, 10);

@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import { filterModelsByScope, staticCanonicalModel } from "./routing.js";
-import { getCurrentCursorClientType, runWithCursorClientType } from "./sand-client.js";
 import type {
-  CursorClientType,
   GatewayModel,
   ModelParameterDefinition,
   ModelScope,
@@ -49,8 +47,7 @@ const failureAt = new Map<string, number>();
 let lastForcedRefreshAt = 0;
 
 function cacheBucket(apiKey: string): string {
-  // Sand / SDK 通道可见模型可能不同，按通道分桶避免串名单。
-  return createHash("sha256").update(`${apiKey}\0${getCurrentCursorClientType()}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
 }
 
 function setCache(bucket: string, entry: { models: ModelEntry[]; at: number }): void {
@@ -98,7 +95,7 @@ export async function listAvailableModels(apiKey?: string, forceRefresh = false)
     const cursor = sdk.Cursor as
       | { models?: { list?: (options: { apiKey: string }) => Promise<unknown> } }
       | undefined;
-    const listed = await runWithCursorClientType(getCurrentCursorClientType(), () => cursor?.models?.list?.({ apiKey }));
+    const listed = await cursor?.models?.list?.({ apiKey });
     const models = parseSdkModels(listed);
     if (models.length) {
       setCache(bucket, { models, at: Date.now() });
@@ -179,10 +176,9 @@ export function findModelEntry(models: ModelEntry[], modelId: string): ModelEntr
     model.id.toLowerCase() === target || model.aliases.some((alias) => alias.toLowerCase() === target));
 }
 
-/** 查一份目录要用哪把 key、走哪条通道。目录按 (apiKey, 通道) 分桶缓存，两者必须一起决定。 */
+/** 查一份目录要用哪把 key。目录按 apiKey 分桶缓存。 */
 export interface CatalogueLookup {
   apiKey?: string;
-  clientType: CursorClientType;
 }
 
 export interface CatalogueResolution {
@@ -228,10 +224,10 @@ export async function findModelAcrossCatalogues(
   return { entry: merged, confirmed: Boolean(merged) && complete };
 }
 
-/** 单把 key 的目录查询：失败一律吞掉。runWithCursorClientType 是同步转发，所以要用 try 而不是 .catch。 */
+/** 单把 key 的目录查询：失败一律吞掉。 */
 async function listOneCatalogue(lister: ModelLister, lookup: CatalogueLookup): Promise<ModelListResult | undefined> {
   try {
-    return await runWithCursorClientType(lookup.clientType, () => lister(lookup.apiKey));
+    return await lister(lookup.apiKey);
   } catch {
     return undefined;
   }

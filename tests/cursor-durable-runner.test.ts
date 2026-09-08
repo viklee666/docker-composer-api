@@ -57,7 +57,6 @@ const gatewayConfig: GatewayConfig = {
   maxTransientAttempts: 3,
   autoDisableKeys: true,
   autoDisableThreshold: 2,
-  sandClientMode: false,
   routingStrategy: "fill-first",
   sessionAffinity: false,
   sessionAffinityTtlMs: 60 * 60 * 1000,

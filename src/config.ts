@@ -55,7 +55,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     cursorFastPolicy: parseModelParamPolicyEnv(env.CURSOR_FAST, env.CURSOR_FAST_MODELS),
     cursorModelParams: parseModelParamsSpec(env.CURSOR_MODEL_PARAMS),
     cursorAgentMode: optionalAgentMode(env.CURSOR_AGENT_MODE),
-    sandClientMode: booleanValue(env.SAND_CLIENT_MODE, false),
     // 默认 fill-first：Cursor 按 key 缓存 prompt，轮询换 key 会丢缓存并放大计费，因此轮询要显式开启。
     routingStrategy: parseRoutingStrategy(env.ROUTING_STRATEGY),
     sessionAffinity: booleanValue(env.SESSION_AFFINITY, true),

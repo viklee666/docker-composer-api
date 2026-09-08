@@ -42,7 +42,7 @@ const SESSION_TOKEN_PATTERN = /^user_[A-Za-z0-9_-]+::.+$/;
 /** 默认名的随机后缀取 6 字节（48 bit）：批量铸钥也撞不上，展开成 12 位十六进制后总长仍远小于 MAX_NAME_LENGTH。 */
 const DEFAULT_NAME_RANDOM_BYTES = 6;
 /**
- * 实测铸出来的 key 前缀是 `crsr_`（`docs/sand-rollout-guide.md` 的真账号记录），
+ * 实测铸出来的 key 前缀是 `crsr_`（Grok Bot 上游真账号记录），
  * 而后台占位符长期写的是 `key_`。两个都放行而不是死磕一个：白名单足以挡住「上游换了响应结构」，
  * 又不至于因为占位符所述格式真的出现就把一把好 key 拒之门外。
  */

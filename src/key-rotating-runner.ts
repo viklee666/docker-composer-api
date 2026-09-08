@@ -2,9 +2,7 @@ import { ApiError } from "./errors.js";
 import { classifyKeyFailure, CursorKeyPool, errorMessage } from "./key-pool.js";
 import type { NoKeyReason, RoutingPolicy } from "./key-pool.js";
 import { denyRuleUnverifiable, identityAllowed, modelIdentity, sessionBindingHash } from "./routing.js";
-import { getGlobalCursorClientType, resolveCursorClientType } from "./sand-client.js";
 import type {
-  CursorClientType,
   CursorRunRequest,
   CursorRunResult,
   CursorRunner,
@@ -29,8 +27,6 @@ export interface KeyRotatingOptions {
   /** 运行期从 config 读上限，后台改完不用重建 runner。 */
   resolveMaxKeyAttempts?: () => number;
   resolveMaxTransientAttempts?: () => number;
-  /** 全局通道；未提供时读模块级总开关。测试里应绑到 config，避免并行用例互相污染。 */
-  resolveGlobalClientType?: () => CursorClientType;
   /** 取用策略；未提供时读 key 池自己的策略（选 key 本来就以池上的策略为准）。 */
   resolveRoutingPolicy?: () => RoutingPolicy;
 }
@@ -47,7 +43,6 @@ export interface KeyRotatingOptions {
 export class KeyRotatingRunner implements CursorRunner {
   private readonly resolveMaxKeyAttempts: () => number;
   private readonly resolveMaxTransientAttempts: () => number;
-  private readonly resolveGlobalClientType?: () => CursorClientType;
   private readonly resolveRoutingPolicy?: () => RoutingPolicy;
 
   constructor(
@@ -59,7 +54,6 @@ export class KeyRotatingRunner implements CursorRunner {
     const maxTransientAttempts = positiveIntOr(options.maxTransientAttempts, DEFAULT_MAX_TRANSIENT_ATTEMPTS);
     this.resolveMaxKeyAttempts = options.resolveMaxKeyAttempts ?? (() => maxKeyAttempts);
     this.resolveMaxTransientAttempts = options.resolveMaxTransientAttempts ?? (() => maxTransientAttempts);
-    this.resolveGlobalClientType = options.resolveGlobalClientType;
     this.resolveRoutingPolicy = options.resolveRoutingPolicy;
   }
 
@@ -69,10 +63,6 @@ export class KeyRotatingRunner implements CursorRunner {
 
   private maxTransientAttempts(): number {
     return positiveIntOr(this.resolveMaxTransientAttempts(), DEFAULT_MAX_TRANSIENT_ATTEMPTS);
-  }
-
-  private globalClientType(): CursorClientType {
-    return this.resolveGlobalClientType?.() ?? getGlobalCursorClientType();
   }
 
   private routingPolicy(): RoutingPolicy {
@@ -110,8 +100,7 @@ export class KeyRotatingRunner implements CursorRunner {
       if (record && denyRuleUnverifiable(runIdentity(input), record.modelScope)) {
         throw noKeyError("model-unverified", input.model);
       }
-      const clientType = input.clientType ?? resolveCursorClientType(record?.clientType, this.globalClientType());
-      yield* this.inner.stream({ ...input, clientType }, signal);
+      yield* this.inner.stream(input, signal);
       return;
     }
 
@@ -159,7 +148,6 @@ export class KeyRotatingRunner implements CursorRunner {
         input.keyUsageRef.keyLabel = key.label;
       }
       await this.pool.recordUse(key.id);
-      const clientType = resolveCursorClientType(key.clientType, this.globalClientType());
 
       let emitted = false;
       // 非流式：整段缓冲到本次尝试成功结束后再放行——失败尝试的任何事件（含 thinking）都不会
@@ -167,7 +155,7 @@ export class KeyRotatingRunner implements CursorRunner {
       const buffering = !input.stream;
       const buffered: CursorStreamEvent[] = [];
       try {
-        for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey, clientType }, signal)) {
+        for await (const event of this.inner.stream({ ...input, apiKey: key.apiKey }, signal)) {
           if (buffering) {
             buffered.push(event);
             continue;

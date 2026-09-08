@@ -11,7 +11,6 @@ import {
   NO_KEY_SENTINEL
 } from "./routing.js";
 import type {
-  CursorClientTypeSetting,
   CursorKeyRecord,
   ModelIdentity,
   ModelScope,
@@ -157,7 +156,6 @@ export class CursorKeyPool {
         sortOrder: await this.nextSortOrder(),
         requestCount: 0,
         failureCount: 0,
-        clientType: "inherit",
         modelScope: emptyScope(),
         weight: 1,
         createdAt: new Date().toISOString()
@@ -318,7 +316,6 @@ export class CursorKeyPool {
   async add(
     apiKey: string,
     label?: string,
-    clientType: CursorClientTypeSetting = "inherit",
     options: AddKeyOptions = {}
   ): Promise<CursorKeyRecord> {
     const trimmed = apiKey.trim();
@@ -334,7 +331,6 @@ export class CursorKeyPool {
       sortOrder: await this.nextSortOrder(),
       requestCount: 0,
       failureCount: 0,
-      clientType,
       modelScope: {
         allowed: normalizeModelList(options.modelScope?.allowed),
         excluded: normalizeModelList(options.modelScope?.excluded)
@@ -348,10 +344,6 @@ export class CursorKeyPool {
 
   async getByValue(apiKey: string): Promise<CursorKeyRecord | undefined> {
     return this.store.getCursorKeyByValue(apiKey);
-  }
-
-  async setClientType(id: string, clientType: CursorClientTypeSetting): Promise<boolean> {
-    return this.store.updateCursorKey(id, { clientType });
   }
 
   /** 按给定 id 序列调整取用顺序；id 必须全部存在于池中。 */

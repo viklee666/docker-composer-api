@@ -571,7 +571,6 @@ function makeKey(overrides: Partial<CursorKeyRecord> & { id: string }): CursorKe
     sortOrder: 1,
     requestCount: 0,
     failureCount: 0,
-    clientType: "inherit",
     modelScope: { allowed: [], excluded: [] },
     weight: 1,
     createdAt: new Date().toISOString(),

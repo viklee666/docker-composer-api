@@ -33,7 +33,6 @@ import type { CursorKeyPool } from "./key-pool.js";
 import { policyIntent } from "./model-param-policy.js";
 import { errorMessage } from "./key-pool.js";
 import type { UsageReconciler } from "./usage-reconciler.js";
-import { resolveCursorClientType, runWithCursorClientType } from "./sand-client.js";
 import { effectiveIntentFromParams, mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-params.js";
 import {
   applyModelScope,
@@ -81,7 +80,6 @@ import { sse, sseDone } from "./sse.js";
 import type {
   AgentMode,
   AuthContext,
-  CursorClientType,
   CursorKeyRecord,
   CursorRunRequest,
   CursorRunResult,
@@ -435,7 +433,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
  */
 async function listModels(deps: AppDeps, request: Parameters<typeof authenticate>[0]): ReturnType<ModelLister> {
   const lister = deps.modelLister ?? listAvailableModels;
-  let source: CatalogueLookup = { clientType: deps.config.sandClientMode ? "sand" : "sdk" };
+  let source: CatalogueLookup = {};
   let auth: AuthContext | undefined;
   const token = extractToken(request);
   if (token) {
@@ -447,7 +445,7 @@ async function listModels(deps: AppDeps, request: Parameters<typeof authenticate
     try {
       auth = authFor(deps, request);
     } catch {
-      source = { clientType: source.clientType };
+      source = {};
     }
     if (auth?.mode === "direct" && auth.apiKey) {
       const record = await deps.keyPool.getByValue(auth.apiKey);
@@ -459,11 +457,11 @@ async function listModels(deps: AppDeps, request: Parameters<typeof authenticate
       try {
         source = await catalogueSource(deps, auth);
       } catch {
-        source = { clientType: source.clientType };
+        source = {};
       }
     }
   }
-  const listed = await runWithCursorClientType(source.clientType, () => lister(source.apiKey));
+  const listed = await lister(source.apiKey);
   return withConnectModels(deps, await filterListedModels(deps, listed, auth), auth);
 }
 
@@ -530,21 +528,19 @@ function sdkModelAsConnect(model: ModelEntry): ModelEntry | undefined {
  * 借用走 pickActive，它刻意不推进轮询游标：读目录是旁路动作，不该改变下一次执行选中哪把 key。
  */
 async function catalogueSource(deps: AppDeps, auth: AuthContext): Promise<CatalogueLookup> {
-  const fallback: CursorClientType = deps.config.sandClientMode ? "sand" : "sdk";
   if (auth.mode === "direct") {
     const record = auth.apiKey ? await deps.keyPool.getByValue(auth.apiKey) : undefined;
     // 未登记的直传 token 没有任何值得向上游证明的身份；把它原样交给 models.list
     // 会让发现端点变成调用方驱动的上游探测器。未登记时只允许无 key 的缓存/兜底路径。
     return {
-      ...(record?.status === "active" ? { apiKey: record.apiKey } : {}),
-      clientType: resolveCursorClientType(record?.clientType, fallback)
+      ...(record?.status === "active" ? { apiKey: record.apiKey } : {})
     };
   }
   const key = await deps.keyPool.pickActive(
     new Set(),
     auth.allowedCursorKeyIds?.length ? { allowedKeyIds: auth.allowedCursorKeyIds } : undefined
   );
-  return { apiKey: key?.apiKey, clientType: resolveCursorClientType(key?.clientType, fallback) };
+  return { ...(key ? { apiKey: key.apiKey } : {}) };
 }
 
 /**
@@ -670,18 +666,17 @@ async function catalogueLookups(
   auth: AuthContext,
   registered: CursorKeyRecord | undefined
 ): Promise<CatalogueLookup[]> {
-  const fallback: CursorClientType = deps.config.sandClientMode ? "sand" : "sdk";
   if (auth.mode === "direct") {
     // 未登记的直传 token 一律不查目录：这条路上身份没人用（direct 不选 key，也没有网关范围），
     // 而拿调用方随手给的 token 去查目录，等于让任何人都能撬动一次上游调用，
     // 顺带把按 key 分桶的目录缓存冲成一次性的。
     return registered?.status === "active"
-      ? [{ apiKey: registered.apiKey, clientType: resolveCursorClientType(registered.clientType, fallback) }]
+      ? [{ apiKey: registered.apiKey }]
       : [];
   }
   return (await deps.keyPool.list())
     .filter((key) => key.status === "active")
-    .map((key) => ({ apiKey: key.apiKey, clientType: resolveCursorClientType(key.clientType, fallback) }));
+    .map((key) => ({ apiKey: key.apiKey }));
 }
 
 /**

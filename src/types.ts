@@ -70,11 +70,6 @@ export interface GatewayConfig {
   cursorModelParams?: ModelParameterValue[];
   /** 默认 Cursor 会话模式 agent/plan（env: CURSOR_AGENT_MODE）。 */
   cursorAgentMode?: AgentMode;
-  /**
-   * 全局 Sand 通道：把发给 Cursor 的 x-cursor-client-type 从 sdk 改成 sand。
-   * 单个 key 可覆盖（inherit / sdk / sand）。env: SAND_CLIENT_MODE，后台可改。
-   */
-  sandClientMode: boolean;
   /** key 取用策略：fill-first（默认，吃满第一个 key 以命中 Cursor 缓存）或 round-robin。 */
   routingStrategy: RoutingStrategy;
   /** 会话粘性：同一会话固定复用上次成功的 key，保住上游缓存。env: SESSION_AFFINITY，后台可改。 */
@@ -188,9 +183,6 @@ export interface ModelIdentity {
 
 /** 实际发给 Cursor 的 x-cursor-client-type。 */
 export type CursorClientType = "sdk" | "sand";
-
-/** key 级通道：跟随全局总开关，或强制 sdk / sand。 */
-export type CursorClientTypeSetting = "inherit" | CursorClientType;
 
 export type AgentMode = "agent" | "plan";
 
@@ -409,8 +401,6 @@ export interface CursorRunRequest {
   modelParams?: ModelParameterValue[];
   /** Cursor 会话模式 agent/plan。 */
   mode?: AgentMode;
-  /** 本次请求解析后的 Cursor client-type（sdk / sand）。由 KeyRotatingRunner 按 key 设置写入。 */
-  clientType?: CursorClientType;
   /**
    * 本次请求走哪条 provider。由 server 在建请求时按 header / 模型前缀 / key 设置选定，
    * 交给 ProviderRoutingRunner 分发。缺省即 SDK 路线，行为与改造前一致。
@@ -494,8 +484,6 @@ export interface CursorKeyRecord {
   requestCount: number;
   /** 连续失败次数（成功或人工启用即归零），达到自动禁用阈值才会被禁用。 */
   failureCount: number;
-  /** 该 key 的通道：跟随全局 / 强制 SDK / 强制 Sand。 */
-  clientType: CursorClientTypeSetting;
   /** 该 key 允许 / 禁止服务的模型；空表示不限制。黑名单优先于白名单。 */
   modelScope: ModelScope;
   /** round-robin 的加权份额，越大越常被选中。fill-first 策略下不生效。 */
@@ -514,7 +502,6 @@ export interface CursorKeyPatch {
   failureCount?: number;
   incrementRequestCount?: boolean;
   incrementFailureCount?: boolean;
-  clientType?: CursorClientTypeSetting;
   modelScope?: ModelScope;
   weight?: number;
 }

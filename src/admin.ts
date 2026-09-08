@@ -34,12 +34,10 @@ import {
   saveRequestLogKeep,
   saveRequestTimeoutMs,
   saveRoutingStrategy,
-  saveSandClientMode,
   saveSessionAffinity,
   saveSessionAffinityTtlMs,
   saveSystemPromptSettings
 } from "./gateway-settings.js";
-import { isSandClientHookPatched, parseCursorClientTypeSetting, resolveCursorClientType, runWithCursorClientType, setGlobalCursorClientType } from "./sand-client.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel, type ModelListResult, type ModelLister } from "./models.js";
 import { applyProxyConfig, parseProxyUrl, proxyStatus, testProxy } from "./proxy.js";
@@ -128,8 +126,6 @@ function publicRuntimeConfig(
     cursorMaxModeModels: deps.config.cursorMaxModePolicy?.models ?? [],
     autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
     autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
-    sandClientMode: deps.config.sandClientMode === true,
-    sandClientHookPatched: isSandClientHookPatched(),
     gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey),
     routingStrategy: routing.strategy,
     sessionAffinity: routing.sessionAffinity,
@@ -160,10 +156,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const keys = await deps.keyPool.list();
     const requests = await deps.store.requestLogStats();
     const poolKey = keys.find((key) => key.status === "active");
-    const modelList = await runWithCursorClientType(
-      resolveCursorClientType(poolKey?.clientType, deps.config.sandClientMode ? "sand" : "sdk"),
-      () => (deps.modelLister ?? listAvailableModels)(poolKey?.apiKey)
-    );
+    const modelList = await (deps.modelLister ?? listAvailableModels)(poolKey?.apiKey);
     const http1 = await loadCursorSdkUseHttp1ForAgent(deps.store, {
       proxyConfigured: Boolean(deps.config.proxyUrl),
       fallback: deps.config.cursorSdkUseHttp1ForAgent
@@ -303,16 +296,6 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       deps.config.autoDisableThreshold = threshold;
       deps.keyPool.setAutoDisablePolicy({ threshold });
       await saveAutoDisableThreshold(deps.store, threshold);
-      touched = true;
-    }
-
-    if (body.sandClientMode !== undefined) {
-      if (typeof body.sandClientMode !== "boolean") {
-        throw new ApiError("sandClientMode must be a boolean.", 400, "invalid_request_error", "sandClientMode");
-      }
-      await saveSandClientMode(deps.store, body.sandClientMode);
-      deps.config.sandClientMode = body.sandClientMode;
-      setGlobalCursorClientType(body.sandClientMode ? "sand" : "sdk");
       touched = true;
     }
 
@@ -759,14 +742,10 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const body = objectBody(request.body);
     const key = typeof body.key === "string" ? body.key : "";
     const label = typeof body.label === "string" ? body.label : undefined;
-    const clientType = body.clientType === undefined ? "inherit" : parseCursorClientTypeSetting(body.clientType);
-    if (!clientType) {
-      throw new ApiError("clientType must be inherit, sdk, or sand.", 400, "invalid_request_error", "clientType");
-    }
     const allowed = optionalStringArray(body.allowed, "allowed");
     const excluded = optionalStringArray(body.excluded, "excluded");
     const weight = body.weight === undefined ? undefined : parseWeight(body.weight);
-    const record = await deps.keyPool.add(key, label, clientType, {
+    const record = await deps.keyPool.add(key, label, {
       ...(allowed !== undefined || excluded !== undefined
         ? { modelScope: { allowed: allowed ?? [], excluded: excluded ?? [] } }
         : {}),
@@ -783,15 +762,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     requireAdmin(request, deps);
     const body = objectBody(request.body);
     const sessionToken = typeof body.sessionToken === "string" ? body.sessionToken : "";
-    const clientType = body.clientType === undefined ? "inherit" : parseCursorClientTypeSetting(body.clientType);
-    if (!clientType) {
-      throw new ApiError("clientType must be inherit, sdk, or sand.", 400, "invalid_request_error", "clientType");
-    }
     const minted = await createCursorApiKey({
       sessionToken,
       name: body.name as string | undefined
     });
-    const record = await deps.keyPool.add(minted.apiKey, minted.name, clientType);
+    const record = await deps.keyPool.add(minted.apiKey, minted.name);
     return { ok: true, key: publicKey(record), name: minted.name };
   });
 
@@ -816,19 +791,6 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const ok = await deps.keyPool.disable(keyId(request), "manual");
     if (!ok) throw new ApiError("Key not found.", 404, "not_found");
     return { ok: true };
-  });
-
-  app.post("/admin/api/keys/:id/channel", async (request) => {
-    requireAdmin(request, deps);
-    const body = objectBody(request.body);
-    const clientType = parseCursorClientTypeSetting(body.clientType);
-    if (!clientType) {
-      throw new ApiError("clientType must be inherit, sdk, or sand.", 400, "invalid_request_error", "clientType");
-    }
-    const ok = await deps.keyPool.setClientType(keyId(request), clientType);
-    if (!ok) throw new ApiError("Key not found.", 404, "not_found");
-    const record = await deps.keyPool.get(keyId(request));
-    return { ok: true, key: record ? publicKey(record) : undefined };
   });
 
   /**
@@ -1190,12 +1152,11 @@ interface CatalogueEntry {
  */
 async function globalModelCatalogue(deps: AppDeps): Promise<{ models: CatalogueEntry[]; source: "cursor" | "fallback" }> {
   const lister = deps.modelLister ?? listAvailableModels;
-  const globalType = deps.config.sandClientMode ? "sand" : "sdk";
   const active = (await deps.keyPool.list()).filter((key) => key.status === "active");
   const merged = new Map<string, CatalogueEntry>();
   let source: "cursor" | "fallback" = "fallback";
   for (const key of active) {
-    const listed = await listCatalogue(lister, resolveCursorClientType(key.clientType, globalType), key.apiKey);
+    const listed = await listCatalogue(lister, key.apiKey);
     if (!listed) continue;
     if (listed.source === "cursor") source = "cursor";
     for (const model of listed.models) mergeCatalogueEntry(merged, model);
@@ -1203,7 +1164,7 @@ async function globalModelCatalogue(deps: AppDeps): Promise<{ models: CatalogueE
   // 一把 active key 都没有（或全部拉取失败）时退回无 key 目录：进程缓存或静态兜底。
   // 空清单会让后台的模型勾选框整片空白，运维连手填的参照都没有。
   if (!merged.size) {
-    const listed = await listCatalogue(lister, globalType, undefined);
+    const listed = await listCatalogue(lister, undefined);
     if (listed) {
       source = listed.source;
       for (const model of listed.models) mergeCatalogueEntry(merged, model);
@@ -1212,14 +1173,13 @@ async function globalModelCatalogue(deps: AppDeps): Promise<{ models: CatalogueE
   return { models: [...merged.values()], source };
 }
 
-/** 单把 key 的目录查询：失败一律吞掉。runWithCursorClientType 是同步转发，所以要用 try 而不是 .catch。 */
+/** 单把 key 的目录查询：失败一律吞掉。 */
 async function listCatalogue(
   lister: ModelLister,
-  clientType: CursorClientType,
   apiKey: string | undefined
 ): Promise<ModelListResult | undefined> {
   try {
-    return await runWithCursorClientType(clientType, () => lister(apiKey));
+    return await lister(apiKey);
   } catch {
     return undefined;
   }
@@ -1263,7 +1223,6 @@ function publicKey(record: CursorKeyRecord): Record<string, unknown> {
     lastError: record.lastError ?? null,
     requestCount: record.requestCount,
     failureCount: record.failureCount,
-    clientType: record.clientType,
     modelScope: record.modelScope,
     weight: record.weight,
     createdAt: record.createdAt

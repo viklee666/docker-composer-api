@@ -1,7 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
-import { getCurrentCursorClientType, isSandClientHookPatched, iterateWithCursorClientType, waitForSandClientHook } from "./sand-client.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers, responseCallIds } from "./protocol.js";
 import { durableSessionId } from "./durable-id.js";
@@ -120,13 +119,11 @@ export class CursorSdkRunner implements CursorRunner {
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
     if (signal?.aborted) throw new ApiError("Request was aborted.", 499, "request_aborted");
     const id = sessionId(input);
-    const clientType = input.clientType ?? getCurrentCursorClientType();
     try {
       // kill switch 或本请求 forceStateless：每请求独立 fresh agent，没有共享会话状态需要保护；
       // 跳过互斥锁，否则同一网关 key + 模型的所有并发请求会被完全串行化。
-      // client-type 必须包住整段 SDK 调用：header 是在 create/send 时写入的。
       if (this.isStateless(input)) {
-        yield* iterateWithCursorClientType(clientType, this.streamLocked(input, signal, id));
+        yield* this.streamLocked(input, signal, id);
         return;
       }
       const hub = this.input.sessionHub;
@@ -141,7 +138,7 @@ export class CursorSdkRunner implements CursorRunner {
         ownerHash: input.ownerHash
       }) : undefined;
       if (hub && durableId) {
-        yield* iterateWithCursorClientType(clientType, this.streamDurable(hub, durableId, input, signal));
+        yield* this.streamDurable(hub, durableId, input, signal);
         return;
       }
       // D4: Hub 在但认不出会话 → 真 stateless（与 kill switch 相同）。禁止用 ownerHash/sessionKey 走旧 resume。
@@ -153,7 +150,7 @@ export class CursorSdkRunner implements CursorRunner {
           liveSessions: hub.size
         });
       }
-      yield* iterateWithCursorClientType(clientType, this.streamLocked({ ...input, forceStateless: true }, signal, id));
+      yield* this.streamLocked({ ...input, forceStateless: true }, signal, id);
     } catch (error) {
       await this.recycleExecutorOnAuthFailure(input, error);
       throw error;
@@ -1338,18 +1335,6 @@ export class CursorSdkRunner implements CursorRunner {
     if (!Agent || typeof Agent !== "function" && typeof Agent !== "object") {
       throw new ApiError("@cursor/sdk Agent export is unavailable.", 500, "cursor_sdk_unavailable");
     }
-    // 只拦 Sand 请求：hook 没打上时硬编码仍是 sdk，宁可 503 也不假装已经走 Sand。
-    // SDK 通道不依赖 hook，也不在这里多等，避免拖慢历史默认路径。
-    if (getCurrentCursorClientType() === "sand") {
-      await waitForSandClientHook();
-      if (!isSandClientHookPatched()) {
-        throw new ApiError(
-          "Sand channel is selected but the Cursor SDK client-type hook did not apply. Restart the gateway and check [sand-client-loader] logs.",
-          503,
-          "sand_channel_unavailable"
-        );
-      }
-    }
     return Agent as AgentFactory;
   }
 
@@ -1834,13 +1819,12 @@ function captureUsageFromSdkEvent(
   publishUsageTotal(ledger, telemetry);
 }
 
-/** 把真实下发给上游的模型 / 参数 / 通道写回遥测通道，用于核对推理强度、1M、fast 是否真的生效。 */
+/** 把真实下发给上游的模型 / 参数写回遥测通道，用于核对推理强度、1M、fast 是否真的生效。 */
 function recordRunTelemetry(input: CursorRunRequest, resolved: ResolvedModelRun): void {
   const telemetry = input.telemetryRef;
   if (!telemetry) return;
   telemetry.upstreamModel = resolved.model.id;
   if (resolved.model.params?.length) telemetry.modelParams = resolved.model.params.map((param) => ({ ...param }));
-  telemetry.clientType = input.clientType ?? getCurrentCursorClientType();
 }
 
 function finiteNumber(value: unknown): number | undefined {

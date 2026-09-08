@@ -48,7 +48,6 @@ function key(overrides: Partial<CursorKeyRecord> = {}): CursorKeyRecord {
     sortOrder: 1,
     requestCount: 0,
     failureCount: 0,
-    clientType: "inherit",
     modelScope: { allowed: [], excluded: [] },
     weight: 1,
     createdAt: new Date().toISOString(),

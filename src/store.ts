@@ -84,7 +84,6 @@ export class SqliteStateStore implements StateStore {
         last_error TEXT,
         request_count INTEGER NOT NULL DEFAULT 0,
         failure_count INTEGER NOT NULL DEFAULT 0,
-        client_type TEXT NOT NULL DEFAULT 'inherit',
         allowed_models TEXT,
         excluded_models TEXT,
         weight INTEGER NOT NULL DEFAULT 1,
@@ -209,9 +208,6 @@ export class SqliteStateStore implements StateStore {
     this.db.exec("UPDATE cursor_keys SET sort_order = rowid WHERE sort_order = 0");
     if (!columns.has("failure_count")) {
       this.db.exec("ALTER TABLE cursor_keys ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0");
-    }
-    if (!columns.has("client_type")) {
-      this.db.exec("ALTER TABLE cursor_keys ADD COLUMN client_type TEXT NOT NULL DEFAULT 'inherit'");
     }
     if (!columns.has("allowed_models")) {
       this.db.exec("ALTER TABLE cursor_keys ADD COLUMN allowed_models TEXT");
@@ -364,8 +360,8 @@ export class SqliteStateStore implements StateStore {
   async insertCursorKey(record: CursorKeyRecord): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, failure_count, client_type, allowed_models, excluded_models, weight, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, failure_count, allowed_models, excluded_models, weight, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -380,7 +376,6 @@ export class SqliteStateStore implements StateStore {
         record.lastError ?? null,
         record.requestCount,
         record.failureCount,
-        record.clientType,
         encodeList(record.modelScope?.allowed),
         encodeList(record.modelScope?.excluded),
         normalizeWeight(record.weight),
@@ -428,10 +423,6 @@ export class SqliteStateStore implements StateStore {
     }
     if (patch.incrementFailureCount) {
       sets.push("failure_count = failure_count + 1");
-    }
-    if (patch.clientType !== undefined) {
-      sets.push("client_type = ?");
-      values.push(patch.clientType);
     }
     if (patch.modelScope !== undefined) {
       sets.push("allowed_models = ?", "excluded_models = ?");
@@ -957,7 +948,6 @@ export class MemoryStateStore implements StateStore {
     if (patch.failureCount !== undefined) key.failureCount = patch.failureCount;
     if (patch.incrementRequestCount) key.requestCount += 1;
     if (patch.incrementFailureCount) key.failureCount += 1;
-    if (patch.clientType !== undefined) key.clientType = patch.clientType;
     if (patch.modelScope !== undefined) key.modelScope = cloneScope(patch.modelScope);
     if (patch.weight !== undefined) key.weight = normalizeWeight(patch.weight);
     return true;
@@ -1408,7 +1398,6 @@ function rowToKey(row: Record<string, unknown>): CursorKeyRecord {
     lastError: optional(row.last_error),
     requestCount: Number(row.request_count ?? 0),
     failureCount: Number(row.failure_count ?? 0),
-    clientType: row.client_type === "sdk" || row.client_type === "sand" ? row.client_type : "inherit",
     modelScope: decodeScope(row.allowed_models, row.excluded_models),
     weight: normalizeWeight(Number(row.weight ?? 1)),
     createdAt: String(row.created_at)

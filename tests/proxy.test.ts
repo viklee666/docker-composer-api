@@ -1003,7 +1003,6 @@ function settingsConfig(): GatewayConfig {
     maxTransientAttempts: 3,
     autoDisableKeys: true,
     autoDisableThreshold: 2,
-    sandClientMode: false,
     routingStrategy: "fill-first",
     sessionAffinity: true,
     sessionAffinityTtlMs: 3_600_000,

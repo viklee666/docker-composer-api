@@ -56,7 +56,6 @@ const baseConfig: GatewayConfig = {
   maxTransientAttempts: 3,
   autoDisableKeys: true,
   autoDisableThreshold: 2,
-  sandClientMode: false,
   routingStrategy: "fill-first",
   sessionAffinity: false,
   sessionAffinityTtlMs: 60 * 60 * 1000,
@@ -275,10 +274,6 @@ test("sqlite store migrates legacy cursor_keys table and supports reorder", asyn
   assert.deepEqual(migrated.map((key) => key.id), ["id-a", "id-b"]);
   assert.ok(migrated.every((key) => key.sortOrder > 0), "sort_order backfilled from rowid");
   assert.ok(migrated.every((key) => key.failureCount === 0), "failure_count 补列后从 0 起算");
-  assert.ok(migrated.every((key) => key.clientType === "inherit"), "client_type 补列后默认跟随全局");
-
-  await store.updateCursorKey("id-a", { clientType: "sand" });
-  assert.equal((await store.listCursorKeys()).find((key) => key.id === "id-a")?.clientType, "sand");
 
   await store.updateCursorKey("id-a", { incrementFailureCount: true });
   assert.equal((await store.listCursorKeys()).find((key) => key.id === "id-a")?.failureCount, 1);
@@ -2181,111 +2176,6 @@ test("admin settings can toggle Cursor SDK HTTP/1.1 mode", async () => {
   const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
   assert.equal(overview.statusCode, 200);
   assert.equal(overview.json().config.cursorSdkUseHttp1ForAgent, true);
-});
-
-test("admin settings can toggle Sand channel globally and per key", async () => {
-  const runner = new FakeRunner({ text: "ok" });
-  const { app, store, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"] });
-  const adminHeaders = { authorization: "Bearer gateway-key" };
-
-  const listed = await app.inject({ method: "GET", url: "/admin/api/keys", headers: adminHeaders });
-  assert.equal(listed.statusCode, 200);
-  assert.ok(listed.json().keys.every((key: { clientType: string }) => key.clientType === "inherit"));
-
-  const saved = await app.inject({
-    method: "POST",
-    url: "/admin/api/settings",
-    headers: adminHeaders,
-    payload: { sandClientMode: true }
-  });
-  assert.equal(saved.statusCode, 200);
-  assert.equal(saved.json().config.sandClientMode, true);
-  assert.equal(await store.getSetting("sandClientMode"), "on");
-
-  const overview = await app.inject({ method: "GET", url: "/admin/api/overview", headers: adminHeaders });
-  assert.equal(overview.json().config.sandClientMode, true);
-
-  await app.inject({
-    method: "POST",
-    url: "/v1/chat/completions",
-    headers: adminHeaders,
-    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
-  });
-  assert.equal(runner.lastInput?.clientType, "sand", "总开关打开后，跟随全局的 key 应走 sand");
-
-  const keys = await keyPool.list();
-  const keyA = keys.find((key) => key.apiKey === "key-a");
-  const keyB = keys.find((key) => key.apiKey === "key-b");
-  assert.ok(keyA && keyB);
-
-  const forcedSdk = await app.inject({
-    method: "POST",
-    url: `/admin/api/keys/${keyA.id}/channel`,
-    headers: adminHeaders,
-    payload: { clientType: "sdk" }
-  });
-  assert.equal(forcedSdk.statusCode, 200);
-  assert.equal(forcedSdk.json().key.clientType, "sdk");
-
-  const forcedSand = await app.inject({
-    method: "POST",
-    url: `/admin/api/keys/${keyB.id}/channel`,
-    headers: adminHeaders,
-    payload: { clientType: "sand" }
-  });
-  assert.equal(forcedSand.statusCode, 200);
-  assert.equal(forcedSand.json().key.clientType, "sand");
-
-  await keyPool.disable(keyB.id, "manual");
-  await app.inject({
-    method: "POST",
-    url: "/v1/chat/completions",
-    headers: adminHeaders,
-    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
-  });
-  assert.equal(runner.lastApiKey, "key-a");
-  assert.equal(runner.lastInput?.clientType, "sdk", "key 强制 SDK 应覆盖全局 Sand");
-
-  await keyPool.enable(keyB.id);
-  await keyPool.disable(keyA.id, "manual");
-  await app.inject({
-    method: "POST",
-    url: "/v1/chat/completions",
-    headers: adminHeaders,
-    payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
-  });
-  assert.equal(runner.lastApiKey, "key-b");
-  assert.equal(runner.lastInput?.clientType, "sand");
-
-  const off = await app.inject({
-    method: "POST",
-    url: "/admin/api/settings",
-    headers: adminHeaders,
-    payload: { sandClientMode: false }
-  });
-  assert.equal(off.json().config.sandClientMode, false);
-
-  const invalid = await app.inject({
-    method: "POST",
-    url: `/admin/api/keys/${keyA.id}/channel`,
-    headers: adminHeaders,
-    payload: { clientType: "glass" }
-  });
-  assert.equal(invalid.statusCode, 400);
-});
-
-test("admin can add a key already pinned to Sand", async () => {
-  const { app, keyPool } = await createTestApp();
-  const created = await app.inject({
-    method: "POST",
-    url: "/admin/api/keys",
-    headers: { authorization: "Bearer gateway-key" },
-    payload: { key: "key-sand-only", label: "sand-key", clientType: "sand" }
-  });
-  assert.equal(created.statusCode, 200);
-  assert.equal(created.json().key.clientType, "sand");
-  const stored = (await keyPool.list()).find((key) => key.apiKey === "key-sand-only");
-  assert.equal(stored?.clientType, "sand");
 });
 
 test("admin settings persist the three-state Fast / Max Mode policy and echo all four fields", async () => {
@@ -4235,8 +4125,7 @@ async function createTestApp(options: {
   await keyPool.seedFromEnv(options.keys ?? ["server-cursor-key"]);
   const inner = options.runner ?? new FakeRunner();
   const runner = new KeyRotatingRunner(inner, keyPool, {
-    ...options.runnerOptions,
-    resolveGlobalClientType: () => config.sandClientMode ? "sand" : "sdk"
+    ...options.runnerOptions
   });
   const modelLister: ModelLister = options.modelLister ?? (async () => ({
     models: [
