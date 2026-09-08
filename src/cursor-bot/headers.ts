@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cursorChecksum } from "./checksum.js";
-import { credentialClientType, type CursorConnectCredential } from "./credentials.js";
+import { credentialClientType, type CursorBotCredential } from "./credentials.js";
 
 export const CONNECT_PROTOCOL_VERSION = "1";
 
@@ -42,7 +42,7 @@ const REDACTED_HEADERS = new Set([
 ]);
 
 export interface BuildHeadersOptions {
-  credential: CursorConnectCredential;
+  credential: CursorBotCredential;
   codec?: ConnectCodec;
   /** 流式还是一元。默认 stream；填错会被服务端以 415 拒掉。 */
   kind?: ConnectCallKind;

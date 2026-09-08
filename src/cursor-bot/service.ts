@@ -12,27 +12,27 @@ import type {
   GatewayTool,
   RequestUsage
 } from "../types.js";
-import { fetchAvailableModels, type ConnectCatalog, type ConnectModelEntry } from "./available-models.js";
+import { fetchAvailableModels, type BotCatalog, type BotModelEntry } from "./available-models.js";
 import { exchangeUserApiKey } from "./api-key-exchange.js";
 import { resolveRequestedModel } from "./catalog.js";
-import { CursorConnectClient, DEFAULT_CONNECT_BASE_URL } from "./client.js";
+import { CursorBotClient, DEFAULT_BOT_BASE_URL } from "./client.js";
 import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
-import type { CursorConnectCredential } from "./credentials.js";
+import type { CursorBotCredential } from "./credentials.js";
 import { SAND_CLIENT_TYPE } from "./credentials.js";
 import { DEFAULT_READ_MAX_BYTES } from "./envelope.js";
 import type { UnifiedEvent } from "./events.js";
 import { LocalToolRegistry } from "./local-tools.js";
-import { CursorConnectProvider, conversationIdFor } from "./provider.js";
+import { CursorBotProvider, conversationIdFor } from "./provider.js";
 import { buildInferenceStreamRequest } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
 import { SubagentScheduler, subagentTool, type SubagentRunContext } from "./subagent-scheduler.js";
 import { runToolLoop } from "./tool-loop.js";
-import { CursorConnectStore, type CcCredential } from "./store.js";
-import { DEFAULT_CONNECT_CLIENT_VERSION } from "../config.js";
+import { CursorBotStore, type BotCredential } from "./store.js";
+import { DEFAULT_BOT_CLIENT_VERSION } from "../config.js";
 import type { ConnectFetch } from "./transport.js";
 
 /** 把 `GatewayConfig` 上那一组可选字段收敛成一份带默认值的设置。 */
-export interface ConnectSettings {
+export interface BotSettings {
   defaultProvider: GatewayProvider;
   baseUrl: string;
   codec: "proto" | "json";
@@ -44,17 +44,17 @@ export interface ConnectSettings {
   clientVersion: string;
 }
 
-export function connectSettings(config: GatewayConfig): ConnectSettings {
+export function botSettings(config: GatewayConfig): BotSettings {
   return {
     defaultProvider: config.defaultProvider ?? "sdk",
-    baseUrl: config.connectBaseUrl?.trim() || DEFAULT_CONNECT_BASE_URL,
-    codec: config.connectCodec ?? "proto",
-    readMaxBytes: config.connectReadMaxBytes ?? DEFAULT_READ_MAX_BYTES,
-    sendTools: config.connectSendTools ?? false,
-    localTools: config.connectLocalTools ?? [],
-    subagents: config.connectSubagents ?? false,
-    background: config.connectBackground ?? false,
-    clientVersion: config.connectClientVersion?.trim() || DEFAULT_CONNECT_CLIENT_VERSION
+    baseUrl: config.botBaseUrl?.trim() || DEFAULT_BOT_BASE_URL,
+    codec: config.botCodec ?? "proto",
+    readMaxBytes: config.botReadMaxBytes ?? DEFAULT_READ_MAX_BYTES,
+    sendTools: config.botSendTools ?? false,
+    localTools: config.botLocalTools ?? [],
+    subagents: config.botSubagents ?? false,
+    background: config.botBackground ?? false,
+    clientVersion: config.botClientVersion?.trim() || DEFAULT_BOT_CLIENT_VERSION
   };
 }
 
@@ -63,29 +63,29 @@ const CATALOG_TTL_MS = 5 * 60 * 1000;
 /** 连续失败到这个数就自动停用凭据，避免一把废 token 把每个请求都拖到超时。 */
 const CREDENTIAL_FAILURE_LIMIT = 5;
 
-export interface CursorConnectServiceOptions {
-  store: CursorConnectStore;
+export interface CursorBotServiceOptions {
+  store: CursorBotStore;
   config: GatewayConfig;
   fetchImpl?: ConnectFetch;
   workspace?: string;
 }
 
 /**
- * Connect 路线的装配层。
+ * Cursor Bot 路线的装配层。
  *
  * 它拥有三件事：**凭据轮换**（按最近使用时间挑一把活的）、**目录缓存**（按凭据分片），
- * 以及把两者喂给 `CursorConnectProvider`。选路本身在 `router.ts`，不在这里。
+ * 以及把两者喂给 `CursorBotProvider`。选路本身在 `router.ts`，不在这里。
  */
-export class CursorConnectService implements CursorRunner {
-  private readonly settings: ConnectSettings;
+export class CursorBotService implements CursorRunner {
+  private readonly settings: BotSettings;
   private readonly localTools?: LocalToolRegistry;
-  private readonly catalogs = new Map<string, { value: ConnectCatalog; expiresAt: number }>();
-  private readonly inflight = new Map<string, Promise<ConnectCatalog | undefined>>();
+  private readonly catalogs = new Map<string, { value: BotCatalog; expiresAt: number }>();
+  private readonly inflight = new Map<string, Promise<BotCatalog | undefined>>();
   /** runId → SSE 订阅者。事件先落库、再从这里推出去。 */
   private readonly listeners = new Map<string, Set<(event: UnifiedEvent) => void>>();
 
-  constructor(private readonly options: CursorConnectServiceOptions) {
-    this.settings = connectSettings(options.config);
+  constructor(private readonly options: CursorBotServiceOptions) {
+    this.settings = botSettings(options.config);
     if (this.settings.localTools.length) {
       this.localTools = new LocalToolRegistry({
         workspace: options.workspace ?? options.config.cursorWorkingDirectory,
@@ -98,7 +98,7 @@ export class CursorConnectService implements CursorRunner {
     return this.options.store.activeCredentials().length > 0;
   }
 
-  get store(): CursorConnectStore {
+  get store(): CursorBotStore {
     return this.options.store;
   }
 
@@ -134,7 +134,7 @@ export class CursorConnectService implements CursorRunner {
       available: active.length > 0,
       credentials: all.length,
       activeCredentials: active.length,
-      ...(active.length ? {} : { reason: all.length ? "所有 Connect 凭据都已停用" : "还没有配置 Connect 凭据" })
+      ...(active.length ? {} : { reason: all.length ? "所有 Bot 凭据都已停用" : "还没有配置 Bot 凭据" })
     };
   }
 
@@ -172,10 +172,10 @@ export class CursorConnectService implements CursorRunner {
    *
    * 每一轮都是一次新的 `Stream` 请求：`conversation_id` 不变、`invocation_id` 每轮新生成。
    * **上游是否真按 conversation_id 接续尚未实测**（计划 §P2），所以这条路只有在运维显式
-   * 打开 `CURSOR_CONNECT_SEND_TOOLS` 之后才会走到。
+   * 打开 `CURSOR_BOT_SEND_TOOLS` 之后才会走到。
    */
   private async *streamWithTools(
-    credential: CcCredential,
+    credential: BotCredential,
     input: CursorRunRequest,
     orchestrated: GatewayTool[],
     signal?: AbortSignal
@@ -194,7 +194,7 @@ export class CursorConnectService implements CursorRunner {
       catalog
     });
 
-    const client = new CursorConnectClient({
+    const client = new CursorBotClient({
       credential: toProviderCredential(credential),
       baseUrl: this.settings.baseUrl,
       codec: this.settings.codec,
@@ -286,8 +286,8 @@ export class CursorConnectService implements CursorRunner {
   }
 
   /** 子代理的 child run：同一把凭据、独立 conversation、可以是不同模型。 */
-  private async runChild(credential: CcCredential, context: SubagentRunContext): Promise<{ text: string; isError?: boolean; usage?: RequestUsage }> {
-    const client = new CursorConnectClient({
+  private async runChild(credential: BotCredential, context: SubagentRunContext): Promise<{ text: string; isError?: boolean; usage?: RequestUsage }> {
+    const client = new CursorBotClient({
       credential: toProviderCredential(credential),
       baseUrl: this.settings.baseUrl,
       codec: this.settings.codec,
@@ -342,14 +342,14 @@ export class CursorConnectService implements CursorRunner {
    * 按 `lastUsedAt` 升序里的**最近使用者优先**（fill-first）：与 SDK 路线的默认策略一致，
    * 换凭据会丢掉上游按设备/账号维持的 prompt 缓存。
    */
-  pickCredential(model?: string): CcCredential {
+  pickCredential(model?: string): BotCredential {
     const active = this.options.store.activeCredentials().filter((credential) => allowsModel(credential, model));
     if (!active.length) {
       const total = this.options.store.listCredentials().length;
       throw new ApiError(
         total
-          ? "No usable Cursor Connect credential for this model."
-          : "Cursor Connect is not configured; add a credential in the admin console.",
+          ? "No usable Cursor Bot credential for this model."
+          : "Cursor Bot is not configured; add a credential in the admin console.",
         503,
         "provider_unavailable"
       );
@@ -359,7 +359,7 @@ export class CursorConnectService implements CursorRunner {
   }
 
   /** 目录：按凭据分片缓存，失败短缓存，不让一次抖动把之后几分钟全拖成降级。 */
-  async catalog(credential: CcCredential, force = false): Promise<ConnectCatalog | undefined> {
+  async catalog(credential: BotCredential, force = false): Promise<BotCatalog | undefined> {
     const cached = this.catalogs.get(credential.id);
     if (!force && cached && cached.expiresAt > Date.now()) return cached.value;
 
@@ -381,15 +381,15 @@ export class CursorConnectService implements CursorRunner {
       .catch((error: unknown) => {
         this.inflight.delete(credential.id);
         // 目录拿不到不该让推理请求失败：`resolveModelParams` 有家族兜底。
-        console.warn(`[cursor-connect] model catalog unavailable: ${errorText(error)}`);
+        console.warn(`[cursor-bot] model catalog unavailable: ${errorText(error)}`);
         return undefined;
       });
     this.inflight.set(credential.id, pending);
     return pending;
   }
 
-  /** 对外模型列表（`/v1/models` 的 Connect 视角）。DISABLED 的不暴露。 */
-  async listModels(force = false): Promise<ConnectModelEntry[]> {
+  /** 对外模型列表（`/v1/models` 的 Bot 视角）。DISABLED 的不暴露。 */
+  async listModels(force = false): Promise<BotModelEntry[]> {
     const credential = this.pickCredential();
     const catalog = await this.catalog(credential, force);
     return (catalog?.models ?? []).filter((model) => model.degradation !== "disabled");
@@ -421,13 +421,13 @@ export class CursorConnectService implements CursorRunner {
   }
 
   /**
-   * 用 Cursor Key 池里的 `crsr_` 向上游兑换 session JWT，写成 Connect 凭据。
+   * 用 Cursor Key 池里的 `crsr_` 向上游兑换 session JWT，写成 Bot 凭据。
    * 同一把 key 再拉一次只换 token，machineId 保持不变。
    */
   async importFromCursorKey(
     key: Pick<CursorKeyRecord, "id" | "apiKey" | "label" | "modelScope">,
     options: { label?: string; machineId?: string } = {}
-  ): Promise<CcCredential> {
+  ): Promise<BotCredential> {
     const tokens = await exchangeUserApiKey({
       apiKey: key.apiKey,
       baseUrl: this.settings.baseUrl,
@@ -435,7 +435,7 @@ export class CursorConnectService implements CursorRunner {
     });
     const existing = this.options.store.credentialBySourceKeyId(key.id);
     const label = options.label?.trim() || key.label?.trim() || existing?.label;
-    const write = (target?: CcCredential): CcCredential =>
+    const write = (target?: BotCredential): BotCredential =>
       this.options.store.upsertCredential({
         ...(target ? { id: target.id } : {}),
         label,
@@ -460,8 +460,8 @@ export class CursorConnectService implements CursorRunner {
     }
   }
 
-  private providerFor(credential: CcCredential, input: CursorRunRequest): CursorConnectProvider {
-    return new CursorConnectProvider({
+  private providerFor(credential: BotCredential, input: CursorRunRequest): CursorBotProvider {
+    return new CursorBotProvider({
       resolveCredential: () => toProviderCredential(credential),
       baseUrl: this.settings.baseUrl,
       codec: this.settings.codec,
@@ -486,7 +486,7 @@ export class CursorConnectService implements CursorRunner {
     }
   }
 
-  private async modelCatalogFor(credential: CcCredential, modelId: string): Promise<ModelCatalog | undefined> {
+  private async modelCatalogFor(credential: BotCredential, modelId: string): Promise<ModelCatalog | undefined> {
     const catalog = await this.catalog(credential);
     const wanted = modelId.trim().toLowerCase();
     const entry = catalog?.models.find(
@@ -496,7 +496,7 @@ export class CursorConnectService implements CursorRunner {
     return { parameters: entry.parameters, variants: entry.variants };
   }
 
-  private noteFailure(credential: CcCredential, error: unknown): void {
+  private noteFailure(credential: BotCredential, error: unknown): void {
     const status = error instanceof ApiError ? error.statusCode : 500;
     // 只有凭据本身的问题才计数。429/5xx 是上游状态，跟这把 token 的有效性无关，
     // 按失败累计会把一次限流演变成把凭据停掉。
@@ -504,13 +504,13 @@ export class CursorConnectService implements CursorRunner {
     const failures = this.options.store.recordCredentialFailure(credential.id, errorText(error));
     if (failures >= CREDENTIAL_FAILURE_LIMIT) {
       this.options.store.setCredentialStatus(credential.id, "disabled");
-      console.error(`[cursor-connect] credential ${credential.id} disabled after ${failures} auth failures`);
+      console.error(`[cursor-bot] credential ${credential.id} disabled after ${failures} auth failures`);
     }
   }
 }
 
 /** 库里的凭据行 → provider 要的凭据形状。空字段一律不带，避免发出空串头。 */
-function toProviderCredential(credential: CcCredential): CursorConnectCredential {
+function toProviderCredential(credential: BotCredential): CursorBotCredential {
   return {
     id: credential.id,
     ...(credential.label ? { label: credential.label } : {}),
@@ -528,7 +528,7 @@ function toProviderCredential(credential: CcCredential): CursorConnectCredential
   };
 }
 
-function allowsModel(credential: CcCredential, model?: string): boolean {
+function allowsModel(credential: BotCredential, model?: string): boolean {
   if (!model) return true;
   const wanted = model.trim().toLowerCase();
   if (credential.excludedModels?.some((entry) => entry.toLowerCase() === wanted)) return false;
@@ -545,11 +545,11 @@ function errorText(error: unknown): string {
  *
  * machineId 不给就生成一个并**永久保存**：每次启动换一个的话，上游看到的是每次一台新设备。
  */
-export function seedConnectCredential(store: CursorConnectStore, config: GatewayConfig): CcCredential | undefined {
-  const token = config.connectSessionToken?.trim();
+export function seedBotCredential(store: CursorBotStore, config: GatewayConfig): BotCredential | undefined {
+  const token = config.botSessionToken?.trim();
   if (!token) return undefined;
   const existing = store.listCredentials().find((credential) => credential.label === "env");
-  const settings = connectSettings(config);
+  const settings = botSettings(config);
   if (existing) {
     // token 变了才更新，避免每次启动都写一遍库。
     if (existing.sessionToken === token) return existing;
@@ -564,7 +564,7 @@ export function seedConnectCredential(store: CursorConnectStore, config: Gateway
   return store.upsertCredential({
     label: "env",
     sessionToken: token,
-    machineId: config.connectMachineId?.trim() || randomUUID(),
+    machineId: config.botMachineId?.trim() || randomUUID(),
     clientVersion: settings.clientVersion,
     clientOs: process.platform,
     clientArch: process.arch,

@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ApiError } from "../src/errors.js";
 import type { CursorRunRequest, ModelParameterValue, RunTelemetryRef } from "../src/types.js";
-import { ModelCatalogCache, resolveRequestedModel } from "../src/cursor-connect/catalog.js";
-import { CursorConnectClient } from "../src/cursor-connect/client.js";
-import type { CursorConnectCredential } from "../src/cursor-connect/credentials.js";
-import { encodeEnvelope } from "../src/cursor-connect/envelope.js";
-import { CursorConnectProvider, conversationIdFor } from "../src/cursor-connect/provider.js";
-import { buildInferenceStreamRequest } from "../src/cursor-connect/request-builder.js";
-import { ResponseNormalizer } from "../src/cursor-connect/response-normalizer.js";
+import { ModelCatalogCache, resolveRequestedModel } from "../src/cursor-bot/catalog.js";
+import { CursorBotClient } from "../src/cursor-bot/client.js";
+import type { CursorBotCredential } from "../src/cursor-bot/credentials.js";
+import { encodeEnvelope } from "../src/cursor-bot/envelope.js";
+import { CursorBotProvider, conversationIdFor } from "../src/cursor-bot/provider.js";
+import { buildInferenceStreamRequest } from "../src/cursor-bot/request-builder.js";
+import { ResponseNormalizer } from "../src/cursor-bot/response-normalizer.js";
 import {
   InferenceExtendedUsageInfo,
   InferenceMessageRole,
@@ -21,9 +21,9 @@ import {
   InferenceThinkingStreamPart,
   InferenceToolCallStreamPart,
   InferenceUsageInfo
-} from "../src/cursor-connect/proto/inference_pb.js";
+} from "../src/cursor-bot/proto/inference_pb.js";
 
-const CREDENTIAL: CursorConnectCredential = {
+const CREDENTIAL: CursorBotCredential = {
   id: "cred-1",
   sessionToken: "session-token-value",
   machineId: "machine-abc",
@@ -587,7 +587,7 @@ test("the client posts to /aiserver.v1.InferenceService/Stream and decodes the f
     messageFrame(textFrame(" there")),
     endFrame()
   ]);
-  const client = new CursorConnectClient({ credential: CREDENTIAL, fetchImpl, baseUrl: "https://api2.example.test/" });
+  const client = new CursorBotClient({ credential: CREDENTIAL, fetchImpl, baseUrl: "https://api2.example.test/" });
 
   const texts: string[] = [];
   for await (const frame of client.stream(
@@ -612,7 +612,7 @@ test("an endStream error surfaces as a mapped ApiError even under HTTP 200", asy
     messageFrame(textFrame("partial")),
     endFrame({ error: { code: "resource_exhausted", message: "quota" } })
   ]);
-  const client = new CursorConnectClient({ credential: CREDENTIAL, fetchImpl });
+  const client = new CursorBotClient({ credential: CREDENTIAL, fetchImpl });
   await assert.rejects(
     async () => {
       for await (const _ of client.stream(new InferenceStreamRequest())) {
@@ -626,7 +626,7 @@ test("an endStream error surfaces as a mapped ApiError even under HTTP 200", asy
 
 test("a stream that never sends endStream is an error, not an empty answer", async () => {
   const { fetchImpl } = fakeUpstream([messageFrame(textFrame("truncated"))]);
-  const client = new CursorConnectClient({ credential: CREDENTIAL, fetchImpl });
+  const client = new CursorBotClient({ credential: CREDENTIAL, fetchImpl });
   await assert.rejects(
     async () => {
       for await (const _ of client.stream(new InferenceStreamRequest())) {
@@ -647,7 +647,7 @@ test("an unsupported content encoding cancels the body instead of leaking the so
       cancelled = true;
     }
   });
-  const client = new CursorConnectClient({
+  const client = new CursorBotClient({
     credential: CREDENTIAL,
     fetchImpl: async () => new Response(body, { status: 200, headers: { "connect-content-encoding": "zstd" } })
   });
@@ -664,7 +664,7 @@ test("an unsupported content encoding cancels the body instead of leaking the so
 });
 
 test("an HTTP error status becomes an ApiError with the upstream status", async () => {
-  const client = new CursorConnectClient({
+  const client = new CursorBotClient({
     credential: CREDENTIAL,
     fetchImpl: async () => new Response("no", { status: 401 })
   });
@@ -694,9 +694,9 @@ function runRequest(overrides: Partial<CursorRunRequest> = {}): CursorRunRequest
   } as CursorRunRequest;
 }
 
-function provider(frames: Uint8Array[], options: Partial<ConstructorParameters<typeof CursorConnectProvider>[0]> = {}) {
+function provider(frames: Uint8Array[], options: Partial<ConstructorParameters<typeof CursorBotProvider>[0]> = {}) {
   const upstream = fakeUpstream(frames);
-  const instance = new CursorConnectProvider({
+  const instance = new CursorBotProvider({
     resolveCredential: () => CREDENTIAL,
     fetchImpl: upstream.fetchImpl,
     newInvocationId: () => "inv-fixed",
@@ -841,7 +841,7 @@ test("reuseDurableAgent false does not reuse conversation_id even with the same 
 test("the caller's AbortSignal reaches fetch and surfaces as 499", async () => {
   const controller = new AbortController();
   let sawSignal: AbortSignal | undefined;
-  const instance = new CursorConnectProvider({
+  const instance = new CursorBotProvider({
     resolveCredential: () => CREDENTIAL,
     fetchImpl: async (_url, options) => {
       sawSignal = options.signal ?? undefined;
@@ -916,7 +916,7 @@ test("an unreadable end-of-stream frame fails the run instead of truncating it s
     messageFrame(textFrame("partial")),
     encodeEnvelope(new TextEncoder().encode("<html>gateway timeout</html>"), { endStream: true })
   ]);
-  const client = new CursorConnectClient({ credential: CREDENTIAL, fetchImpl });
+  const client = new CursorBotClient({ credential: CREDENTIAL, fetchImpl });
   await assert.rejects(
     async () => {
       for await (const _ of client.stream(new InferenceStreamRequest())) {
@@ -931,7 +931,7 @@ test("envelope-level failures become upstream errors, not internal 500s", async 
   const oversized = new Uint8Array(5);
   new DataView(oversized.buffer).setUint32(1, 0xffffffff, false);
   const { fetchImpl } = fakeUpstream([oversized]);
-  const client = new CursorConnectClient({ credential: CREDENTIAL, fetchImpl });
+  const client = new CursorBotClient({ credential: CREDENTIAL, fetchImpl });
 
   await assert.rejects(
     async () => {

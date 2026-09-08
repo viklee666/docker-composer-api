@@ -1,12 +1,12 @@
 import { ApiError } from "../errors.js";
-import { DEFAULT_CONNECT_BASE_URL } from "./client.js";
+import { DEFAULT_BOT_BASE_URL } from "./client.js";
 import { cursorTokenType } from "./credentials.js";
 import type { ConnectFetch } from "./transport.js";
 
 /**
  * Cursor 桌面端 `exchangeApiKeyForTokens` / `loginWithApiKey` 打的同一个接口。
  * 用 Cursor API key（`crsr_` / `key_`）换 `{ accessToken, refreshToken }`，
- * 其中 accessToken 才是 Connect 路线要的 session JWT。
+ * 其中 accessToken 才是 Bot 路线要的 session JWT。
  *
  * 形状取自 Cursor Grok Bot 桌面端实现：`POST {api2}/auth/exchange_user_api_key`，
  * `Authorization: Bearer <apiKey>`，body `{}`。不发 machineId——兑换与设备标识是两步。
@@ -25,7 +25,7 @@ export interface ExchangedCursorTokens {
 
 export interface ExchangeUserApiKeyOptions {
   apiKey: string;
-  /** 与 Connect 出站同一份 baseUrl，默认 `https://api2.cursor.sh`。 */
+  /** 与 Bot 出站同一份 baseUrl，默认 `https://api2.cursor.sh`。 */
   baseUrl?: string;
   fetchImpl?: ConnectFetch;
 }
@@ -39,7 +39,7 @@ export async function exchangeUserApiKey(options: ExchangeUserApiKeyOptions): Pr
   if (!apiKey) {
     throw new ApiError("Cursor API key is required.", 400, "invalid_request_error", "cursorKeyId");
   }
-  const url = exchangeUrl(options.baseUrl?.trim() || DEFAULT_CONNECT_BASE_URL);
+  const url = exchangeUrl(options.baseUrl?.trim() || DEFAULT_BOT_BASE_URL);
   const doFetch = options.fetchImpl ?? ((input, init) => fetch(input, init));
 
   let response: Response;
@@ -85,7 +85,7 @@ export async function exchangeUserApiKey(options: ExchangeUserApiKeyOptions): Pr
 
   const tokens = readTokens(bodyText);
   if (cursorTokenType(tokens.accessToken) === "web") {
-    throw new ApiError("兑换结果是浏览器 web token，不能作为 Connect session token。", 502, "upstream_error");
+    throw new ApiError("兑换结果是浏览器 web token，不能作为 Bot session token。", 502, "upstream_error");
   }
   return tokens;
 }

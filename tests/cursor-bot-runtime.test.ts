@@ -9,7 +9,7 @@ import {
   conversationMessages,
   toPreparedConversation,
   type PreparedConversation
-} from "../src/cursor-connect/conversation.js";
+} from "../src/cursor-bot/conversation.js";
 import {
   GATEWAY_EVENT_TYPES,
   UPSTREAM_EVENT_TYPES,
@@ -17,26 +17,26 @@ import {
   isGatewayGenerated,
   reduceUsage,
   usageFromEvent
-} from "../src/cursor-connect/events.js";
-import { buildInferenceStreamRequest } from "../src/cursor-connect/request-builder.js";
-import { LocalToolRegistry, resolveWithinWorkspace, type LocalToolAudit } from "../src/cursor-connect/local-tools.js";
-import { CursorConnectStore } from "../src/cursor-connect/store.js";
-import { runToolLoop, type ToolLoopResult } from "../src/cursor-connect/tool-loop.js";
-import { SUBAGENT_TOOL_NAME, SubagentScheduler, subagentTool } from "../src/cursor-connect/subagent-scheduler.js";
+} from "../src/cursor-bot/events.js";
+import { buildInferenceStreamRequest } from "../src/cursor-bot/request-builder.js";
+import { LocalToolRegistry, resolveWithinWorkspace, type LocalToolAudit } from "../src/cursor-bot/local-tools.js";
+import { CursorBotStore } from "../src/cursor-bot/store.js";
+import { runToolLoop, type ToolLoopResult } from "../src/cursor-bot/tool-loop.js";
+import { SUBAGENT_TOOL_NAME, SubagentScheduler, subagentTool } from "../src/cursor-bot/subagent-scheduler.js";
 import {
   contextFromSummary,
   hashMessages,
   shouldSummarize,
   summarizeConversation
-} from "../src/cursor-connect/summarizer.js";
+} from "../src/cursor-bot/summarizer.js";
 import {
   BackgroundWorker,
   ReplayBridge,
   nextDeliveryState,
   resumeDecision
-} from "../src/cursor-connect/background-worker.js";
-import { ProviderRouter, connectModelScope, isConnectModelId, selectProvider } from "../src/cursor-connect/router.js";
-import { InferenceMessageRole } from "../src/cursor-connect/proto/inference_pb.js";
+} from "../src/cursor-bot/background-worker.js";
+import { ProviderRouter, botModelScope, isBotModelId, selectProvider } from "../src/cursor-bot/router.js";
+import { InferenceMessageRole } from "../src/cursor-bot/proto/inference_pb.js";
 import {
   InferenceExtendedUsageInfo,
   InferenceResponseInfo,
@@ -45,7 +45,7 @@ import {
   InferenceThinkingStreamPart,
   InferenceToolCallStreamPart,
   InferenceUsageInfo
-} from "../src/cursor-connect/proto/inference_pb.js";
+} from "../src/cursor-bot/proto/inference_pb.js";
 
 /* ------------------------------------------------------ G5 结构化对话 */
 
@@ -400,8 +400,8 @@ test("reducing the event log agrees with the normalizer regardless of frame orde
 
 /* -------------------------------------------------------------- G10 存储 */
 
-function store(): CursorConnectStore {
-  return CursorConnectStore.open(":memory:");
+function store(): CursorBotStore {
+  return CursorBotStore.open(":memory:");
 }
 
 test("events get monotonic seq and replay from a Last-Event-ID", () => {
@@ -443,7 +443,7 @@ test("tool result submission is idempotent per (run_id, call_id)", () => {
 
 test("a run lease can be taken over only after it expires", () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
-  const db = CursorConnectStore.open(":memory:", { now: () => now });
+  const db = CursorBotStore.open(":memory:", { now: () => now });
   const conversation = db.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
   db.createRun({ conversationId: conversation.id, requestedModel: "m" });
 
@@ -461,7 +461,7 @@ test("a run lease can be taken over only after it expires", () => {
 
 test("a terminal run cannot be resurrected by a lease acquired mid-window", () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
-  const db = CursorConnectStore.open(":memory:", { now: () => now });
+  const db = CursorBotStore.open(":memory:", { now: () => now });
   const conv = db.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
   const run = db.createRun({ conversationId: conv.id, requestedModel: "m" });
 
@@ -1196,7 +1196,7 @@ test("the token budget is actually fed by the runner's reported usage", async ()
 
 test("children do not inherit the parent's tools and their run is leaseable after a crash", async () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
-  const db = CursorConnectStore.open(":memory:", { now: () => now });
+  const db = CursorBotStore.open(":memory:", { now: () => now });
   const conv = db.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
   const run = db.createRun({ conversationId: conv.id, requestedModel: "m" });
 
@@ -1451,7 +1451,7 @@ test("replay backfills history then live events with no gap and no duplicate", (
 
 test("a non-terminal outcome releases the lease instead of stranding the run", async () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
-  const db = CursorConnectStore.open(":memory:", { now: () => now });
+  const db = CursorBotStore.open(":memory:", { now: () => now });
   const conv = db.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
   const run = db.createRun({ conversationId: conv.id, requestedModel: "m" });
 
@@ -1658,39 +1658,39 @@ test("delivery state advances only on real upstream content", () => {
 
 /* ------------------------------------------------------------ P6 选路 */
 
-test("Connect model ids are a separate scope namespace from SDK names", () => {
-  assert.equal(isConnectModelId("connect/grok-4.6"), true);
-  assert.equal(isConnectModelId("grok-4.6"), false);
+test("Bot model ids are a separate scope namespace from SDK names", () => {
+  assert.equal(isBotModelId("bot/grok-4.6"), true);
+  assert.equal(isBotModelId("grok-4.6"), false);
   assert.equal(
-    connectModelScope({ allowed: ["composer-2.5", "grok-4.6"], excluded: [] }),
+    botModelScope({ allowed: ["composer-2.5", "grok-4.6"], excluded: [] }),
     undefined,
-    "只有 SDK 名字的白名单不能变成 Connect 过滤"
+    "只有 SDK 名字的白名单不能变成 Bot 过滤"
   );
   assert.deepEqual(
-    connectModelScope({ allowed: ["composer-2.5", "connect/grok-4.6"], excluded: ["connect/gone"] }),
-    { allowed: ["connect/grok-4.6"], excluded: ["connect/gone"] }
+    botModelScope({ allowed: ["composer-2.5", "bot/grok-4.6"], excluded: ["bot/gone"] }),
+    { allowed: ["bot/grok-4.6"], excluded: ["bot/gone"] }
   );
 });
 
 test("provider selection follows header, then model prefix, then key setting", () => {
-  assert.equal(selectProvider({ headers: { "X-Gateway-Provider": "connect" } }).provider, "connect");
-  assert.equal(selectProvider({ model: "connect/grok-4.6" }).provider, "connect");
-  assert.equal(selectProvider({ model: "connect/grok-4.6" }).model, "grok-4.6");
-  assert.equal(selectProvider({ keySetting: "connect" }).provider, "connect");
+  assert.equal(selectProvider({ headers: { "X-Gateway-Provider": "bot" } }).provider, "bot");
+  assert.equal(selectProvider({ model: "bot/grok-4.6" }).provider, "bot");
+  assert.equal(selectProvider({ model: "bot/grok-4.6" }).model, "grok-4.6");
+  assert.equal(selectProvider({ keySetting: "cursor-connect" }).provider, "bot");
   assert.equal(selectProvider({ keySetting: "inherit" }).provider, "sdk");
   assert.equal(selectProvider({}).provider, "sdk", "默认必须还是 SDK 路线");
   // header 比 key 设置更显式，压测时不该被 key 上的设置盖掉。
   assert.equal(selectProvider({ headers: { "x-gateway-provider": "sdk" }, keySetting: "connect" }).provider, "sdk");
 });
 
-test("selection falls back to sdk when the connect provider is not configured", () => {
-  const selection = selectProvider({ model: "connect/m", connectAvailable: false });
+test("selection falls back to sdk when the bot provider is not configured", () => {
+  const selection = selectProvider({ model: "bot/m", botAvailable: false });
   assert.equal(selection.provider, "sdk");
   assert.match(selection.reason, /unavailable-fallback-sdk/);
-  assert.equal(selection.model, "m", "回落到 SDK 也要去掉 connect/ 前缀，否则目录里查不到这个模型");
+  assert.equal(selection.model, "m", "回落到 SDK 也要去掉 bot/ 前缀，否则目录里查不到这个模型");
 
-  // 默认走 connect 但 connect 没配好时，也必须回落——漏掉这条会一路走到 runnerFor 抛错。
-  const byDefault = selectProvider({ defaultProvider: "connect", connectAvailable: false });
+  // 默认走 bot 但 bot 没配好时，也必须回落——漏掉这条会一路走到 runnerFor 抛错。
+  const byDefault = selectProvider({ defaultProvider: "bot", botAvailable: false });
   assert.equal(byDefault.provider, "sdk");
   assert.match(byDefault.reason, /unavailable-fallback-sdk/);
 });
@@ -1698,29 +1698,29 @@ test("selection falls back to sdk when the connect provider is not configured", 
 test("the router hands back the right runner and never invents capabilities", () => {
   const sdk = { run: async () => ({ text: "", toolCalls: [] }), stream: async function* () {} };
   const router = new ProviderRouter({ sdk });
-  assert.equal(router.connectAvailable, false);
-  assert.equal(router.select({ model: "connect/m" }).provider, "sdk");
+  assert.equal(router.botAvailable, false);
+  assert.equal(router.select({ model: "bot/m" }).provider, "sdk");
   assert.equal(router.runnerFor("sdk"), sdk);
-  assert.throws(() => router.runnerFor("connect"), /not configured/);
+  assert.throws(() => router.runnerFor("bot"), /not configured/);
 
-  const connect = { run: async () => ({ text: "", toolCalls: [] }), stream: async function* () {} };
-  const both = new ProviderRouter({ sdk, connect });
-  assert.equal(both.select({ model: "connect/m" }).provider, "connect");
-  assert.equal(both.runnerFor("connect"), connect);
+  const bot = { run: async () => ({ text: "", toolCalls: [] }), stream: async function* () {} };
+  const both = new ProviderRouter({ sdk, bot });
+  assert.equal(both.select({ model: "bot/m" }).provider, "bot");
+  assert.equal(both.runnerFor("bot"), bot);
   // 未接进 server.ts / 未实测的能力一律不对外声明。
-  const connectCaps = both.capabilities("connect");
-  assert.equal(connectCaps.text, true);
+  const botCaps = both.capabilities("bot");
+  assert.equal(botCaps.text, true);
   assert.deepEqual(
-    Object.entries(connectCaps).filter(([, on]) => on).map(([name]) => name),
+    Object.entries(botCaps).filter(([, on]) => on).map(([name]) => name),
     ["text", "thinking"]
   );
   assert.equal(both.capabilities("sdk").subagents, false, "SDK 路线也没有子代理，不能顺手报 true");
 });
 
 test("a key setting from the database is normalized before it is trusted", () => {
-  // 直接信任的话，一个大小写不对的旧值会被记成 Connect、在 SDK runner 上执行，
-  // capability 又报的是 Connect 那张表。
-  assert.equal(selectProvider({ keySetting: "Connect" }).provider, "connect");
+  // 直接信任的话，一个大小写不对的旧值会被记成 Bot、在 SDK runner 上执行，
+  // capability 又报的是 Bot 那张表。
+  assert.equal(selectProvider({ keySetting: "Connect" }).provider, "bot");
   assert.equal(selectProvider({ keySetting: "cursor-sdk" }).provider, "sdk");
   const garbage = selectProvider({ keySetting: "queued', attempt = 999 --" });
   assert.equal(garbage.provider, "sdk");
@@ -1729,18 +1729,18 @@ test("a key setting from the database is normalized before it is trusted", () =>
 
 test("capabilities report nothing for a route that has no runner wired", () => {
   const sdk = { run: async () => ({ text: "", toolCalls: [] }), stream: async function* () {} };
-  const caps = new ProviderRouter({ sdk }).capabilities("connect");
+  const caps = new ProviderRouter({ sdk }).capabilities("bot");
   assert.deepEqual(Object.values(caps).filter(Boolean), [], "没接 runner 的路线不能宣传任何能力");
 });
 
-test("a bare connect/ prefix leaves the model unset so the default can apply", () => {
-  assert.equal(selectProvider({ model: "connect/" }).model, undefined);
+test("a bare bot/ prefix leaves the model unset so the default can apply", () => {
+  assert.equal(selectProvider({ model: "bot/" }).model, undefined);
   assert.equal(selectProvider({ model: "connected-model" }).model, "connected-model");
 });
 
-test("a run with defaultProvider connect still routes there when it is configured", () => {
+test("a run with defaultProvider bot still routes there when it is configured", () => {
   const runner = { run: async () => ({ text: "", toolCalls: [] }), stream: async function* () {} };
-  const router = new ProviderRouter({ sdk: runner, connect: runner, defaultProvider: "connect" });
-  assert.equal(router.select({}).provider, "connect");
+  const router = new ProviderRouter({ sdk: runner, bot: runner, defaultProvider: "bot" });
+  assert.equal(router.select({}).provider, "bot");
   assert.equal(router.select({ keySetting: "sdk" }).provider, "sdk");
 });

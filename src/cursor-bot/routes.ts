@@ -1,46 +1,46 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError, normalizeError } from "../errors.js";
 import { sse } from "../sse.js";
-import { isTerminal, type CursorConnectStore } from "./store.js";
-import type { CursorConnectService } from "./service.js";
+import { isTerminal, type CursorBotStore } from "./store.js";
+import type { CursorBotService } from "./service.js";
 import type { UnifiedEvent } from "./events.js";
 import { ReplayBridge } from "./background-worker.js";
 
 /**
- * Connect 路线自己的 HTTP 面（计划 §G9）。
+ * Cursor Bot 路线自己的 HTTP 面（计划 §G9）。
  *
  * 这些端点服务的是 **durable / background** 场景：无状态的 OpenAI 风格调用方
  * 本来就在下一次 `/v1/chat/completions` 里带完整历史，用不到这里。
  */
-export interface ConnectRouteDeps {
-  connect?: CursorConnectService;
-  store?: CursorConnectStore;
+export interface BotRouteDeps {
+  bot?: CursorBotService;
+  store?: CursorBotStore;
   /** 鉴权钩子，与主 API 共用同一套入站密钥判定。 */
   authorize: (request: FastifyRequest) => void;
   /** 事件订阅：worker 推事件时回调，用于 SSE live 段。 */
   subscribe?: (runId: string, listener: (event: UnifiedEvent) => void) => () => void;
 }
 
-const PREFIX = "/v1/cursor-connect";
+const PREFIX = "/v1/cursor-bot";
 
-export function registerConnectRoutes(app: FastifyInstance, deps: ConnectRouteDeps): void {
-  const requireStore = (): CursorConnectStore => {
+export function registerBotRoutes(app: FastifyInstance, deps: BotRouteDeps): void {
+  const requireStore = (): CursorBotStore => {
     if (!deps.store) {
-      throw new ApiError("Cursor Connect is not configured on this gateway.", 503, "provider_unavailable");
+      throw new ApiError("Cursor Bot is not configured on this gateway.", 503, "provider_unavailable");
     }
     return deps.store;
   };
 
   app.get(`${PREFIX}/status`, async (request) => {
     deps.authorize(request);
-    return deps.connect?.status() ?? { available: false, credentials: 0, activeCredentials: 0, reason: "未启用" };
+    return deps.bot?.status() ?? { available: false, credentials: 0, activeCredentials: 0, reason: "未启用" };
   });
 
   app.get(`${PREFIX}/models`, async (request) => {
     deps.authorize(request);
-    if (!deps.connect) throw new ApiError("Cursor Connect is not configured.", 503, "provider_unavailable");
+    if (!deps.bot) throw new ApiError("Cursor Bot is not configured.", 503, "provider_unavailable");
     const force = (request.query as { refresh?: string } | undefined)?.refresh === "true";
-    const models = await deps.connect.listModels(force);
+    const models = await deps.bot.listModels(force);
     return { object: "list", data: models };
   });
 
@@ -192,7 +192,7 @@ function runId(request: FastifyRequest): string {
 }
 
 /** 与 background-worker 的 resumeDecision 同一套规则，但把 pending tool 也算进去。 */
-function resumeDecisionFor(store: CursorConnectStore, id: string): { action: string; reason: string } {
+function resumeDecisionFor(store: CursorBotStore, id: string): { action: string; reason: string } {
   const run = store.run(id)!;
   if (isTerminal(run.status)) return { action: "skip", reason: `run is already ${run.status}` };
   if (store.pendingToolCalls(id).length) {
@@ -205,8 +205,8 @@ function resumeDecisionFor(store: CursorConnectStore, id: string): { action: str
   return { action: "resume", reason: "nothing delivered yet" };
 }
 
-/** 把内部错误转成对外 JSON。Connect 专用端点不走 OpenAI/Anthropic 的错误信封。 */
-export function connectErrorReply(reply: FastifyReply, error: unknown): FastifyReply {
+/** 把内部错误转成对外 JSON。Bot 专用端点不走 OpenAI/Anthropic 的错误信封。 */
+export function botErrorReply(reply: FastifyReply, error: unknown): FastifyReply {
   const api = normalizeError(error);
   return reply.status(api.statusCode).send({ error: { message: api.message, code: api.code } });
 }

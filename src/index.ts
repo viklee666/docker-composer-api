@@ -42,10 +42,10 @@ import {
 } from "./sdk-network.js";
 import { createApp } from "./server.js";
 import { SqliteStateStore } from "./store.js";
-import { BackgroundWorker } from "./cursor-connect/background-worker.js";
-import { ProviderRoutingRunner } from "./cursor-connect/routing-runner.js";
-import { CursorConnectService, connectSettings, seedConnectCredential } from "./cursor-connect/service.js";
-import { CursorConnectStore } from "./cursor-connect/store.js";
+import { BackgroundWorker } from "./cursor-bot/background-worker.js";
+import { ProviderRoutingRunner } from "./cursor-bot/routing-runner.js";
+import { CursorBotService, botSettings, seedBotCredential } from "./cursor-bot/service.js";
+import { CursorBotStore } from "./cursor-bot/store.js";
 
 // Cursor SDK 在云端流以 end-stream error 收场时，底层 ConnectError 可能以 unhandledRejection 形式逃逸
 //（官方已确认的 SDK 行为）。兜底记录并截断，避免拖垮进程或在未来 Node 版本触发非零退出；不打印完整堆栈以免泄露敏感上下文。
@@ -191,40 +191,40 @@ const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
 });
 
 /*
- * Cursor Connect 路线（aiserver.v1.InferenceService/Stream）。
+ * Cursor Bot 路线（aiserver.v1.InferenceService/Stream，上游客户端是 Grok Bot）。
  *
- * 与 SDK 路线彻底并列：自己的凭据表（cc_credentials）、自己的目录缓存、自己的 transport。
+ * 与 SDK 路线彻底并列：自己的凭据表（bot_credentials）、自己的目录缓存、自己的 transport。
  * 一条路线的 key、重试和错误污染不到另一条——`ProviderRoutingRunner` 只按
  * `CursorRunRequest.provider` 分发，选路结果由 server.ts 在建请求时定好。
  *
- * 库共用同一个 SQLite 文件，但表名一律 `cc_` 前缀，且 `src/store.ts` 一行没动。
+ * 库共用同一个 SQLite 文件，但表名一律 `bot_` 前缀，且 `src/store.ts` 一行没动。
  */
-const connectStore = CursorConnectStore.open(config.sqlitePath);
-seedConnectCredential(connectStore, config);
-const connect = new CursorConnectService({ store: connectStore, config });
-if (connect.status().available) {
-  console.log(`Cursor Connect: ${connect.status().activeCredentials} credential(s) ready, base=${connectSettings(config).baseUrl}`);
+const botStore = CursorBotStore.open(config.sqlitePath);
+seedBotCredential(botStore, config);
+const bot = new CursorBotService({ store: botStore, config });
+if (bot.status().available) {
+  console.log(`Cursor Bot: ${bot.status().activeCredentials} credential(s) ready, base=${botSettings(config).baseUrl}`);
 } else {
-  console.log(`Cursor Connect: inactive (${connect.status().reason ?? "未配置"})`);
+  console.log(`Cursor Bot: inactive (${bot.status().reason ?? "未配置"})`);
 }
 
 // background worker 只在显式打开时启动：它会自己取 lease 跑 queued 的 run，
 // 没有对外端点在用的时候白跑一圈没意义。
-const connectWorker = connectSettings(config).background
+const botWorker = botSettings(config).background
   ? new BackgroundWorker({
-      store: connectStore,
+      store: botStore,
       execute: async (run) => {
         // 目前 background run 的实际推理由 tool-results 端点驱动的重新入队承担；
         // worker 负责的是把状态从 queued 推进到有人接手，以及崩溃后的接管。
-        console.log(`[cursor-connect] worker picked run ${run.id} (attempt ${run.attempt})`);
+        console.log(`[cursor-bot] worker picked run ${run.id} (attempt ${run.attempt})`);
         return { status: "awaiting_tool" };
       },
-      onEvent: (event) => connect.publish(event)
+      onEvent: (event) => bot.publish(event)
     })
   : undefined;
-connectWorker?.start();
+botWorker?.start();
 
-const runner = new ProviderRoutingRunner({ sdk: sdkRoute, connect });
+const runner = new ProviderRoutingRunner({ sdk: sdkRoute, bot });
 
 /*
  * 金额是 Cursor 服务端算的、最终一致的：run 刚结束时往往还查不到，
@@ -244,7 +244,7 @@ const app = createApp({
   keyPool,
   gatewayKeyPool,
   usageReconciler,
-  connect,
+  bot,
   startedAt: Date.now(),
   runtime: {
     setRequestLogKeep: (value) => store.setRequestLogKeep(value),
@@ -321,9 +321,9 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
         });
       }
       await executorLeases.releaseAll();
-      // 关停 Connect worker 不是失败：它会把在途 run 放回 queued，重启后接着跑。
-      await connectWorker?.stop();
-      connectStore.close();
+      // 关停 Bot worker 不是失败：它会把在途 run 放回 queued，重启后接着跑。
+      await botWorker?.stop();
+      botStore.close();
       localAgentStore.close();
       process.exit(0);
     })();

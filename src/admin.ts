@@ -3,10 +3,10 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
 import { createCursorApiKey } from "./cursor-account.js";
-import { cursorTokenType, SAND_CLIENT_TYPE } from "./cursor-connect/credentials.js";
-import { CONNECT_MODEL_PREFIX, selectProvider } from "./cursor-connect/router.js";
-import { CursorConnectService, connectSettings } from "./cursor-connect/service.js";
-import type { CcCredential } from "./cursor-connect/store.js";
+import { cursorTokenType, SAND_CLIENT_TYPE } from "./cursor-bot/credentials.js";
+import { BOT_MODEL_PREFIX, selectProvider } from "./cursor-bot/router.js";
+import { CursorBotService, botSettings } from "./cursor-bot/service.js";
+import type { BotCredential } from "./cursor-bot/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { GatewayKeyPool } from "./gateway-key-pool.js";
 import { shouldUseDurableHub } from "./config.js";
@@ -556,35 +556,35 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return testProxy(raw);
   });
 
-  /* ------------------------------------------------ Cursor Connect 路线 */
+  /* ------------------------------------------------ Cursor Bot 路线 */
 
   /**
-   * Connect 面板的总览。
+   * Bot 面板的总览。
    * 凭据一律**不回传 token**：只给出形状提示，后台能认出是哪一把、但拿不到明文。
    */
-  app.get("/admin/api/connect", async (request) => {
+  app.get("/admin/api/bot", async (request) => {
     requireAdmin(request, deps);
-    const settings = connectSettings(deps.config);
+    const settings = botSettings(deps.config);
     const cursorKeys = (await deps.keyPool.list()).map(publicKey);
-    if (!deps.connect) {
-      return { enabled: false, settings, status: { available: false, reason: "网关未装载 Connect 路线" }, credentials: [], cursorKeys };
+    if (!deps.bot) {
+      return { enabled: false, settings, status: { available: false, reason: "网关未装载 Bot 路线" }, credentials: [], cursorKeys };
     }
     return {
       enabled: true,
       settings,
-      status: deps.connect.status(),
-      credentials: deps.connect.store.listCredentials().map(publicCredential),
+      status: deps.bot.status(),
+      credentials: deps.bot.store.listCredentials().map(publicCredential),
       cursorKeys
     };
   });
 
   /**
-   * 从 Cursor Key 池兑换 Connect session token。
+   * 从 Cursor Key 池兑换 Bot session token。
    * 必须挂在 `credentials/:id` 之前，避免 `from-key` 被当成凭据 id。
    */
-  app.post("/admin/api/connect/credentials/from-key", async (request) => {
+  app.post("/admin/api/bot/credentials/from-key", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const body = objectBody(request.body);
     const cursorKeyId = typeof body.cursorKeyId === "string" ? body.cursorKeyId.trim() : "";
     if (!cursorKeyId) {
@@ -592,16 +592,16 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     const key = await deps.keyPool.get(cursorKeyId);
     if (!key) throw new ApiError("Cursor key not found.", 404, "not_found", "cursorKeyId");
-    const record = await connect.importFromCursorKey(key, {
+    const record = await bot.importFromCursorKey(key, {
       label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined,
       machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : undefined
     });
     return { credential: publicCredential(record) };
   });
 
-  app.post("/admin/api/connect/credentials", async (request) => {
+  app.post("/admin/api/bot/credentials", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const body = objectBody(request.body);
     const token = typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
     if (!token) {
@@ -611,13 +611,13 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     if (cursorTokenType(token) === "web") {
       throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
     }
-    const record = connect.store.upsertCredential({
+    const record = bot.store.upsertCredential({
       sessionToken: token,
       label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined,
       // machineId 生命周期内不可变：不给就生成一把并持久化，绝不每次请求随机。
       machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : randomUUID(),
       macMachineId: stringParam(body.macMachineId),
-      clientVersion: stringParam(body.clientVersion) ?? connectSettings(deps.config).clientVersion,
+      clientVersion: stringParam(body.clientVersion) ?? botSettings(deps.config).clientVersion,
       clientOs: stringParam(body.clientOs) ?? process.platform,
       clientArch: stringParam(body.clientArch) ?? process.arch,
       deviceType: stringParam(body.deviceType) ?? "desktop",
@@ -628,18 +628,18 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { credential: publicCredential(record) };
   });
 
-  app.post("/admin/api/connect/credentials/:id", async (request) => {
+  app.post("/admin/api/bot/credentials/:id", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const id = keyId(request);
-    const existing = connect.store.credential(id);
+    const existing = bot.store.credential(id);
     if (!existing) throw new ApiError("Credential not found.", 404, "not_found");
     const body = objectBody(request.body);
     const token = typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
     if (token && cursorTokenType(token) === "web") {
       throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
     }
-    const record = connect.store.upsertCredential({
+    const record = bot.store.upsertCredential({
       id,
       ...(token ? { sessionToken: token } : {}),
       label: stringParam(body.label),
@@ -656,36 +656,36 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { credential: publicCredential(record) };
   });
 
-  app.post("/admin/api/connect/credentials/:id/enable", async (request) => {
+  app.post("/admin/api/bot/credentials/:id/enable", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
-    connect.store.setCredentialStatus(keyId(request), "active");
-    return { credential: publicCredential(connect.store.credential(keyId(request))!) };
+    const bot = requireBot(deps);
+    bot.store.setCredentialStatus(keyId(request), "active");
+    return { credential: publicCredential(bot.store.credential(keyId(request))!) };
   });
 
-  app.post("/admin/api/connect/credentials/:id/disable", async (request) => {
+  app.post("/admin/api/bot/credentials/:id/disable", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
-    connect.store.setCredentialStatus(keyId(request), "disabled");
-    return { credential: publicCredential(connect.store.credential(keyId(request))!) };
+    const bot = requireBot(deps);
+    bot.store.setCredentialStatus(keyId(request), "disabled");
+    return { credential: publicCredential(bot.store.credential(keyId(request))!) };
   });
 
-  app.delete("/admin/api/connect/credentials/:id", async (request) => {
+  app.delete("/admin/api/bot/credentials/:id", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
-    if (!connect.store.deleteCredential(keyId(request))) {
+    const bot = requireBot(deps);
+    if (!bot.store.deleteCredential(keyId(request))) {
       throw new ApiError("Credential not found.", 404, "not_found");
     }
     return { deleted: true };
   });
 
   /** 连通性测试：真打一次 AvailableModels，成功回目录规模，失败原样把上游错误交回后台。 */
-  app.post("/admin/api/connect/credentials/:id/test", async (request) => {
+  app.post("/admin/api/bot/credentials/:id/test", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const startedAt = Date.now();
     try {
-      const result = await connect.testCredential(keyId(request));
+      const result = await bot.testCredential(keyId(request));
       return { ...result, durationMs: Date.now() - startedAt };
     } catch (error) {
       const api = normalizeError(error);
@@ -693,42 +693,42 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
   });
 
-  app.get("/admin/api/connect/models", async (request) => {
+  app.get("/admin/api/bot/models", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const refresh = (request.query as { refresh?: string } | undefined)?.refresh === "true";
-    return { models: await connect.listModels(refresh) };
+    return { models: await bot.listModels(refresh) };
   });
 
-  app.get("/admin/api/connect/runs", async (request) => {
+  app.get("/admin/api/bot/runs", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const limit = positiveInt((request.query as { limit?: string } | undefined)?.limit) ?? 50;
-    return { runs: connect.store.listRuns({ limit }) };
+    return { runs: bot.store.listRuns({ limit }) };
   });
 
-  app.get("/admin/api/connect/runs/:id", async (request) => {
+  app.get("/admin/api/bot/runs/:id", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const id = keyId(request);
-    const run = connect.store.run(id);
+    const run = bot.store.run(id);
     if (!run) throw new ApiError("Run not found.", 404, "not_found");
     return {
       run,
-      toolCalls: connect.store.toolCalls(id),
-      tasks: connect.store.tasksForRun(id),
-      events: connect.store.eventsAfter(id, 0, 200)
+      toolCalls: bot.store.toolCalls(id),
+      tasks: bot.store.tasksForRun(id),
+      events: bot.store.eventsAfter(id, 0, 200)
     };
   });
 
-  app.post("/admin/api/connect/runs/:id/cancel", async (request) => {
+  app.post("/admin/api/bot/runs/:id/cancel", async (request) => {
     requireAdmin(request, deps);
-    const connect = requireConnect(deps);
+    const bot = requireBot(deps);
     const id = keyId(request);
-    const run = connect.store.run(id);
+    const run = bot.store.run(id);
     if (!run) throw new ApiError("Run not found.", 404, "not_found");
-    connect.store.releaseRunLease(id, "cancelled");
-    return { run: connect.store.run(id) };
+    bot.store.releaseRunLease(id, "cancelled");
+    return { run: bot.store.run(id) };
   });
 
   app.get("/admin/api/keys", async (request) => {
@@ -958,11 +958,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const startedAt = Date.now();
     const requestedModel = normalizeModel(body.model);
     // 后台测试必须自己选路：它不经过 server.ts 的 loggedRunRequest，
-    // 不写 provider 的话即使用了 connect/ 前缀也还是打到 SDK。
+    // 不写 provider 的话即使用了 bot/ 前缀也还是打到 SDK。
     const route = adminTestRoute(body, requestedModel);
-    if (route.provider === "connect" && keyId) {
+    if (route.provider === "bot" && keyId) {
       throw new ApiError(
-        "Connect 路线不使用 Cursor Key 池，请去掉 keyId。",
+        "Bot 路线不使用 Cursor Key 池，请去掉 keyId。",
         400,
         "invalid_request_error",
         "keyId"
@@ -976,7 +976,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const run: CursorRunRequest = {
       protocol: "openai-chat",
       apiKey: "",
-      useKeyPool: route.provider !== "connect",
+      useKeyPool: route.provider !== "bot",
       keyUsageRef,
       model: route.model,
       prompt: `You are serving a gateway connectivity test. Return only final answer text.\n\nUSER: ${prompt}`,
@@ -992,14 +992,14 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       mode: deps.config.cursorAgentMode,
       provider: route.provider
     };
-    if (route.provider === "connect") {
-      const connect = deps.connect;
-      if (!connect?.available) {
-        const error = connect?.status().reason ?? "这个网关没有装载 Cursor Connect 路线。";
+    if (route.provider === "bot") {
+      const bot = deps.bot;
+      if (!bot?.available) {
+        const error = bot?.status().reason ?? "这个网关没有装载 Cursor Bot 路线。";
         logTest(deps, startedAt, run.model, keyUsageRef, 503, error, { clientType: SAND_CLIENT_TYPE });
         return {
           ok: false,
-          provider: "connect",
+          provider: "bot",
           error,
           keyLabel: null,
           durationMs: Date.now() - startedAt
@@ -1017,8 +1017,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.config.requestTimeoutMs);
-    const runner = route.provider === "connect" && deps.connect ? deps.connect : deps.runner;
-    const logClientType = route.provider === "connect" ? SAND_CLIENT_TYPE : undefined;
+    const runner = route.provider === "bot" && deps.bot ? deps.bot : deps.runner;
+    const logClientType = route.provider === "bot" ? SAND_CLIENT_TYPE : undefined;
     try {
       // 与 abort 竞速：上游完全无视 signal 挂死时，联通性测试也必须在超时后返回而非悬挂。
       const output = await raceWithAbort(runner.run(run, controller.signal), controller.signal);
@@ -1054,18 +1054,18 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
 
 /**
  * 后台测试的选路。可用性故意当成 true：不可用时由 handler 返回 ok:false，
- * 而不是 selectProvider 那种静默回落 SDK——否则点 Connect 测通了其实走的还是密钥池。
+ * 而不是 selectProvider 那种静默回落 SDK——否则点 Bot 测通了其实走的还是密钥池。
  */
-function adminTestRoute(body: Record<string, unknown>, model: string): { provider: "sdk" | "connect"; model: string } {
+function adminTestRoute(body: Record<string, unknown>, model: string): { provider: "sdk" | "bot"; model: string } {
   const selection = selectProvider({
     model,
     keySetting: typeof body.provider === "string" ? body.provider : undefined,
-    connectAvailable: true,
+    botAvailable: true,
     defaultProvider: "sdk"
   });
   return {
     provider: selection.provider,
-    model: selection.model ?? (model.toLowerCase().startsWith(CONNECT_MODEL_PREFIX) ? model.slice(CONNECT_MODEL_PREFIX.length) : model)
+    model: selection.model ?? (model.toLowerCase().startsWith(BOT_MODEL_PREFIX) ? model.slice(BOT_MODEL_PREFIX.length) : model)
   };
 }
 
@@ -1085,18 +1085,18 @@ function requireAdmin(request: FastifyRequest, deps: AppDeps): void {
 }
 
 /** 多密钥入站没接上时所有 gateway-keys 接口都得直接 503，否则 UI 会以为写进去了其实根本没池。 */
-function requireConnect(deps: AppDeps): CursorConnectService {
-  if (!deps.connect) {
-    throw new ApiError("这个网关没有装载 Cursor Connect 路线。", 503, "provider_unavailable");
+function requireBot(deps: AppDeps): CursorBotService {
+  if (!deps.bot) {
+    throw new ApiError("这个网关没有装载 Cursor Bot 路线。", 503, "provider_unavailable");
   }
-  return deps.connect;
+  return deps.bot;
 }
 
 /**
  * 凭据的对外形状。**绝不回传 token**：后台只需要认出是哪一把，
  * 而一个能读回明文的接口等于把库里的凭据搬到了浏览器里。
  */
-function publicCredential(record: CcCredential): Record<string, unknown> {
+function publicCredential(record: BotCredential): Record<string, unknown> {
   return {
     id: record.id,
     label: record.label ?? null,

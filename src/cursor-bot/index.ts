@@ -1,8 +1,8 @@
 /**
- * Cursor Connect provider（`aiserver.v1.InferenceService/Stream`）。
+ * Cursor Bot provider（`aiserver.v1.InferenceService/Stream`，上游客户端是 Grok Bot）。
  *
  * 与 SDK 路线（`cursor-runner.ts` + `@cursor/sdk`）完全并列、互不引用：
- * 这里自己做 Connect envelope、鉴权头与 protobuf 编解码，不用 SDK 的 Agent 生命周期，
+ * 这里自己做 Connect envelope、鉴权头与 protobuf 编解码（协议名是事实，不改），不用 SDK 的 Agent 生命周期，
  * 也不用 `sand-client.ts` 的 ESM loader hook。
  *
  * 协议字段的唯一来源是 `docs/reference/inference-descriptor-8844.txt`
@@ -46,7 +46,7 @@ export {
   assertUsableCredential,
   credentialClientType,
   cursorTokenType,
-  type CursorConnectCredential,
+  type CursorBotCredential,
   type CursorTokenType
 } from "./credentials.js";
 
@@ -69,12 +69,12 @@ export {
 } from "./api-key-exchange.js";
 
 export {
-  CursorConnectClient,
-  DEFAULT_CONNECT_BASE_URL,
+  CursorBotClient,
+  DEFAULT_BOT_BASE_URL,
   INFERENCE_SERVICE,
   STREAM_METHOD,
   methodUrl,
-  type CursorConnectClientOptions
+  type CursorBotClientOptions
 } from "./client.js";
 
 export {
@@ -82,16 +82,16 @@ export {
   buildRequestedModel,
   toStruct,
   toValue,
-  type ConnectConversation,
-  type ConnectMessage,
-  type ConnectModelConfig,
-  type ConnectReasoningPart,
-  type ConnectRequestedModel,
-  type ConnectRole,
-  type ConnectToolResult
+  type BotConversation as BotRequestConversation,
+  type BotMessage,
+  type BotModelConfig,
+  type BotReasoningPart,
+  type BotRequestedModel,
+  type BotRole,
+  type BotToolResult
 } from "./request-builder.js";
 
-export { ResponseNormalizer, type ConnectRunState } from "./response-normalizer.js";
+export { ResponseNormalizer, type BotRunState } from "./response-normalizer.js";
 
 export {
   DEFAULT_CATALOG_FAILURE_TTL_MS,
@@ -104,9 +104,9 @@ export {
 } from "./catalog.js";
 
 export {
-  CursorConnectProvider,
+  CursorBotProvider,
   conversationIdFor,
-  type CursorConnectProviderOptions
+  type CursorBotProviderOptions
 } from "./provider.js";
 
 export {
@@ -130,13 +130,13 @@ export {
 } from "./events.js";
 
 export {
-  CursorConnectStore,
+  CursorBotStore,
   isTerminal,
-  type CcConversation,
-  type CcRun,
-  type CcSummary,
-  type CcTask,
-  type CcToolCall,
+  type BotConversation,
+  type BotRun,
+  type BotSummary,
+  type BotTask,
+  type BotToolCall,
   type DeliveryState,
   type RunStatus,
   type TaskStatus,
@@ -194,11 +194,11 @@ export {
 } from "./background-worker.js";
 
 export {
-  CONNECT_MODEL_PREFIX,
+  BOT_MODEL_PREFIX,
   PROVIDER_HEADER,
   ProviderRouter,
-  connectModelScope,
-  isConnectModelId,
+  botModelScope,
+  isBotModelId,
   selectProvider,
   type ProviderId,
   type ProviderSelection

@@ -9,17 +9,17 @@ import type {
   ModelParameterValue
 } from "../types.js";
 import { ModelCatalogCache, resolveRequestedModel, type ModelCatalogPort } from "./catalog.js";
-import { CursorConnectClient, type CursorConnectClientOptions } from "./client.js";
-import { SAND_CLIENT_TYPE, type CursorConnectCredential } from "./credentials.js";
+import { CursorBotClient, type CursorBotClientOptions } from "./client.js";
+import { SAND_CLIENT_TYPE, type CursorBotCredential } from "./credentials.js";
 import type { ConnectCompression } from "./envelope.js";
 import type { ConnectCodec } from "./headers.js";
-import { buildInferenceStreamRequest, type ConnectConversation, type ConnectMessage } from "./request-builder.js";
+import { buildInferenceStreamRequest, type BotConversation, type BotMessage } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
 import type { ConnectFetch } from "./transport.js";
 
-export interface CursorConnectProviderOptions {
+export interface CursorBotProviderOptions {
   /** 每个请求解析一次凭据：调用方可以按 key / 租户挑不同的 credential。 */
-  resolveCredential: (input: CursorRunRequest) => CursorConnectCredential;
+  resolveCredential: (input: CursorRunRequest) => CursorBotCredential;
   baseUrl?: string;
   codec?: ConnectCodec;
   requestCompression?: ConnectCompression;
@@ -57,10 +57,10 @@ export interface CursorConnectProviderOptions {
  * `key-rotating-runner.ts` 和三套 SSE 输出层一行都不用改，SDK 路线也不受影响。
  * 真正需要新接口的是工具 loop 与 background（G6/G9），到那时再定，现在定必然要推翻。
  */
-export class CursorConnectProvider implements CursorRunner {
+export class CursorBotProvider implements CursorRunner {
   private readonly catalog?: ModelCatalogCache;
 
-  constructor(private readonly options: CursorConnectProviderOptions) {
+  constructor(private readonly options: CursorBotProviderOptions) {
     if (options.getModelCatalog) {
       this.catalog = new ModelCatalogCache(options.getModelCatalog, { ttlMs: options.catalogTtlMs });
     }
@@ -78,7 +78,7 @@ export class CursorConnectProvider implements CursorRunner {
     const credential = this.options.resolveCredential(input);
     // 先建 client：它的构造函数会校验凭据。放在 buildConversation 之后的话，
     // 一份缺字段的凭据要先白跑一次目录查询（可能是网络往返）才会被拒。
-    const client = new CursorConnectClient(this.clientOptions(credential));
+    const client = new CursorBotClient(this.clientOptions(credential));
     const conversation = await this.buildConversation(input, credential);
     const normalizer = new ResponseNormalizer();
 
@@ -97,7 +97,7 @@ export class CursorConnectProvider implements CursorRunner {
     yield { type: "done", result: normalizer.result() };
   }
 
-  private clientOptions(credential: CursorConnectCredential): CursorConnectClientOptions {
+  private clientOptions(credential: CursorBotCredential): CursorBotClientOptions {
     return {
       credential,
       baseUrl: this.options.baseUrl,
@@ -112,8 +112,8 @@ export class CursorConnectProvider implements CursorRunner {
 
   private async buildConversation(
     input: CursorRunRequest,
-    credential: CursorConnectCredential
-  ): Promise<ConnectConversation> {
+    credential: CursorBotCredential
+  ): Promise<BotConversation> {
     const intent = intentFrom(input);
     // 只有真有语义意图时才查目录：没意图时参数一定为空，查了也用不上。
     const needsCatalog = intent.reasoningEffort !== undefined || intent.maxMode !== undefined || intent.fast !== undefined;
@@ -121,12 +121,12 @@ export class CursorConnectProvider implements CursorRunner {
     const resolved = resolveRequestedModel({ modelId: input.model, intent, catalog });
     if (resolved.dropped.length) {
       console.warn(
-        `[cursor-connect] model="${input.model}" dropped intent: ${resolved.dropped.join(", ")}` +
+        `[cursor-bot] model="${input.model}" dropped intent: ${resolved.dropped.join(", ")}` +
           (resolved.usedFallback ? " (catalog unavailable, used family fallback)" : "")
       );
     }
 
-    const messages: ConnectMessage[] = [];
+    const messages: BotMessage[] = [];
     for (const instruction of this.options.systemInstructions ?? []) {
       if (instruction.trim()) messages.push({ role: "system", text: instruction });
     }
@@ -143,7 +143,7 @@ export class CursorConnectProvider implements CursorRunner {
   }
 
   /** 下发参数写回 telemetryRef，与 SDK 路线同一条通道，请求日志无需区分 provider。 */
-  private recordRequestTelemetry(input: CursorRunRequest, conversation: ConnectConversation): void {
+  private recordRequestTelemetry(input: CursorRunRequest, conversation: BotConversation): void {
     const telemetry = input.telemetryRef;
     if (!telemetry) return;
     telemetry.upstreamModel = conversation.requestedModel.modelId;
@@ -172,7 +172,7 @@ function intentFrom(input: CursorRunRequest): ModelIntent {
   };
 }
 
-function modelConfigFrom(input: CursorRunRequest): ConnectConversation["modelConfig"] {
+function modelConfigFrom(input: CursorRunRequest): BotConversation["modelConfig"] {
   const config = {
     maxTokens: input.maxTokens,
     temperature: input.temperature,

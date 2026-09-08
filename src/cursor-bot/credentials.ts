@@ -7,12 +7,12 @@ export const SAND_CLIENT_TYPE = "sand";
 export const SAND_DEFAULT_MODEL_ID = "grok-4.5";
 
 /**
- * Connect 路线的一份凭据。
+ * Cursor Bot 路线的一份凭据。
  *
- * 与 SDK 路线的 `CURSOR_API_KEYS` 是两套东西：SDK 用 API key，Connect 用 session JWT
+ * 与 SDK 路线的 `CURSOR_API_KEYS` 是两套东西：SDK 用 API key，Bot 用 session JWT
  * 加一组**必须稳定**的设备标识。machineId 每次请求换一个，上游看到的就是每次一台新设备。
  */
-export interface CursorConnectCredential {
+export interface CursorBotCredential {
   /** 库内标识，仅用于日志与缓存分片，不发给上游。 */
   id: string;
   label?: string;
@@ -41,7 +41,7 @@ export interface CursorConnectCredential {
 /** JWT payload 里的 `type` claim；浏览器登录态是 `web`，不能拿去调推理。 */
 export type CursorTokenType = "session" | "web" | "unknown";
 
-export function credentialClientType(credential: CursorConnectCredential): string {
+export function credentialClientType(credential: CursorBotCredential): string {
   return credential.clientType?.trim() || SAND_CLIENT_TYPE;
 }
 
@@ -70,16 +70,16 @@ export function cursorTokenType(token: string): CursorTokenType {
  *
  * 抛出的消息里绝不含 token 本身。
  */
-export function assertUsableCredential(credential: CursorConnectCredential): void {
+export function assertUsableCredential(credential: CursorBotCredential): void {
   const missing = (["sessionToken", "machineId", "clientVersion"] as const).filter(
     (field) => !credential[field]?.trim()
   );
   if (missing.length) {
-    throw new ApiError(`Cursor Connect credential is missing ${missing.join(", ")}.`, 500, "invalid_credential");
+    throw new ApiError(`Cursor Bot credential is missing ${missing.join(", ")}.`, 500, "invalid_credential");
   }
   if (cursorTokenType(credential.sessionToken) === "web") {
     throw new ApiError(
-      "Cursor Connect credential holds a browser web token; a session token is required.",
+      "Cursor Bot credential holds a browser web token; a session token is required.",
       401,
       "unauthorized"
     );

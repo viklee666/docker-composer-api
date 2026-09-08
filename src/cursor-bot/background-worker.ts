@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { UnifiedEvent } from "./events.js";
 import { isGatewayGenerated } from "./events.js";
-import type { CcRun, CursorConnectStore, DeliveryState, RunStatus } from "./store.js";
+import type { BotRun, CursorBotStore, DeliveryState, RunStatus } from "./store.js";
 import { isTerminal } from "./store.js";
 
 /**
@@ -25,10 +25,10 @@ export interface RunExecution {
 }
 
 /** 真正跑一个 run。worker 只管 lease、状态机与事件顺序。 */
-export type RunExecutor = (run: CcRun, signal: AbortSignal) => Promise<RunExecution>;
+export type RunExecutor = (run: BotRun, signal: AbortSignal) => Promise<RunExecution>;
 
 export interface BackgroundWorkerOptions {
-  store: CursorConnectStore;
+  store: CursorBotStore;
   execute: RunExecutor;
   owner?: string;
   leaseMs?: number;
@@ -83,7 +83,7 @@ export class BackgroundWorker {
     }
   }
 
-  private async runOne(run: CcRun): Promise<void> {
+  private async runOne(run: BotRun): Promise<void> {
     const controller = new AbortController();
     this.controllers.set(run.id, controller);
     try {
@@ -134,7 +134,7 @@ export class BackgroundWorker {
   }
 
   private emit(
-    run: CcRun,
+    run: BotRun,
     type: "run.started" | "run.errored" | "run.paused" | "run.cancelled" | "run.finished",
     payload: Record<string, unknown>
   ): void {
@@ -160,7 +160,7 @@ export class ReplayBridge {
   private live = false;
 
   constructor(
-    private readonly store: CursorConnectStore,
+    private readonly store: CursorBotStore,
     private readonly runId: string,
     /** 缓冲上限。缓冲里的事件都已经落库，溢出丢掉不会丢数据——backfill 会从库里查回来。 */
     private readonly maxBuffer = 4096
@@ -214,7 +214,7 @@ export class ReplayBridge {
  * 已经把半截文本发给客户端的 run 重跑会重复输出，这种情况宁可标 `unknown`
  * 让调用方决定，也不要假装恢复成功。
  */
-export function resumeDecision(run: CcRun, hasSideEffectingTools = false): {
+export function resumeDecision(run: BotRun, hasSideEffectingTools = false): {
   action: "skip" | "resume" | "await_tool" | "unknown";
   reason: string;
 } {

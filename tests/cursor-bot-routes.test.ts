@@ -7,19 +7,19 @@ import type { ModelLister } from "../src/models.js";
 import { createApp } from "../src/server.js";
 import { MemoryStateStore } from "../src/store.js";
 import type { CursorRunResult, CursorRunner, CursorStreamEvent, GatewayConfig } from "../src/types.js";
-import { encodeEnvelope } from "../src/cursor-connect/envelope.js";
-import { ProviderRoutingRunner } from "../src/cursor-connect/routing-runner.js";
-import { CursorConnectService } from "../src/cursor-connect/service.js";
-import { CursorConnectStore } from "../src/cursor-connect/store.js";
+import { encodeEnvelope } from "../src/cursor-bot/envelope.js";
+import { ProviderRoutingRunner } from "../src/cursor-bot/routing-runner.js";
+import { CursorBotService } from "../src/cursor-bot/service.js";
+import { CursorBotStore } from "../src/cursor-bot/store.js";
 import {
   AvailableModelsResponse,
   AvailableModelsResponse_AvailableModel,
   AvailableModelsResponse_DegradationStatus
-} from "../src/cursor-connect/proto/available_models_pb.js";
+} from "../src/cursor-bot/proto/available_models_pb.js";
 import {
   InferenceStreamResponse,
   InferenceTextStreamPart
-} from "../src/cursor-connect/proto/inference_pb.js";
+} from "../src/cursor-bot/proto/inference_pb.js";
 
 const ADMIN_PASSWORD = "admin-secret";
 const GATEWAY_KEY = "gw-key";
@@ -39,7 +39,7 @@ function jwt(payload: Record<string, unknown>): string {
 }
 
 /** 一元上游桩：AvailableModels 的请求与响应都是裸 protobuf；兑换接口走 JSON；Stream 回一段 pong。 */
-function connectFetch(
+function botFetch(
   models: AvailableModelsResponse_AvailableModel[],
   exchange: {
     accessToken?: string;
@@ -91,7 +91,7 @@ function connectFetch(
         { status: 200 }
       );
     }
-    return new Response(`unexpected connect url: ${href}`, { status: 500 });
+    return new Response(`unexpected bot url: ${href}`, { status: 500 });
   };
 }
 
@@ -99,7 +99,7 @@ async function buildApp(
   options: {
     withCredential?: boolean;
     config?: Partial<GatewayConfig>;
-    exchange?: Parameters<typeof connectFetch>[1];
+    exchange?: Parameters<typeof botFetch>[1];
     modelLister?: ModelLister;
     gatewayKeyPool?: GatewayKeyPool;
   } = {}
@@ -115,14 +115,14 @@ async function buildApp(
   const keyPool = new CursorKeyPool(store);
   await keyPool.seedFromEnv(["cursor-key"]);
 
-  const connectStore = CursorConnectStore.open(":memory:");
+  const botStore = CursorBotStore.open(":memory:");
   if (options.withCredential) {
-    connectStore.upsertCredential({ sessionToken: "session-token", machineId: "machine-1", clientVersion: "3.18.9" });
+    botStore.upsertCredential({ sessionToken: "session-token", machineId: "machine-1", clientVersion: "3.18.9" });
   }
-  const connect = new CursorConnectService({
-    store: connectStore,
+  const bot = new CursorBotService({
+    store: botStore,
     config,
-    fetchImpl: connectFetch(
+    fetchImpl: botFetch(
       [
         new AvailableModelsResponse_AvailableModel({ name: "grok-4.6", defaultOn: true }),
         new AvailableModelsResponse_AvailableModel({
@@ -137,13 +137,13 @@ async function buildApp(
   const app = createApp({
     config,
     store,
-    runner: new ProviderRoutingRunner({ sdk: new StubRunner(), connect }),
+    runner: new ProviderRoutingRunner({ sdk: new StubRunner(), bot }),
     keyPool,
-    connect,
+    bot,
     ...(options.modelLister ? { modelLister: options.modelLister } : {}),
     ...(options.gatewayKeyPool ? { gatewayKeyPool: options.gatewayKeyPool } : {})
   });
-  return { app, connect, connectStore, keyPool };
+  return { app, bot, botStore, keyPool };
 }
 
 const adminAuth = { authorization: `Bearer ${ADMIN_PASSWORD}` };
@@ -151,9 +151,9 @@ const apiAuth = { authorization: `Bearer ${GATEWAY_KEY}` };
 
 /* ------------------------------------------------------------ 管理接口 */
 
-test("the admin connect panel reports an unconfigured route instead of failing", async () => {
+test("the admin bot panel reports an unconfigured route instead of failing", async () => {
   const { app } = await buildApp();
-  const response = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  const response = await app.inject({ method: "GET", url: "/admin/api/bot", headers: adminAuth });
   assert.equal(response.statusCode, 200);
   const body = response.json() as { enabled: boolean; status: { available: boolean }; credentials: unknown[] };
   assert.equal(body.enabled, true);
@@ -164,7 +164,7 @@ test("the admin connect panel reports an unconfigured route instead of failing",
 
 test("admin endpoints require the admin password, not just any gateway key", async () => {
   const { app } = await buildApp({ withCredential: true });
-  for (const url of ["/admin/api/connect", "/admin/api/connect/models", "/admin/api/connect/runs"]) {
+  for (const url of ["/admin/api/bot", "/admin/api/bot/models", "/admin/api/bot/runs"]) {
     assert.equal((await app.inject({ method: "GET", url })).statusCode, 401, `${url} 应拒绝匿名请求`);
     assert.equal(
       (await app.inject({ method: "GET", url, headers: apiAuth })).statusCode,
@@ -172,7 +172,7 @@ test("admin endpoints require the admin password, not just any gateway key", asy
       `${url} 不该接受普通网关密钥`
     );
   }
-  const fromKey = "/admin/api/connect/credentials/from-key";
+  const fromKey = "/admin/api/bot/credentials/from-key";
   assert.equal((await app.inject({ method: "POST", url: fromKey, payload: { cursorKeyId: "x" } })).statusCode, 401);
   assert.equal(
     (await app.inject({ method: "POST", url: fromKey, headers: apiAuth, payload: { cursorKeyId: "x" } })).statusCode,
@@ -185,7 +185,7 @@ test("a credential can be created, tested, disabled and deleted from the admin A
   const { app } = await buildApp();
   const created = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials",
+    url: "/admin/api/bot/credentials",
     headers: adminAuth,
     payload: { sessionToken: "brand-new-token", label: "primary" }
   });
@@ -200,7 +200,7 @@ test("a credential can be created, tested, disabled and deleted from the admin A
 
   const tested = await app.inject({
     method: "POST",
-    url: `/admin/api/connect/credentials/${id}/test`,
+    url: `/admin/api/bot/credentials/${id}/test`,
     headers: adminAuth
   });
   assert.equal(tested.statusCode, 200);
@@ -208,32 +208,32 @@ test("a credential can be created, tested, disabled and deleted from the admin A
 
   const disabled = await app.inject({
     method: "POST",
-    url: `/admin/api/connect/credentials/${id}/disable`,
+    url: `/admin/api/bot/credentials/${id}/disable`,
     headers: adminAuth
   });
   assert.equal((disabled.json() as { credential: { status: string } }).credential.status, "disabled");
 
   const removed = await app.inject({
     method: "DELETE",
-    url: `/admin/api/connect/credentials/${id}`,
+    url: `/admin/api/bot/credentials/${id}`,
     headers: adminAuth
   });
   assert.equal(removed.statusCode, 200);
-  const after = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  const after = await app.inject({ method: "GET", url: "/admin/api/bot", headers: adminAuth });
   assert.deepEqual((after.json() as { credentials: unknown[] }).credentials, []);
   await app.close();
 });
 
-test("a connect credential can be imported from a Cursor key in the pool", async () => {
+test("a bot credential can be imported from a Cursor key in the pool", async () => {
   const calls: Array<{ url: string; authorization: string; body: string }> = [];
   const accessToken = jwt({ type: "session", sub: "acct" });
-  const { app, connectStore, keyPool } = await buildApp({
+  const { app, botStore, keyPool } = await buildApp({
     exchange: { accessToken, refreshToken: "refresh-token", calls }
   });
   const [key] = await keyPool.list();
   const created = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials/from-key",
+    url: "/admin/api/bot/credentials/from-key",
     headers: adminAuth,
     payload: { cursorKeyId: key.id }
   });
@@ -248,39 +248,39 @@ test("a connect credential can be imported from a Cursor key in the pool", async
   assert.equal(calls[0].authorization, `Bearer ${key.apiKey}`);
   assert.equal(calls[0].body, "{}");
 
-  const stored = connectStore.credential(String(credential.id));
+  const stored = botStore.credential(String(credential.id));
   assert.equal(stored?.sessionToken, accessToken);
   assert.equal(stored?.sourceCursorKeyId, key.id);
   const machineId = stored!.machineId;
 
-  const listed = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  const listed = await app.inject({ method: "GET", url: "/admin/api/bot", headers: adminAuth });
   assert.doesNotMatch(listed.body, new RegExp(accessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(listed.body, new RegExp(key.apiKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
   const again = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials/from-key",
+    url: "/admin/api/bot/credentials/from-key",
     headers: adminAuth,
     payload: { cursorKeyId: key.id, machineId: "should-not-replace" }
   });
   assert.equal(again.statusCode, 200);
   const updated = (again.json() as { credential: { id: string } }).credential;
   assert.equal(updated.id, credential.id, "同一把 key 再拉应更新而不是新建");
-  assert.equal(connectStore.credential(updated.id)?.machineId, machineId);
-  assert.equal(connectStore.listCredentials().length, 1);
+  assert.equal(botStore.credential(updated.id)?.machineId, machineId);
+  assert.equal(botStore.listCredentials().length, 1);
   await app.close();
 });
 
 test("importing from a missing Cursor key is 404 and does not invent a credential", async () => {
-  const { app, connectStore } = await buildApp();
+  const { app, botStore } = await buildApp();
   const response = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials/from-key",
+    url: "/admin/api/bot/credentials/from-key",
     headers: adminAuth,
     payload: { cursorKeyId: "missing-key" }
   });
   assert.equal(response.statusCode, 404);
-  assert.equal(connectStore.listCredentials().length, 0);
+  assert.equal(botStore.listCredentials().length, 0);
   await app.close();
 });
 
@@ -288,7 +288,7 @@ test("from-key requires a cursorKeyId", async () => {
   const { app } = await buildApp();
   const response = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials/from-key",
+    url: "/admin/api/bot/credentials/from-key",
     headers: adminAuth,
     payload: {}
   });
@@ -301,7 +301,7 @@ test("from-key surfaces exchange failures without leaking the Cursor key", async
   const [key] = await keyPool.list();
   const response = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials/from-key",
+    url: "/admin/api/bot/credentials/from-key",
     headers: adminAuth,
     payload: { cursorKeyId: key.id }
   });
@@ -310,10 +310,10 @@ test("from-key surfaces exchange failures without leaking the Cursor key", async
   await app.close();
 });
 
-test("the admin connect panel lists Cursor keys for import", async () => {
+test("the admin bot panel lists Cursor keys for import", async () => {
   const { app, keyPool } = await buildApp();
   const [key] = await keyPool.list();
-  const response = await app.inject({ method: "GET", url: "/admin/api/connect", headers: adminAuth });
+  const response = await app.inject({ method: "GET", url: "/admin/api/bot", headers: adminAuth });
   const body = response.json() as { cursorKeys: Array<{ id: string; apiKey?: string; maskedKey: string }> };
   assert.equal(body.cursorKeys.length, 1);
   assert.equal(body.cursorKeys[0].id, key.id);
@@ -328,7 +328,7 @@ test("a browser web token is refused before it ever reaches the upstream", async
   const webToken = `${encode({ alg: "none" })}.${encode({ type: "web" })}.sig`;
   const response = await app.inject({
     method: "POST",
-    url: "/admin/api/connect/credentials",
+    url: "/admin/api/bot/credentials",
     headers: adminAuth,
     payload: { sessionToken: webToken }
   });
@@ -338,26 +338,26 @@ test("a browser web token is refused before it ever reaches the upstream", async
 });
 
 test("rotating a token keeps the machine id stable", async () => {
-  const { app, connectStore } = await buildApp({ withCredential: true });
-  const id = connectStore.listCredentials()[0].id;
-  const before = connectStore.credential(id)!.machineId;
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const id = botStore.listCredentials()[0].id;
+  const before = botStore.credential(id)!.machineId;
 
   const response = await app.inject({
     method: "POST",
-    url: `/admin/api/connect/credentials/${id}`,
+    url: `/admin/api/bot/credentials/${id}`,
     headers: adminAuth,
     payload: { sessionToken: "rotated-token" }
   });
   assert.equal(response.statusCode, 200);
-  assert.equal(connectStore.credential(id)?.sessionToken, "rotated-token");
+  assert.equal(botStore.credential(id)?.sessionToken, "rotated-token");
   // 设备标识变了上游就当成另一台设备，换 token 不该顺带换掉它。
-  assert.equal(connectStore.credential(id)?.machineId, before);
+  assert.equal(botStore.credential(id)?.machineId, before);
   await app.close();
 });
 
 test("the admin model list comes from the catalog and hides disabled models", async () => {
   const { app } = await buildApp({ withCredential: true });
-  const response = await app.inject({ method: "GET", url: "/admin/api/connect/models", headers: adminAuth });
+  const response = await app.inject({ method: "GET", url: "/admin/api/bot/models", headers: adminAuth });
   assert.equal(response.statusCode, 200);
   assert.deepEqual(
     (response.json() as { models: Array<{ id: string }> }).models.map((model) => model.id),
@@ -367,22 +367,22 @@ test("the admin model list comes from the catalog and hides disabled models", as
 });
 
 test("admin run listing and cancel work end to end", async () => {
-  const { app, connectStore } = await buildApp({ withCredential: true });
-  const conversation = connectStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
-  const run = connectStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
-  connectStore.appendEvents(run.id, conversation.id, [{ type: "text.delta", payload: { text: "a" } }]);
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const conversation = botStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
+  const run = botStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
+  botStore.appendEvents(run.id, conversation.id, [{ type: "text.delta", payload: { text: "a" } }]);
 
-  const list = await app.inject({ method: "GET", url: "/admin/api/connect/runs", headers: adminAuth });
+  const list = await app.inject({ method: "GET", url: "/admin/api/bot/runs", headers: adminAuth });
   assert.equal((list.json() as { runs: Array<{ id: string }> }).runs[0].id, run.id);
 
-  const detail = await app.inject({ method: "GET", url: `/admin/api/connect/runs/${run.id}`, headers: adminAuth });
+  const detail = await app.inject({ method: "GET", url: `/admin/api/bot/runs/${run.id}`, headers: adminAuth });
   const body = detail.json() as { events: unknown[]; toolCalls: unknown[] };
   assert.equal(body.events.length, 1);
   assert.deepEqual(body.toolCalls, []);
 
   const cancelled = await app.inject({
     method: "POST",
-    url: `/admin/api/connect/runs/${run.id}/cancel`,
+    url: `/admin/api/bot/runs/${run.id}/cancel`,
     headers: adminAuth
   });
   assert.equal((cancelled.json() as { run: { status: string } }).run.status, "cancelled");
@@ -391,30 +391,30 @@ test("admin run listing and cancel work end to end", async () => {
 
 /* -------------------------------------------------------- 对外 API 面 */
 
-test("the public connect endpoints authenticate with the gateway key", async () => {
+test("the public bot endpoints authenticate with the gateway key", async () => {
   const { app } = await buildApp({ withCredential: true });
-  assert.equal((await app.inject({ method: "GET", url: "/v1/cursor-connect/status" })).statusCode, 401);
+  assert.equal((await app.inject({ method: "GET", url: "/v1/cursor-bot/status" })).statusCode, 401);
 
-  const status = await app.inject({ method: "GET", url: "/v1/cursor-connect/status", headers: apiAuth });
+  const status = await app.inject({ method: "GET", url: "/v1/cursor-bot/status", headers: apiAuth });
   assert.equal(status.statusCode, 200);
   assert.equal((status.json() as { available: boolean }).available, true);
   await app.close();
 });
 
 test("run status, tool-results and resume enforce ownership and idempotency", async () => {
-  const { app, connectStore } = await buildApp({ withCredential: true });
-  const conversation = connectStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
-  const run = connectStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
-  connectStore.recordToolCall({ runId: run.id, callId: "call-1", toolName: "search", args: {} });
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const conversation = botStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
+  const run = botStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
+  botStore.recordToolCall({ runId: run.id, callId: "call-1", toolName: "search", args: {} });
 
   assert.equal(
-    (await app.inject({ method: "GET", url: "/v1/cursor-connect/runs/nope", headers: apiAuth })).statusCode,
+    (await app.inject({ method: "GET", url: "/v1/cursor-bot/runs/nope", headers: apiAuth })).statusCode,
     404
   );
 
   const first = await app.inject({
     method: "POST",
-    url: `/v1/cursor-connect/runs/${run.id}/tool-results`,
+    url: `/v1/cursor-bot/runs/${run.id}/tool-results`,
     headers: apiAuth,
     payload: { results: [{ toolCallId: "call-1", result: { ok: true } }, { toolCallId: "ghost", result: 1 }] }
   });
@@ -426,7 +426,7 @@ test("run status, tool-results and resume enforce ownership and idempotency", as
 
   const again = await app.inject({
     method: "POST",
-    url: `/v1/cursor-connect/runs/${run.id}/tool-results`,
+    url: `/v1/cursor-bot/runs/${run.id}/tool-results`,
     headers: apiAuth,
     payload: { results: [{ toolCallId: "call-1", result: { ok: true } }] }
   });
@@ -434,7 +434,7 @@ test("run status, tool-results and resume enforce ownership and idempotency", as
 
   const empty = await app.inject({
     method: "POST",
-    url: `/v1/cursor-connect/runs/${run.id}/tool-results`,
+    url: `/v1/cursor-bot/runs/${run.id}/tool-results`,
     headers: apiAuth,
     payload: { results: [] }
   });
@@ -443,14 +443,14 @@ test("run status, tool-results and resume enforce ownership and idempotency", as
 });
 
 test("resume refuses to re-run anything already partially delivered", async () => {
-  const { app, connectStore } = await buildApp({ withCredential: true });
-  const conversation = connectStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
-  const run = connectStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
-  connectStore.appendEvents(run.id, conversation.id, [{ type: "text.delta", payload: { text: "half" } }]);
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const conversation = botStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
+  const run = botStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
+  botStore.appendEvents(run.id, conversation.id, [{ type: "text.delta", payload: { text: "half" } }]);
 
   const response = await app.inject({
     method: "POST",
-    url: `/v1/cursor-connect/runs/${run.id}/resume`,
+    url: `/v1/cursor-bot/runs/${run.id}/resume`,
     headers: apiAuth
   });
   const body = response.json() as { resumed: boolean; action: string };
@@ -460,17 +460,17 @@ test("resume refuses to re-run anything already partially delivered", async () =
 });
 
 test("the events endpoint replays persisted events and honours Last-Event-ID", async () => {
-  const { app, connectStore } = await buildApp({ withCredential: true });
-  const conversation = connectStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
-  const run = connectStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
-  const events = connectStore.appendEvents(run.id, conversation.id, [
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const conversation = botStore.upsertConversation({ ownerHash: "o", upstreamConversationId: "up" });
+  const run = botStore.createRun({ conversationId: conversation.id, requestedModel: "grok-4.6" });
+  const events = botStore.appendEvents(run.id, conversation.id, [
     { type: "text.delta", payload: { text: "a" } },
     { type: "text.delta", payload: { text: "b" } }
   ]);
   // 终态 run 的 SSE 补发完就收流，测试才能拿到完整响应而不是挂在 live 段。
-  connectStore.releaseRunLease(run.id, "completed");
+  botStore.releaseRunLease(run.id, "completed");
 
-  const full = await app.inject({ method: "GET", url: `/v1/cursor-connect/runs/${run.id}/events`, headers: apiAuth });
+  const full = await app.inject({ method: "GET", url: `/v1/cursor-bot/runs/${run.id}/events`, headers: apiAuth });
   assert.equal(full.statusCode, 200);
   assert.match(full.headers["content-type"] as string, /text\/event-stream/);
   assert.equal((full.body.match(/"text":"a"/g) ?? []).length, 1);
@@ -478,7 +478,7 @@ test("the events endpoint replays persisted events and honours Last-Event-ID", a
 
   const resumed = await app.inject({
     method: "GET",
-    url: `/v1/cursor-connect/runs/${run.id}/events`,
+    url: `/v1/cursor-bot/runs/${run.id}/events`,
     headers: { ...apiAuth, "last-event-id": events[0].eventId }
   });
   assert.ok(!resumed.body.includes('"text":"a"'), "已经收过的事件不该重发");
@@ -486,7 +486,7 @@ test("the events endpoint replays persisted events and honours Last-Event-ID", a
   await app.close();
 });
 
-test("connect endpoints report 503 when the route is not configured at all", async () => {
+test("bot endpoints report 503 when the route is not configured at all", async () => {
   const store = new MemoryStateStore();
   const config: GatewayConfig = {
     ...loadConfig({}),
@@ -496,15 +496,15 @@ test("connect endpoints report 503 when the route is not configured at all", asy
   };
   const keyPool = new CursorKeyPool(store);
   await keyPool.seedFromEnv(["cursor-key"]);
-  // 没有 connect：端点仍然注册，但明确回 503 而不是 404，
+  // 没有 bot：端点仍然注册，但明确回 503 而不是 404，
   // 否则运维分不清「没装这条路线」和「打错了 URL」。
   const app = createApp({ config, store, runner: new StubRunner(), keyPool });
 
-  const status = await app.inject({ method: "GET", url: "/v1/cursor-connect/status", headers: apiAuth });
+  const status = await app.inject({ method: "GET", url: "/v1/cursor-bot/status", headers: apiAuth });
   assert.equal((status.json() as { available: boolean }).available, false);
-  const runs = await app.inject({ method: "GET", url: "/v1/cursor-connect/runs", headers: apiAuth });
+  const runs = await app.inject({ method: "GET", url: "/v1/cursor-bot/runs", headers: apiAuth });
   assert.equal(runs.statusCode, 503);
-  const admin = await app.inject({ method: "GET", url: "/admin/api/connect/models", headers: adminAuth });
+  const admin = await app.inject({ method: "GET", url: "/admin/api/bot/models", headers: adminAuth });
   assert.equal(admin.statusCode, 503);
   await app.close();
 });
@@ -524,28 +524,28 @@ test("provider selection routes by header and model prefix without touching the 
   await app.close();
 });
 
-test("the admin connectivity test can send a real Connect chat", async () => {
+test("the admin connectivity test can send a real Bot chat", async () => {
   const { app } = await buildApp({ withCredential: true });
   const viaProvider = await app.inject({
     method: "POST",
     url: "/admin/api/test",
     headers: adminAuth,
-    payload: { provider: "connect", model: "grok-4.6", prompt: "ping" }
+    payload: { provider: "bot", model: "grok-4.6", prompt: "ping" }
   });
   assert.equal(viaProvider.statusCode, 200);
   assert.equal(viaProvider.json().ok, true);
-  assert.equal(viaProvider.json().provider, "connect");
+  assert.equal(viaProvider.json().provider, "bot");
   assert.equal(viaProvider.json().text, "pong");
 
   const viaPrefix = await app.inject({
     method: "POST",
     url: "/admin/api/test",
     headers: adminAuth,
-    payload: { model: "connect/grok-4.6", prompt: "ping" }
+    payload: { model: "bot/grok-4.6", prompt: "ping" }
   });
   assert.equal(viaPrefix.statusCode, 200);
   assert.equal(viaPrefix.json().ok, true);
-  assert.equal(viaPrefix.json().provider, "connect");
+  assert.equal(viaPrefix.json().provider, "bot");
   assert.equal(viaPrefix.json().text, "pong");
 
   const sdk = await app.inject({
@@ -561,30 +561,30 @@ test("the admin connectivity test can send a real Connect chat", async () => {
   await app.close();
 });
 
-test("the admin Connect test does not silently fall back to the SDK pool", async () => {
+test("the admin Bot test does not silently fall back to the SDK pool", async () => {
   const { app } = await buildApp();
   const missing = await app.inject({
     method: "POST",
     url: "/admin/api/test",
     headers: adminAuth,
-    payload: { provider: "connect", model: "grok-4.6" }
+    payload: { provider: "bot", model: "grok-4.6" }
   });
   assert.equal(missing.statusCode, 200);
   assert.equal(missing.json().ok, false);
-  assert.equal(missing.json().provider, "connect");
+  assert.equal(missing.json().provider, "bot");
   assert.match(String(missing.json().error), /凭据/);
 
   const mixed = await app.inject({
     method: "POST",
     url: "/admin/api/test",
     headers: adminAuth,
-    payload: { provider: "connect", model: "grok-4.6", keyId: "any" }
+    payload: { provider: "bot", model: "grok-4.6", keyId: "any" }
   });
   assert.equal(mixed.statusCode, 400);
   await app.close();
 });
 
-test("GET /v1/models exposes Connect entries under the connect/ prefix", async () => {
+test("GET /v1/models exposes Bot entries under the bot/ prefix", async () => {
   const { app } = await buildApp({
     withCredential: true,
     modelLister: async () => ({
@@ -599,21 +599,21 @@ test("GET /v1/models exposes Connect entries under the connect/ prefix", async (
   assert.ok(byId["composer-2.5"]);
   assert.equal(byId["composer-2.5"].gateway_provider, "sdk");
   assert.equal(byId["composer-2.5"].owned_by, "cursor");
-  assert.ok(byId["connect/composer-2.5"], "SDK 目录里的模型必须镜像成 connect/ 前缀，客户端才能选路");
-  assert.equal(byId["connect/composer-2.5"].gateway_provider, "connect");
-  assert.equal(byId["connect/composer-2.5"].owned_by, "cursor-connect");
-  assert.ok(byId["connect/grok-4.6"], "Connect 目录里的模型必须以 connect/ 前缀出现");
-  assert.equal(byId["connect/grok-4.6"].gateway_provider, "connect");
-  assert.ok(!byId["connect/gone"], "DISABLED 的 Connect 模型不能出现在目录里");
+  assert.ok(byId["bot/composer-2.5"], "SDK 目录里的模型必须镜像成 bot/ 前缀，客户端才能选路");
+  assert.equal(byId["bot/composer-2.5"].gateway_provider, "bot");
+  assert.equal(byId["bot/composer-2.5"].owned_by, "cursor-bot");
+  assert.ok(byId["bot/grok-4.6"], "Bot 目录里的模型必须以 bot/ 前缀出现");
+  assert.equal(byId["bot/grok-4.6"].gateway_provider, "bot");
+  assert.ok(!byId["bot/gone"], "DISABLED 的 Bot 模型不能出现在目录里");
 
-  const fetched = await app.inject({ method: "GET", url: "/v1/models/connect/grok-4.6", headers: apiAuth });
+  const fetched = await app.inject({ method: "GET", url: "/v1/models/bot/grok-4.6", headers: apiAuth });
   assert.equal(fetched.statusCode, 200);
-  assert.equal((fetched.json() as { id: string; gateway_provider: string }).id, "connect/grok-4.6");
-  assert.equal((fetched.json() as { gateway_provider: string }).gateway_provider, "connect");
+  assert.equal((fetched.json() as { id: string; gateway_provider: string }).id, "bot/grok-4.6");
+  assert.equal((fetched.json() as { gateway_provider: string }).gateway_provider, "bot");
   await app.close();
 });
 
-test("GET /v1/models still exposes connect/ clones when the Connect catalog is empty", async () => {
+test("GET /v1/models still exposes bot/ clones when the Bot catalog is empty", async () => {
   const { app } = await buildApp({
     withCredential: true,
     exchange: { failCatalog: true },
@@ -626,11 +626,11 @@ test("GET /v1/models still exposes connect/ clones when the Connect catalog is e
   assert.equal(listed.statusCode, 200);
   const ids = (listed.json() as { data: Array<{ id: string }> }).data.map((model) => model.id);
   assert.ok(ids.includes("composer-2.5"));
-  assert.ok(ids.includes("connect/composer-2.5"), "AvailableModels 失败时也要用 SDK 目录镜像出 connect/ 前缀");
+  assert.ok(ids.includes("bot/composer-2.5"), "AvailableModels 失败时也要用 SDK 目录镜像出 bot/ 前缀");
   await app.close();
 });
 
-test("a client can chat through Connect by selecting a connect/ model", async () => {
+test("a client can chat through Bot by selecting a bot/ model", async () => {
   const { app } = await buildApp({
     withCredential: true,
     modelLister: async () => ({
@@ -642,7 +642,7 @@ test("a client can chat through Connect by selecting a connect/ model", async ()
     method: "POST",
     url: "/v1/chat/completions",
     headers: apiAuth,
-    payload: { model: "connect/grok-4.6", messages: [{ role: "user", content: "hi" }] }
+    payload: { model: "bot/grok-4.6", messages: [{ role: "user", content: "hi" }] }
   });
   assert.equal(response.statusCode, 200);
   assert.equal(
@@ -652,7 +652,7 @@ test("a client can chat through Connect by selecting a connect/ model", async ()
   await app.close();
 });
 
-test("an SDK-only gateway key whitelist still lists and serves connect/ models", async () => {
+test("an SDK-only gateway key whitelist still lists and serves bot/ models", async () => {
   const inbound = "gateway-scoped-key-01";
   const gwStore = new MemoryStateStore();
   const gatewayKeyPool = new GatewayKeyPool(gwStore);
@@ -679,14 +679,14 @@ test("an SDK-only gateway key whitelist still lists and serves connect/ models",
   const ids = (listed.json() as { data: Array<{ id: string }> }).data.map((model) => model.id);
   assert.ok(ids.includes("composer-2.5"));
   assert.ok(!ids.includes("grok-4.6"), "SDK 白名单仍要挡住密钥池里的 grok");
-  assert.ok(ids.includes("connect/grok-4.6"), "Connect 目录不能被 SDK 白名单吃掉");
-  assert.ok(ids.includes("connect/composer-2.5"));
+  assert.ok(ids.includes("bot/grok-4.6"), "Bot 目录不能被 SDK 白名单吃掉");
+  assert.ok(ids.includes("bot/composer-2.5"));
 
   const chat = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
     headers: auth,
-    payload: { model: "connect/grok-4.6", messages: [{ role: "user", content: "hi" }] }
+    payload: { model: "bot/grok-4.6", messages: [{ role: "user", content: "hi" }] }
   });
   assert.equal(chat.statusCode, 200);
   assert.equal(

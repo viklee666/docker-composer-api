@@ -86,7 +86,7 @@ td.mono,.mono{font-family:var(--mono);font-size:12px}
 .spacer{flex:1}
 .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent-2));
   display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#06101f;flex-shrink:0}
-#test-result,#cc-chat-result{margin-top:12px;background:#0d1322;border:1px solid var(--border);border-radius:9px;
+#test-result,#bot-chat-result{margin-top:12px;background:#0d1322;border:1px solid var(--border);border-radius:9px;
   padding:12px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all}
 .table-scroll{overflow-x:auto}
 /*
@@ -222,7 +222,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         <div class="nav-group">密钥</div>
         <button type="button" class="nav-item" data-nav="keys">Cursor Key 池</button>
         <button type="button" class="nav-item" data-nav="gateway-keys">网关密钥</button>
-        <button type="button" class="nav-item" data-nav="connect">Connect 凭据</button>
+        <button type="button" class="nav-item" data-nav="bot">Bot 凭据</button>
         <div class="nav-group">策略</div>
         <button type="button" class="nav-item" data-nav="routing">取用策略与会话粘性</button>
         <button type="button" class="nav-item" data-nav="system-prompt">默认系统提示词</button>
@@ -365,16 +365,16 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           </div>
         </section>
 
-        <section id="sec-connect" class="hidden" data-section="connect">
+        <section id="sec-bot" class="hidden" data-section="bot">
           <div class="panel">
             <div class="head">
-              <h2>Cursor Connect 凭据</h2>
-              <span class="hint">Connect 直连 <code>aiserver.v1.InferenceService/Stream</code>。凭据优先从 Cursor Key 池兑换；也可以继续粘贴桌面端 session JWT。与 SDK 路线的运行时互不共用。</span>
+              <h2>Cursor Bot 凭据</h2>
+              <span class="hint">Bot 路线直连 <code>aiserver.v1.InferenceService/Stream</code>。凭据优先从 Cursor Key 池兑换；也可以继续粘贴桌面端 session JWT。与 SDK 路线的运行时互不共用。</span>
             </div>
             <div class="body">
-              <div class="callout" id="connect-status-box">
-                <strong id="connect-status-title">正在读取状态…</strong>
-                <span id="connect-status-detail"></span>
+              <div class="callout" id="bot-status-box">
+                <strong id="bot-status-title">正在读取状态…</strong>
+                <span id="bot-status-detail"></span>
               </div>
               <div class="callout warn">
                 <strong>设备标识必须稳定</strong>
@@ -382,27 +382,27 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 <br>凭据只能写入、不能读回：后台不回传 token 明文，只显示首尾各 4 位用于辨认。
               </div>
               <div class="row" style="margin-bottom:10px">
-                <select id="cc-from-key" style="flex:2;min-width:240px" title="从 Cursor Key 池兑换 session token">
+                <select id="bot-from-key" style="flex:2;min-width:240px" title="从 Cursor Key 池兑换 session token">
                   <option value="">选择一把 Cursor Key</option>
                 </select>
-                <button class="primary" id="btn-cc-from-key">从 Key 拉取</button>
+                <button class="primary" id="btn-bot-from-key">从 Key 拉取</button>
               </div>
               <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。同一把 key 再拉取会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token。</p>
               <div class="row" style="margin-bottom:14px">
-                <input id="cc-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
-                <input id="cc-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
-                <input id="cc-machine" placeholder="machineId（留空自动生成）" style="flex:1;min-width:160px" autocomplete="off">
-                <button class="primary" id="btn-cc-add">添加凭据</button>
+                <input id="bot-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
+                <input id="bot-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
+                <input id="bot-machine" placeholder="machineId（留空自动生成）" style="flex:1;min-width:160px" autocomplete="off">
+                <button class="primary" id="btn-bot-add">添加凭据</button>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr>
                     <th>备注</th><th>token</th><th>类型</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
                   </tr></thead>
-                  <tbody id="cc-body"></tbody>
+                  <tbody id="bot-body"></tbody>
                 </table>
               </div>
-              <div class="empty hidden" id="cc-empty">暂无 Connect 凭据。加一把之后这条路线才会出现在选路里。</div>
+              <div class="empty hidden" id="bot-empty">暂无 Bot 凭据。加一把之后这条路线才会出现在选路里。</div>
             </div>
           </div>
 
@@ -413,11 +413,11 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
             </div>
             <div class="body">
               <div class="row">
-                <select id="cc-test-model" style="min-width:200px" title="来自 Connect 目录；目录还没拉到时默认 grok-4.6"></select>
-                <input id="cc-test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
-                <button class="primary" id="btn-cc-chat">发送测试</button>
+                <select id="bot-test-model" style="min-width:200px" title="来自 Bot 目录；目录还没拉到时默认 grok-4.6"></select>
+                <input id="bot-test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
+                <button class="primary" id="btn-bot-chat">发送测试</button>
               </div>
-              <div id="cc-chat-result" class="hidden"></div>
+              <div id="bot-chat-result" class="hidden"></div>
             </div>
           </div>
 
@@ -430,7 +430,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               <div class="table-scroll">
                 <table>
                   <thead><tr><th>项</th><th>当前值</th><th>env</th></tr></thead>
-                  <tbody id="cc-settings-body"></tbody>
+                  <tbody id="bot-settings-body"></tbody>
                 </table>
               </div>
             </div>
@@ -443,17 +443,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
             </div>
             <div class="body">
               <div class="row" style="margin-bottom:12px">
-                <button id="btn-cc-models">拉取目录</button>
-                <button id="btn-cc-models-refresh">强制刷新</button>
-                <span class="hint" id="cc-models-hint"></span>
+                <button id="btn-bot-models">拉取目录</button>
+                <button id="btn-bot-models-refresh">强制刷新</button>
+                <span class="hint" id="bot-models-hint"></span>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr><th>模型</th><th>显示名</th><th>上下文</th><th>能力</th><th>参数</th><th>状态</th></tr></thead>
-                  <tbody id="cc-models-body"></tbody>
+                  <tbody id="bot-models-body"></tbody>
                 </table>
               </div>
-              <div class="empty hidden" id="cc-models-empty">还没有拉取过目录</div>
+              <div class="empty hidden" id="bot-models-empty">还没有拉取过目录</div>
             </div>
           </div>
 
@@ -464,17 +464,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
             </div>
             <div class="body">
               <div class="row" style="margin-bottom:12px">
-                <button id="btn-cc-runs">刷新 Run</button>
-                <span class="hint" id="cc-runs-hint"></span>
+                <button id="btn-bot-runs">刷新 Run</button>
+                <span class="hint" id="bot-runs-hint"></span>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr><th>run</th><th>模型</th><th>状态</th><th>交付</th><th>尝试</th><th>事件</th><th>开始</th><th>操作</th></tr></thead>
-                  <tbody id="cc-runs-body"></tbody>
+                  <tbody id="bot-runs-body"></tbody>
                 </table>
               </div>
-              <div class="empty hidden" id="cc-runs-empty">暂无 run</div>
-              <pre id="cc-run-detail" class="hidden" style="margin-top:14px;max-height:320px;overflow:auto;background:var(--panel-2);padding:12px;border-radius:8px;font-size:12px"></pre>
+              <div class="empty hidden" id="bot-runs-empty">暂无 run</div>
+              <pre id="bot-run-detail" class="hidden" style="margin-top:14px;max-height:320px;overflow:auto;background:var(--panel-2);padding:12px;border-radius:8px;font-size:12px"></pre>
             </div>
           </div>
         </section>
@@ -610,9 +610,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
             <div class="head"><h2>联通性测试</h2><span class="hint">会真实消耗额度。逐个验证某把 Cursor Key 请用 Key 池表格每行的「测试」</span></div>
             <div class="body">
               <div class="row">
-                <select id="test-provider" style="min-width:160px" title="SDK 走密钥池；Connect 走 Connect 凭据">
+                <select id="test-provider" style="min-width:160px" title="SDK 走密钥池；Bot 走 Bot 凭据">
                   <option value="sdk">SDK（密钥池）</option>
-                  <option value="connect">Connect</option>
+                  <option value="bot">Bot</option>
                 </select>
                 <select id="test-model" style="min-width:180px"></select>
                 <input id="test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
@@ -828,7 +828,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   var lastOverview = null;
   var lastProxy = null;
   var modelCatalog = [];
-  var connectCatalog = [];
+  var botCatalog = [];
   var autoDisableThreshold = 1;
   var gwPoolEnabled = false;
   var revealedGwKey = '';
@@ -843,7 +843,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     dashboard: '概览',
     keys: 'Cursor Key 池',
     'gateway-keys': '网关密钥',
-    connect: 'Connect 凭据',
+    bot: 'Bot 凭据',
     routing: '取用策略与会话粘性',
     'system-prompt': '默认系统提示词',
     proxy: '代理设置',
@@ -950,13 +950,13 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   function modelIds(){
     return modelCatalog.map(function(m){ return m.id; });
   }
-  function connectModelIds(){
-    var ids = connectCatalog.map(function(m){ return m.id; });
+  function botModelIds(){
+    var ids = botCatalog.map(function(m){ return m.id; });
     return ids.length ? ids : ['grok-4.6'];
   }
   function testProvider(){
     var sel = $('test-provider');
-    return sel && sel.value === 'connect' ? 'connect' : 'sdk';
+    return sel && sel.value === 'bot' ? 'bot' : 'sdk';
   }
   function fillSelect(select, ids, emptyLabel){
     if (!select) return;
@@ -982,25 +982,25 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }
   }
   function fillModelSelects(){
-    if (testProvider() === 'connect') fillSelect($('test-model'), connectModelIds(), null);
+    if (testProvider() === 'bot') fillSelect($('test-model'), botModelIds(), null);
     else fillSelect($('test-model'), modelIds(), null);
     fillSelect($('log-model'), modelIds(), '全部模型');
   }
   function fillCcChatModels(){
-    var sel = $('cc-test-model');
+    var sel = $('bot-test-model');
     if (!sel) return;
     var before = sel.value;
-    fillSelect(sel, connectModelIds(), null);
+    fillSelect(sel, botModelIds(), null);
     if (before) return;
-    connectCatalog.forEach(function(m){
+    botCatalog.forEach(function(m){
       if (m.defaultOn) sel.value = m.id;
     });
   }
   function updateTestRouteHint(){
     var hint = $('test-route-hint');
     if (!hint) return;
-    hint.textContent = testProvider() === 'connect'
-      ? '走 Connect 凭据（InferenceService/Stream），不经过 Cursor Key 池。请先在 Connect 凭据页拉好 token。'
+    hint.textContent = testProvider() === 'bot'
+      ? '走 Bot 凭据（InferenceService/Stream），不经过 Cursor Key 池。请先在 Bot 凭据页拉好 token。'
       : '下方按钮走密钥池（测当前队首可用 key）。';
   }
   function setModelCatalog(data){
@@ -1046,39 +1046,39 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (name === 'system-prompt') hydrateSystemPrompt();
     if (name === 'history') loadLogs();
     if (name === 'proxy') loadProxy();
-    if (name === 'connect') loadConnect();
+    if (name === 'bot') loadBot();
   }
 
-  /* ------------------------------------------------ Cursor Connect 面板 */
+  /* ------------------------------------------------ Cursor Bot 面板 */
 
   var CC_SETTING_ROWS = [
     ['默认 provider', 'defaultProvider', 'GATEWAY_PROVIDER'],
-    ['出站 base URL', 'baseUrl', 'CURSOR_CONNECT_BASE_URL'],
-    ['编码', 'codec', 'CURSOR_CONNECT_CODEC'],
-    ['单帧上限', 'readMaxBytes', 'CURSOR_CONNECT_MAX_FRAME_BYTES'],
-    ['向上游声明工具', 'sendTools', 'CURSOR_CONNECT_SEND_TOOLS'],
-    ['本地工具白名单', 'localTools', 'CURSOR_CONNECT_LOCAL_TOOLS'],
-    ['网关子代理', 'subagents', 'CURSOR_CONNECT_SUBAGENTS'],
-    ['background worker', 'background', 'CURSOR_CONNECT_BACKGROUND'],
-    ['客户端版本', 'clientVersion', 'CURSOR_CONNECT_CLIENT_VERSION']
+    ['出站 base URL', 'baseUrl', 'CURSOR_BOT_BASE_URL'],
+    ['编码', 'codec', 'CURSOR_BOT_CODEC'],
+    ['单帧上限', 'readMaxBytes', 'CURSOR_BOT_MAX_FRAME_BYTES'],
+    ['向上游声明工具', 'sendTools', 'CURSOR_BOT_SEND_TOOLS'],
+    ['本地工具白名单', 'localTools', 'CURSOR_BOT_LOCAL_TOOLS'],
+    ['网关子代理', 'subagents', 'CURSOR_BOT_SUBAGENTS'],
+    ['background worker', 'background', 'CURSOR_BOT_BACKGROUND'],
+    ['客户端版本', 'clientVersion', 'CURSOR_BOT_CLIENT_VERSION']
   ];
 
-  function loadConnect(){
-    api('GET', '/admin/api/connect').then(function(data){
-      renderConnectStatus(data);
-      renderConnectSettings(data.settings || {});
-      renderConnectCredentials(data.credentials || []);
+  function loadBot(){
+    api('GET', '/admin/api/bot').then(function(data){
+      renderBotStatus(data);
+      renderBotSettings(data.settings || {});
+      renderBotCredentials(data.credentials || []);
       fillCcKeySelect(Array.isArray(data.cursorKeys) ? data.cursorKeys : lastKeys);
-      if (data.status && data.status.available) loadConnectModels(false);
+      if (data.status && data.status.available) loadBotModels(false);
       else fillCcChatModels();
     }).catch(function(err){
-      $('connect-status-title').textContent = '读取失败';
-      $('connect-status-detail').textContent = err.message;
+      $('bot-status-title').textContent = '读取失败';
+      $('bot-status-detail').textContent = err.message;
     });
   }
 
   function fillCcKeySelect(keys){
-    var sel = $('cc-from-key');
+    var sel = $('bot-from-key');
     if (!sel) return;
     var current = sel.value;
     var list = keys || [];
@@ -1089,25 +1089,25 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     });
     sel.innerHTML = opts.join('');
     if (current) sel.value = current;
-    $('btn-cc-from-key').disabled = !list.length;
+    $('btn-bot-from-key').disabled = !list.length;
   }
 
-  function renderConnectStatus(data){
+  function renderBotStatus(data){
     var status = data.status || {};
-    var box = $('connect-status-box');
+    var box = $('bot-status-box');
     box.className = 'callout' + (status.available ? '' : ' warn');
-    $('connect-status-title').textContent = status.available ? 'Connect 路线可用' : 'Connect 路线未就绪';
+    $('bot-status-title').textContent = status.available ? 'Bot 路线可用' : 'Bot 路线未就绪';
     var bits = [];
     if (status.activeCredentials !== undefined) {
       bits.push(status.activeCredentials + ' / ' + (status.credentials || 0) + ' 把凭据可用');
     }
     if (status.reason) bits.push(status.reason);
-    if (data.settings && data.settings.defaultProvider === 'connect') bits.push('已设为默认 provider');
-    else bits.push('默认仍走 SDK 路线；本页「对话测试」或联通性测试里选 Connect，即可实际发请求');
-    $('connect-status-detail').textContent = bits.join('；');
+    if (data.settings && data.settings.defaultProvider === 'bot') bits.push('已设为默认 provider');
+    else bits.push('默认仍走 SDK 路线；本页「对话测试」或联通性测试里选 Bot，即可实际发请求');
+    $('bot-status-detail').textContent = bits.join('；');
   }
 
-  function renderConnectSettings(settings){
+  function renderBotSettings(settings){
     var rows = CC_SETTING_ROWS.map(function(row){
       var value = settings[row[1]];
       if (Array.isArray(value)) value = value.length ? value.join(', ') : '（全关）';
@@ -1115,22 +1115,22 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       return '<tr><td>' + esc(row[0]) + '</td><td><code>' + esc(value === undefined ? '-' : value) +
         '</code></td><td class="muted">' + esc(row[2]) + '</td></tr>';
     });
-    $('cc-settings-body').innerHTML = rows.join('');
+    $('bot-settings-body').innerHTML = rows.join('');
   }
 
-  function renderConnectCredentials(list){
-    $('cc-empty').classList.toggle('hidden', list.length > 0);
-    $('cc-body').innerHTML = list.map(function(item){
+  function renderBotCredentials(list){
+    $('bot-empty').classList.toggle('hidden', list.length > 0);
+    $('bot-body').innerHTML = list.map(function(item){
       var badge = item.status === 'active' ? '<span class="chip ok">● 可用</span>' : '<span class="chip bad">● 停用</span>';
       var warn = item.tokenType === 'web' ? ' <span class="chip bad">web token</span>' : '';
       if (item.sourceCursorKeyId) warn += ' <span class="chip">Key 池</span>';
       var actions = [
-        '<button data-cc-test="' + esc(item.id) + '">测试</button>',
+        '<button data-bot-test="' + esc(item.id) + '">测试</button>',
         item.status === 'active'
-          ? '<button data-cc-disable="' + esc(item.id) + '">停用</button>'
-          : '<button data-cc-enable="' + esc(item.id) + '">启用</button>',
-        '<button data-cc-rotate="' + esc(item.id) + '">换 token</button>',
-        '<button class="danger" data-cc-del="' + esc(item.id) + '">删除</button>'
+          ? '<button data-bot-disable="' + esc(item.id) + '">停用</button>'
+          : '<button data-bot-enable="' + esc(item.id) + '">启用</button>',
+        '<button data-bot-rotate="' + esc(item.id) + '">换 token</button>',
+        '<button class="danger" data-bot-del="' + esc(item.id) + '">删除</button>'
       ].join(' ');
       return '<tr>' +
         '<td>' + esc(item.label || '-') + '</td>' +
@@ -1146,14 +1146,14 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }).join('');
   }
 
-  function loadConnectModels(force){
-    $('cc-models-hint').textContent = '正在拉取…';
-    api('GET', '/admin/api/connect/models' + (force ? '?refresh=true' : '')).then(function(data){
+  function loadBotModels(force){
+    $('bot-models-hint').textContent = '正在拉取…';
+    api('GET', '/admin/api/bot/models' + (force ? '?refresh=true' : '')).then(function(data){
       var models = data.models || [];
-      connectCatalog = models;
-      $('cc-models-empty').classList.toggle('hidden', models.length > 0);
-      $('cc-models-hint').textContent = models.length + ' 个模型' + (force ? '（已强制刷新）' : '');
-      $('cc-models-body').innerHTML = models.map(function(model){
+      botCatalog = models;
+      $('bot-models-empty').classList.toggle('hidden', models.length > 0);
+      $('bot-models-hint').textContent = models.length + ' 个模型' + (force ? '（已强制刷新）' : '');
+      $('bot-models-body').innerHTML = models.map(function(model){
         var caps = [];
         if (model.supportsAgent) caps.push('agent');
         if (model.supportsThinking) caps.push('thinking');
@@ -1175,19 +1175,19 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           '</tr>';
       }).join('');
       fillCcChatModels();
-      if (testProvider() === 'connect') fillModelSelects();
+      if (testProvider() === 'bot') fillModelSelects();
     }).catch(function(err){
-      $('cc-models-hint').textContent = '拉取失败：' + err.message;
+      $('bot-models-hint').textContent = '拉取失败：' + err.message;
       fillCcChatModels();
     });
   }
 
-  function loadConnectRuns(){
-    api('GET', '/admin/api/connect/runs?limit=50').then(function(data){
+  function loadBotRuns(){
+    api('GET', '/admin/api/bot/runs?limit=50').then(function(data){
       var runs = data.runs || [];
-      $('cc-runs-empty').classList.toggle('hidden', runs.length > 0);
-      $('cc-runs-hint').textContent = runs.length + ' 条';
-      $('cc-runs-body').innerHTML = runs.map(function(run){
+      $('bot-runs-empty').classList.toggle('hidden', runs.length > 0);
+      $('bot-runs-hint').textContent = runs.length + ' 条';
+      $('bot-runs-body').innerHTML = runs.map(function(run){
         var terminal = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
         var cls = run.status === 'completed' ? 'ok' : (run.status === 'failed' ? 'bad' : 'warn');
         return '<tr>' +
@@ -1199,13 +1199,13 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           '<td>' + esc(run.lastEventSeq) + '</td>' +
           '<td class="muted">' + esc(run.startedAt ? run.startedAt.replace('T', ' ').slice(0, 19) : '-') + '</td>' +
           '<td class="row" style="gap:6px">' +
-            '<button data-cc-run="' + esc(run.id) + '">详情</button>' +
-            (terminal ? '' : '<button class="danger" data-cc-run-cancel="' + esc(run.id) + '">取消</button>') +
+            '<button data-bot-run="' + esc(run.id) + '">详情</button>' +
+            (terminal ? '' : '<button class="danger" data-bot-run-cancel="' + esc(run.id) + '">取消</button>') +
           '</td>' +
           '</tr>';
       }).join('');
     }).catch(function(err){
-      $('cc-runs-hint').textContent = '读取失败：' + err.message;
+      $('bot-runs-hint').textContent = '读取失败：' + err.message;
     });
   }
   function closeMenu(){
@@ -1533,7 +1533,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '</div>';
       var actions = '<button data-action="test" data-id="' + esc(key.id) + '">测试</button>';
       actions += '<button data-action="models" data-id="' + esc(key.id) + '">模型范围</button>';
-      actions += '<button data-action="connect-import" data-id="' + esc(key.id) + '" title="用这把 key 向 Cursor 兑换 Connect session token">拉取 Connect</button>';
+      actions += '<button data-action="bot-import" data-id="' + esc(key.id) + '" title="用这把 key 向 Cursor 兑换 Bot session token">拉取 Bot</button>';
       if (key.status === 'active') {
         actions += '<button data-action="disable" data-id="' + esc(key.id) + '">禁用</button>';
       } else {
@@ -1640,7 +1640,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     api('POST', '/admin/api/test', {
       keyId: id,
       provider: 'sdk',
-      model: testProvider() === 'connect' ? (modelIds()[0] || 'composer-2.5') : $('test-model').value,
+      model: testProvider() === 'bot' ? (modelIds()[0] || 'composer-2.5') : $('test-model').value,
       prompt: $('test-prompt').value
     })
       .then(function(data){
@@ -2126,41 +2126,41 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (event.target === $('modal-mask')) closeModal();
   });
 
-  $('btn-cc-add').addEventListener('click', function(){
-    var token = $('cc-token').value.trim();
+  $('btn-bot-add').addEventListener('click', function(){
+    var token = $('bot-token').value.trim();
     if (!token) { toast('请先粘贴 session token', true); return; }
     var body = { sessionToken: token };
-    var label = $('cc-label').value.trim();
-    var machine = $('cc-machine').value.trim();
+    var label = $('bot-label').value.trim();
+    var machine = $('bot-machine').value.trim();
     if (label) body.label = label;
     if (machine) body.machineId = machine;
-    api('POST', '/admin/api/connect/credentials', body).then(function(){
+    api('POST', '/admin/api/bot/credentials', body).then(function(){
       // 明文 token 不留在输入框里：这个页面可能在共享屏幕上开着。
-      $('cc-token').value = '';
-      $('cc-label').value = '';
-      $('cc-machine').value = '';
-      toast('已添加 Connect 凭据');
-      loadConnect();
+      $('bot-token').value = '';
+      $('bot-label').value = '';
+      $('bot-machine').value = '';
+      toast('已添加 Bot 凭据');
+      loadBot();
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('添加失败：' + err.message, true);
     });
   });
 
-  $('btn-cc-from-key').addEventListener('click', function(){
-    var id = $('cc-from-key').value.trim();
+  $('btn-bot-from-key').addEventListener('click', function(){
+    var id = $('bot-from-key').value.trim();
     if (!id) { toast('请先选择一把 Cursor Key', true); return; }
     var body = { cursorKeyId: id };
-    var label = $('cc-label').value.trim();
-    var machine = $('cc-machine').value.trim();
+    var label = $('bot-label').value.trim();
+    var machine = $('bot-machine').value.trim();
     if (label) body.label = label;
     if (machine) body.machineId = machine;
-    var btn = $('btn-cc-from-key');
+    var btn = $('btn-bot-from-key');
     btn.disabled = true;
     var prev = btn.textContent;
     btn.textContent = '拉取中…';
-    api('POST', '/admin/api/connect/credentials/from-key', body).then(function(){
-      toast('已从 Key 拉取 Connect 凭据');
-      loadConnect();
+    api('POST', '/admin/api/bot/credentials/from-key', body).then(function(){
+      toast('已从 Key 拉取 Bot 凭据');
+      loadBot();
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('拉取失败：' + err.message, true);
     }).finally(function(){
@@ -2169,78 +2169,78 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     });
   });
 
-  $('btn-cc-models').addEventListener('click', function(){ loadConnectModels(false); });
-  $('btn-cc-models-refresh').addEventListener('click', function(){ loadConnectModels(true); });
-  $('btn-cc-runs').addEventListener('click', loadConnectRuns);
-  $('btn-cc-chat').addEventListener('click', function(){
+  $('btn-bot-models').addEventListener('click', function(){ loadBotModels(false); });
+  $('btn-bot-models-refresh').addEventListener('click', function(){ loadBotModels(true); });
+  $('btn-bot-runs').addEventListener('click', loadBotRuns);
+  $('btn-bot-chat').addEventListener('click', function(){
     runAdminChatTest({
-      button: $('btn-cc-chat'),
-      result: $('cc-chat-result'),
-      provider: 'connect',
-      model: $('cc-test-model').value,
-      prompt: $('cc-test-prompt').value
+      button: $('btn-bot-chat'),
+      result: $('bot-chat-result'),
+      provider: 'bot',
+      model: $('bot-test-model').value,
+      prompt: $('bot-test-prompt').value
     });
   });
 
-  $('cc-body').addEventListener('click', function(event){
+  $('bot-body').addEventListener('click', function(event){
     var target = event.target;
     if (!target || target.tagName !== 'BUTTON') return;
-    var id = target.getAttribute('data-cc-test');
+    var id = target.getAttribute('data-bot-test');
     if (id) {
       target.disabled = true;
       target.textContent = '测试中…';
-      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id) + '/test').then(function(res){
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/test').then(function(res){
         if (res.ok) toast('连通，目录 ' + res.models + ' 个模型（' + res.durationMs + 'ms）');
         else toast('测试失败 ' + (res.status || '') + '：' + (res.error || '未知错误'), true);
-        loadConnect();
+        loadBot();
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('测试失败：' + err.message, true);
-        loadConnect();
+        loadBot();
       });
       return;
     }
-    id = target.getAttribute('data-cc-enable') || target.getAttribute('data-cc-disable');
+    id = target.getAttribute('data-bot-enable') || target.getAttribute('data-bot-disable');
     if (id) {
-      var action = target.hasAttribute('data-cc-enable') ? 'enable' : 'disable';
-      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id) + '/' + action).then(function(){
+      var action = target.hasAttribute('data-bot-enable') ? 'enable' : 'disable';
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/' + action).then(function(){
         toast(action === 'enable' ? '已启用' : '已停用');
-        loadConnect();
+        loadBot();
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('操作失败：' + err.message, true);
       });
       return;
     }
-    id = target.getAttribute('data-cc-rotate');
+    id = target.getAttribute('data-bot-rotate');
     if (id) {
       var next = window.prompt('粘贴新的 session token（machineId 保持不变）');
       if (!next || !next.trim()) return;
-      api('POST', '/admin/api/connect/credentials/' + encodeURIComponent(id), { sessionToken: next.trim() }).then(function(){
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id), { sessionToken: next.trim() }).then(function(){
         toast('已更新 token');
-        loadConnect();
+        loadBot();
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('更新失败：' + err.message, true);
       });
       return;
     }
-    id = target.getAttribute('data-cc-del');
+    id = target.getAttribute('data-bot-del');
     if (id) {
-      if (!window.confirm('删除这份凭据？之后走 Connect 的请求会改用其它凭据，没有其它凭据时会回落 SDK 路线。')) return;
-      api('DELETE', '/admin/api/connect/credentials/' + encodeURIComponent(id)).then(function(){
+      if (!window.confirm('删除这份凭据？之后走 Bot 的请求会改用其它凭据，没有其它凭据时会回落 SDK 路线。')) return;
+      api('DELETE', '/admin/api/bot/credentials/' + encodeURIComponent(id)).then(function(){
         toast('已删除');
-        loadConnect();
+        loadBot();
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('删除失败：' + err.message, true);
       });
     }
   });
 
-  $('cc-runs-body').addEventListener('click', function(event){
+  $('bot-runs-body').addEventListener('click', function(event){
     var target = event.target;
     if (!target || target.tagName !== 'BUTTON') return;
-    var id = target.getAttribute('data-cc-run');
+    var id = target.getAttribute('data-bot-run');
     if (id) {
-      api('GET', '/admin/api/connect/runs/' + encodeURIComponent(id)).then(function(data){
-        var box = $('cc-run-detail');
+      api('GET', '/admin/api/bot/runs/' + encodeURIComponent(id)).then(function(data){
+        var box = $('bot-run-detail');
         box.classList.remove('hidden');
         box.textContent = JSON.stringify(data, null, 2);
       }).catch(function(err){
@@ -2248,12 +2248,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       });
       return;
     }
-    id = target.getAttribute('data-cc-run-cancel');
+    id = target.getAttribute('data-bot-run-cancel');
     if (id) {
       if (!window.confirm('取消这个 run？已经交付给客户端的内容不会撤回。')) return;
-      api('POST', '/admin/api/connect/runs/' + encodeURIComponent(id) + '/cancel').then(function(){
+      api('POST', '/admin/api/bot/runs/' + encodeURIComponent(id) + '/cancel').then(function(){
         toast('已取消');
-        loadConnectRuns();
+        loadBotRuns();
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('取消失败：' + err.message, true);
       });
@@ -2498,10 +2498,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       openScopeModal('key-scope', id, key && key.modelScope);
       return;
     }
-    if (action === 'connect-import') {
+    if (action === 'bot-import') {
       button.disabled = true;
-      api('POST', '/admin/api/connect/credentials/from-key', { cursorKeyId: id }).then(function(){
-        toast('已拉取 Connect 凭据，可到「Connect 凭据」页查看');
+      api('POST', '/admin/api/bot/credentials/from-key', { cursorKeyId: id }).then(function(){
+        toast('已拉取 Bot 凭据，可到「Bot 凭据」页查看');
       }).catch(function(err){
         if (err.message !== 'unauthorized') toast('拉取失败：' + err.message, true);
       }).finally(function(){ button.disabled = false; });
@@ -2603,7 +2603,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       model: opts.model,
       prompt: opts.prompt
     }).then(function(data){
-      var route = data.provider === 'connect' ? 'Connect' : 'SDK';
+      var route = data.provider === 'bot' ? 'Bot' : 'SDK';
       if (data.ok) {
         result.textContent = '✔ ' + route + ' 成功（' + (data.durationMs / 1000).toFixed(1) + 's'
           + (data.keyLabel ? '，key：' + data.keyLabel : '') + '）\\n' + data.text;
@@ -2612,7 +2612,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           + (data.keyLabel ? '，key：' + data.keyLabel : '') + '）\\n' + data.error;
       }
       loadAll();
-      if (currentSection === 'connect') loadConnect();
+      if (currentSection === 'bot') loadBot();
     }).catch(function(err){
       result.textContent = '✘ 请求失败：' + err.message;
     }).finally(function(){
@@ -2623,7 +2623,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
   $('test-provider').addEventListener('change', function(){
     updateTestRouteHint();
-    if (testProvider() === 'connect' && !connectCatalog.length) loadConnectModels(false);
+    if (testProvider() === 'bot' && !botCatalog.length) loadBotModels(false);
     fillModelSelects();
   });
 

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 import type { GatewayImage, GatewayTool, GatewayToolCall } from "../types.js";
-import type { ConnectMessage, ConnectReasoningPart, ConnectToolResult } from "./request-builder.js";
+import type { BotMessage, BotReasoningPart, BotToolResult } from "./request-builder.js";
 
 /**
- * Connect 路线的结构化上下文（计划 §G5）。
+ * Cursor Bot 路线的结构化上下文（计划 §G5）。
  *
  * 与 `CursorRunRequest.prompt` 并存而不替换：SDK 路线只能收一串合成文本，
  * 而 `InferenceCoreMessage` 是结构化的——有 `role`（含 `SYSTEM=4`）、`tool_calls`、
@@ -13,7 +13,7 @@ import type { ConnectMessage, ConnectReasoningPart, ConnectToolResult } from "./
  */
 export interface PreparedConversation {
   /** 结构化消息，直接对应 InferenceCoreMessage[]。不含 system。 */
-  messages: ConnectMessage[];
+  messages: BotMessage[];
   /** system / developer 指令单独保留，构造请求时映射到 role=SYSTEM(4)。 */
   systemInstructions: string[];
   tools: GatewayTool[];
@@ -24,7 +24,7 @@ export interface PreparedConversation {
   invocationId: string;
   /**
    * 上一轮 thinking 的 signature **不在这里**——它们直接挂在
-   * `ConnectMessage.reasoning[].signature` 上，由 request-builder 原样写进
+   * `BotMessage.reasoning[].signature` 上，由 request-builder 原样写进
    * `InferenceReasoningPart.signature`。
    *
    * 这里曾经有一张按消息下标索引的 `reasoningSignatures` 表。它是错的：下标既会被
@@ -56,7 +56,7 @@ export interface ConversationOptions {
  *
  * 刻意不改 `protocol.ts`：那 1200 行合成 prompt 的逻辑服务着 SDK 路线和三套对外协议，
  * 已有 590 条测试压在上面。这里只读原始 body 走一条独立的结构化解析，
- * 两条路径互不影响，Connect 路线出问题也不会波及 SDK 路线。
+ * 两条路径互不影响，Bot 路线出问题也不会波及 SDK 路线。
  */
 export function toPreparedConversation(
   body: unknown,
@@ -79,10 +79,10 @@ export function toPreparedConversation(
 }
 
 /** 把结构化对话摊平成 request-builder 要的消息序列（system 在最前）。 */
-export function conversationMessages(conversation: PreparedConversation): ConnectMessage[] {
+export function conversationMessages(conversation: PreparedConversation): BotMessage[] {
   const system = conversation.systemInstructions
     .filter((text) => text.trim())
-    .map((text): ConnectMessage => ({ role: "system", text }));
+    .map((text): BotMessage => ({ role: "system", text }));
   return [...system, ...conversation.messages];
 }
 
@@ -100,7 +100,7 @@ function resolveSystem(clientSystem: string[], options: ConversationOptions): st
 
 interface ParsedInbound {
   system: string[];
-  messages: ConnectMessage[];
+  messages: BotMessage[];
 }
 
 /* ------------------------------------------------------------- OpenAI Chat */
@@ -138,7 +138,7 @@ function parseChat(record: Record<string, unknown>): ParsedInbound {
     }
 
     if (role === "assistant") {
-      const assistant: ConnectMessage = { role: "assistant" };
+      const assistant: BotMessage = { role: "assistant" };
       const text = contentText(message.content);
       if (text) assistant.text = text;
       // 旧式单个 function_call 与新式 tool_calls 都要认，否则旧客户端的整轮工具调用会消失。
@@ -185,7 +185,7 @@ function toolArguments(raw: unknown): Record<string, unknown> {
 }
 
 /** 只有真有内容才推：空 user 消息在 wire 上是一条 role=USER 但 content oneof 未设的消息。 */
-function pushUser(messages: ConnectMessage[], content: unknown): void {
+function pushUser(messages: BotMessage[], content: unknown): void {
   const message = userMessage(content);
   if (message.text || message.images?.length) messages.push(message);
 }
@@ -268,9 +268,9 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
     }
 
     // Anthropic 把 tool_result 放在 user 消息里，但协议侧它属于 role=TOOL(3)。
-    const toolResults: ConnectToolResult[] = [];
+    const toolResults: BotToolResult[] = [];
     const toolCalls: GatewayToolCall[] = [];
-    const reasoning: ConnectReasoningPart[] = [];
+    const reasoning: BotReasoningPart[] = [];
     const images: GatewayImage[] = [];
     const texts: string[] = [];
 
@@ -282,7 +282,7 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
         case "thinking": {
           const text = stringOr(block.thinking, "");
           const signature = stringOr(block.signature, "");
-          const part: ConnectReasoningPart = { text };
+          const part: BotReasoningPart = { text };
           if (signature) part.signature = signature;
           reasoning.push(part);
           break;
@@ -326,7 +326,7 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
           // 与 protocol.ts 一致：明确拒绝而不是静默丢掉——
           // 丢掉的后果是模型被问一份它从来没收到的 PDF。
           throw new ApiError(
-            "document/PDF content blocks are not supported on the Cursor Connect route.",
+            "document/PDF content blocks are not supported on the Cursor Bot route.",
             400,
             "unsupported_parameter"
           );
@@ -347,7 +347,7 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
 
     const text = texts.join("\n\n");
     if (role === "assistant") {
-      const assistant: ConnectMessage = { role: "assistant" };
+      const assistant: BotMessage = { role: "assistant" };
       if (text) assistant.text = text;
       if (toolCalls.length) assistant.toolCalls = toolCalls;
       if (reasoning.length) assistant.reasoning = reasoning;
@@ -372,7 +372,7 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
 
 /* ------------------------------------------------------------------ 通用 */
 
-function userMessage(content: unknown): ConnectMessage {
+function userMessage(content: unknown): BotMessage {
   const images: GatewayImage[] = [];
   const texts: string[] = [];
   if (typeof content === "string") {
@@ -403,7 +403,7 @@ function imageFrom(part: Record<string, unknown>): GatewayImage | undefined {
   return { type: "image", source: "url", data: url };
 }
 
-function parseReasoning(message: Record<string, unknown>): ConnectReasoningPart[] {
+function parseReasoning(message: Record<string, unknown>): BotReasoningPart[] {
   const text = stringOr(message.reasoning_content, "") || stringOr(message.reasoning, "");
   if (!text) return [];
   const signature = stringOr(message.reasoning_signature, "");

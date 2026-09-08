@@ -6,9 +6,9 @@ import type { DraftEvent, UnifiedEvent, UnifiedEventType } from "./events.js";
 import { UNIFIED_EVENT_VERSION } from "./events.js";
 
 /**
- * Connect 路线的持久化（计划 §G10）。
+ * Cursor Bot 路线的持久化（计划 §G10）。
  *
- * 表名一律 `cc_` 前缀，且**不改 `src/store.ts`**：那 1500 行服务着 SDK 路线，
+ * 表名一律 `bot_` 前缀，且**不改 `src/store.ts`**：那 1500 行服务着 SDK 路线，
  * 已有大量测试压在上面。这里只借同一个 SQLite 文件（或另开一个），自己建表、自己迁移。
  */
 
@@ -34,7 +34,7 @@ export type ToolCallStatus = "streaming" | "complete" | "submitted" | "failed";
 
 export type TaskStatus = "queued" | "running" | "awaiting_tool" | "awaiting_child" | "completed" | "failed" | "cancelled";
 
-export interface CcRun {
+export interface BotRun {
   id: string;
   conversationId: string;
   parentRunId?: string;
@@ -56,7 +56,7 @@ export interface CcRun {
   finishedAt?: string;
 }
 
-export interface CcToolCall {
+export interface BotToolCall {
   runId: string;
   callId: string;
   toolName: string;
@@ -71,7 +71,7 @@ export interface CcToolCall {
   completedAt?: string;
 }
 
-export interface CcTask {
+export interface BotTask {
   taskId: string;
   runId: string;
   parentTaskId?: string;
@@ -86,7 +86,7 @@ export interface CcTask {
   nextRunAt?: string;
 }
 
-export interface CcSummary {
+export interface BotSummary {
   id: string;
   conversationId: string;
   runId: string;
@@ -98,7 +98,7 @@ export interface CcSummary {
   createdAt: string;
 }
 
-export interface CcConversation {
+export interface BotConversation {
   id: string;
   ownerHash: string;
   upstreamConversationId: string;
@@ -122,7 +122,7 @@ export interface CreateRunInput {
 }
 
 const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS cc_credentials (
+  CREATE TABLE IF NOT EXISTS bot_credentials (
     id TEXT PRIMARY KEY,
     label TEXT,
     encrypted_session_token TEXT NOT NULL,
@@ -149,7 +149,7 @@ const SCHEMA = `
     source_cursor_key_id TEXT
   );
 
-  CREATE TABLE IF NOT EXISTS cc_conversations (
+  CREATE TABLE IF NOT EXISTS bot_conversations (
     id TEXT PRIMARY KEY,
     owner_hash TEXT NOT NULL,
     upstream_conversation_id TEXT NOT NULL,
@@ -164,10 +164,10 @@ const SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_conversations_upstream
-  ON cc_conversations(upstream_conversation_id, owner_hash);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_conversations_upstream
+  ON bot_conversations(upstream_conversation_id, owner_hash);
 
-  CREATE TABLE IF NOT EXISTS cc_runs (
+  CREATE TABLE IF NOT EXISTS bot_runs (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
     parent_run_id TEXT,
@@ -190,11 +190,11 @@ const SCHEMA = `
     finished_at TEXT
   );
 
-  CREATE INDEX IF NOT EXISTS idx_cc_runs_conversation ON cc_runs(conversation_id);
-  CREATE INDEX IF NOT EXISTS idx_cc_runs_lease ON cc_runs(status, lease_until);
-  CREATE INDEX IF NOT EXISTS idx_cc_runs_parent ON cc_runs(parent_run_id);
+  CREATE INDEX IF NOT EXISTS idx_bot_runs_conversation ON bot_runs(conversation_id);
+  CREATE INDEX IF NOT EXISTS idx_bot_runs_lease ON bot_runs(status, lease_until);
+  CREATE INDEX IF NOT EXISTS idx_bot_runs_parent ON bot_runs(parent_run_id);
 
-  CREATE TABLE IF NOT EXISTS cc_events (
+  CREATE TABLE IF NOT EXISTS bot_events (
     run_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
     event_id TEXT NOT NULL,
@@ -206,10 +206,10 @@ const SCHEMA = `
     PRIMARY KEY (run_id, seq)
   );
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_events_event_id ON cc_events(run_id, event_id);
-  CREATE INDEX IF NOT EXISTS idx_cc_events_replay ON cc_events(run_id, seq);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_events_event_id ON bot_events(run_id, event_id);
+  CREATE INDEX IF NOT EXISTS idx_bot_events_replay ON bot_events(run_id, seq);
 
-  CREATE TABLE IF NOT EXISTS cc_tool_calls (
+  CREATE TABLE IF NOT EXISTS bot_tool_calls (
     run_id TEXT NOT NULL,
     call_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
@@ -225,7 +225,7 @@ const SCHEMA = `
     PRIMARY KEY (run_id, call_id)
   );
 
-  CREATE TABLE IF NOT EXISTS cc_tasks (
+  CREATE TABLE IF NOT EXISTS bot_tasks (
     task_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     parent_task_id TEXT,
@@ -242,9 +242,9 @@ const SCHEMA = `
     updated_at TEXT NOT NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_cc_tasks_run ON cc_tasks(run_id);
+  CREATE INDEX IF NOT EXISTS idx_bot_tasks_run ON bot_tasks(run_id);
 
-  CREATE TABLE IF NOT EXISTS cc_summaries (
+  CREATE TABLE IF NOT EXISTS bot_summaries (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -257,14 +257,14 @@ const SCHEMA = `
     created_at TEXT NOT NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_cc_summaries_conversation ON cc_summaries(conversation_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_bot_summaries_conversation ON bot_summaries(conversation_id, created_at DESC);
 
   -- 没有这条唯一索引时，"按 source_hash 去重"只是先查再写，两个并发摘要会各插一行，
   -- 同一段消息被摘两次、计费两次，之后 latestSummary 还会在两行之间任取。
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_summaries_dedupe ON cc_summaries(conversation_id, source_hash);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_summaries_dedupe ON bot_summaries(conversation_id, source_hash);
 `;
 
-export interface CcCredential {
+export interface BotCredential {
   id: string;
   label?: string;
   /** 明文 session token。**只在进程内传递，绝不进日志、响应体或 fixture。** */
@@ -292,7 +292,7 @@ export interface CcCredential {
   sourceCursorKeyId?: string;
 }
 
-export interface CcCredentialInput {
+export interface BotCredentialInput {
   id?: string;
   label?: string;
   sessionToken?: string;
@@ -312,7 +312,7 @@ export interface CcCredentialInput {
   sourceCursorKeyId?: string;
 }
 
-export interface ConnectStoreOptions {
+export interface BotStoreOptions {
   now?: () => Date;
   newId?: () => string;
   /**
@@ -324,7 +324,7 @@ export interface ConnectStoreOptions {
   revealToken?: (stored: string) => string;
 }
 
-export class CursorConnectStore {
+export class CursorBotStore {
   private readonly now: () => Date;
   private readonly newId: () => string;
   private readonly protect: (plain: string) => string;
@@ -332,7 +332,7 @@ export class CursorConnectStore {
 
   constructor(
     private readonly db: DatabaseSync,
-    options: ConnectStoreOptions = {}
+    options: BotStoreOptions = {}
   ) {
     this.now = options.now ?? (() => new Date());
     this.newId = options.newId ?? randomUUID;
@@ -349,14 +349,14 @@ export class CursorConnectStore {
    */
   private migrate(): void {
     const columns: Array<[string, string, string]> = [
-      ["cc_runs", "next_run_at", "TEXT"],
-      ["cc_runs", "delivery_state", "TEXT NOT NULL DEFAULT 'none'"],
-      ["cc_runs", "usage_json", "TEXT"],
-      ["cc_events", "attempt", "INTEGER NOT NULL DEFAULT 0"],
-      ["cc_tool_calls", "idempotency_key", "TEXT"],
-      ["cc_conversations", "latest_event_seq", "INTEGER NOT NULL DEFAULT 0"],
-      ["cc_credentials", "note", "TEXT"],
-      ["cc_credentials", "source_cursor_key_id", "TEXT"]
+      ["bot_runs", "next_run_at", "TEXT"],
+      ["bot_runs", "delivery_state", "TEXT NOT NULL DEFAULT 'none'"],
+      ["bot_runs", "usage_json", "TEXT"],
+      ["bot_events", "attempt", "INTEGER NOT NULL DEFAULT 0"],
+      ["bot_tool_calls", "idempotency_key", "TEXT"],
+      ["bot_conversations", "latest_event_seq", "INTEGER NOT NULL DEFAULT 0"],
+      ["bot_credentials", "note", "TEXT"],
+      ["bot_credentials", "source_cursor_key_id", "TEXT"]
     ];
     for (const [table, column, type] of columns) {
       if (this.hasColumn(table, column)) continue;
@@ -368,10 +368,10 @@ export class CursorConnectStore {
     }
     // 索引必须在补列之后建：SCHEMA 里的 CREATE TABLE IF NOT EXISTS 不会给旧表加列，
     // 若把这个 UNIQUE INDEX 放进 SCHEMA，旧库会在 migrate 之前就以 "no such column" 炸死进程。
-    if (this.hasColumn("cc_credentials", "source_cursor_key_id")) {
+    if (this.hasColumn("bot_credentials", "source_cursor_key_id")) {
       this.db.exec(
-        `CREATE UNIQUE INDEX IF NOT EXISTS idx_cc_credentials_source_key
-         ON cc_credentials(source_cursor_key_id)
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_credentials_source_key
+         ON bot_credentials(source_cursor_key_id)
          WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != ''`
       );
     }
@@ -389,14 +389,14 @@ export class CursorConnectStore {
   }
 
   /** 便于测试与独立部署：自带一个库而不是强行挂到 SDK 路线的库上。 */
-  static open(path = ":memory:", options: ConnectStoreOptions = {}): CursorConnectStore {
+  static open(path = ":memory:", options: BotStoreOptions = {}): CursorBotStore {
     const db = new DatabaseSync(path);
     try {
       db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
     } catch {
       // 内存库不支持 WAL。
     }
-    return new CursorConnectStore(db, options);
+    return new CursorBotStore(db, options);
   }
 
   close(): void {
@@ -412,7 +412,7 @@ export class CursorConnectStore {
     upstreamConversationGroupId?: string;
     defaultModel?: string;
     stickyCredentialId?: string;
-  }): CcConversation {
+  }): BotConversation {
     const ts = this.iso();
     // 一条 INSERT ... ON CONFLICT 而不是"先查再写"：两个并发的首次接触会各插一行，
     // 之后每次按 (upstream_id, owner) 查都是 `.get()` 任取其一，
@@ -421,7 +421,7 @@ export class CursorConnectStore {
     // 客户端发一个空 model 就会把已配置的默认值抹掉。
     this.db
       .prepare(
-        `INSERT INTO cc_conversations
+        `INSERT INTO bot_conversations
          (id, owner_hash, upstream_conversation_id, upstream_conversation_group_id, default_model,
           default_parameters_json, sticky_credential_id, latest_summary_id, latest_event_seq, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 0, 'active', ?, ?)
@@ -441,25 +441,25 @@ export class CursorConnectStore {
         ts
       );
     const row = this.db
-      .prepare("SELECT * FROM cc_conversations WHERE upstream_conversation_id = ? AND owner_hash = ?")
+      .prepare("SELECT * FROM bot_conversations WHERE upstream_conversation_id = ? AND owner_hash = ?")
       .get(input.upstreamConversationId, input.ownerHash);
     return mapConversation(row!);
   }
 
-  conversation(id: string): CcConversation | undefined {
-    const row = this.db.prepare("SELECT * FROM cc_conversations WHERE id = ?").get(id);
+  conversation(id: string): BotConversation | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_conversations WHERE id = ?").get(id);
     return row ? mapConversation(row) : undefined;
   }
 
   setLatestSummary(conversationId: string, summaryId: string): void {
     this.db
-      .prepare("UPDATE cc_conversations SET latest_summary_id = ?, updated_at = ? WHERE id = ?")
+      .prepare("UPDATE bot_conversations SET latest_summary_id = ?, updated_at = ? WHERE id = ?")
       .run(summaryId, this.iso(), conversationId);
   }
 
   /* ------------------------------------------------------------ 凭据 */
 
-  upsertCredential(input: CcCredentialInput): CcCredential {
+  upsertCredential(input: BotCredentialInput): BotCredential {
     const ts = this.iso();
     const id = input.id ?? this.newId();
     const existing = input.id ? this.credential(input.id) : undefined;
@@ -490,14 +490,14 @@ export class CursorConnectStore {
       const sourceKey = blankToNull(input.sourceCursorKeyId);
       if (sourceKey) put("source_cursor_key_id", sourceKey);
       put("updated_at", ts);
-      if (sets.length) this.db.prepare(`UPDATE cc_credentials SET ${sets.join(", ")} WHERE id = ?`).run(...values, input.id!);
+      if (sets.length) this.db.prepare(`UPDATE bot_credentials SET ${sets.join(", ")} WHERE id = ?`).run(...values, input.id!);
       return this.credential(input.id!)!;
     }
 
-    if (!input.sessionToken) throw new Error("a new Cursor Connect credential needs a session token.");
+    if (!input.sessionToken) throw new Error("a new Cursor Bot credential needs a session token.");
     this.db
       .prepare(
-        `INSERT INTO cc_credentials
+        `INSERT INTO bot_credentials
          (id, label, encrypted_session_token, token_type, expires_at, machine_id, mac_machine_id, client_version,
           client_os, client_arch, client_os_version, device_type, client_key, session_id, timezone,
           status, allowed_models, excluded_models, failure_count, last_used_at, last_error, created_at, updated_at,
@@ -534,60 +534,60 @@ export class CursorConnectStore {
    * 只服务一件事：断言落库的值不是明文 token。除此之外不要用它。
    */
   rawCredentialRow(id: string): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT * FROM cc_credentials WHERE id = ?").get(id);
+    return this.db.prepare("SELECT * FROM bot_credentials WHERE id = ?").get(id);
   }
 
-  credential(id: string): CcCredential | undefined {
-    const row = this.db.prepare("SELECT * FROM cc_credentials WHERE id = ?").get(id);
+  credential(id: string): BotCredential | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_credentials WHERE id = ?").get(id);
     return row ? this.mapCredential(row) : undefined;
   }
 
-  credentialBySourceKeyId(sourceCursorKeyId: string): CcCredential | undefined {
+  credentialBySourceKeyId(sourceCursorKeyId: string): BotCredential | undefined {
     const id = sourceCursorKeyId.trim();
     if (!id) return undefined;
-    const row = this.db.prepare("SELECT * FROM cc_credentials WHERE source_cursor_key_id = ?").get(id);
+    const row = this.db.prepare("SELECT * FROM bot_credentials WHERE source_cursor_key_id = ?").get(id);
     return row ? this.mapCredential(row) : undefined;
   }
 
-  listCredentials(): CcCredential[] {
-    return this.db.prepare("SELECT * FROM cc_credentials ORDER BY created_at").all().map((row) => this.mapCredential(row));
+  listCredentials(): BotCredential[] {
+    return this.db.prepare("SELECT * FROM bot_credentials ORDER BY created_at").all().map((row) => this.mapCredential(row));
   }
 
-  activeCredentials(): CcCredential[] {
+  activeCredentials(): BotCredential[] {
     return this.listCredentials().filter((credential) => credential.status === "active");
   }
 
   deleteCredential(id: string): boolean {
-    return Number(this.db.prepare("DELETE FROM cc_credentials WHERE id = ?").run(id).changes) > 0;
+    return Number(this.db.prepare("DELETE FROM bot_credentials WHERE id = ?").run(id).changes) > 0;
   }
 
   setCredentialStatus(id: string, status: string): void {
     this.db
-      .prepare("UPDATE cc_credentials SET status = ?, updated_at = ? WHERE id = ?")
+      .prepare("UPDATE bot_credentials SET status = ?, updated_at = ? WHERE id = ?")
       .run(status, this.iso(), id);
   }
 
   recordCredentialUse(id: string): void {
     this.db
-      .prepare("UPDATE cc_credentials SET last_used_at = ?, failure_count = 0, last_error = NULL WHERE id = ?")
+      .prepare("UPDATE bot_credentials SET last_used_at = ?, failure_count = 0, last_error = NULL WHERE id = ?")
       .run(this.iso(), id);
   }
 
   /** 记一次失败并返回累计次数，让调用方决定要不要自动停用。 */
   recordCredentialFailure(id: string, error: string): number {
     this.db
-      .prepare("UPDATE cc_credentials SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
+      .prepare("UPDATE bot_credentials SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
       .run(error.slice(0, 400), this.iso(), id);
-    return Number(this.db.prepare("SELECT failure_count FROM cc_credentials WHERE id = ?").get(id)?.failure_count ?? 0);
+    return Number(this.db.prepare("SELECT failure_count FROM bot_credentials WHERE id = ?").get(id)?.failure_count ?? 0);
   }
 
   /* -------------------------------------------------------------- run */
 
-  createRun(input: CreateRunInput): CcRun {
+  createRun(input: CreateRunInput): BotRun {
     const id = input.id ?? this.newId();
     this.db
       .prepare(
-        `INSERT INTO cc_runs
+        `INSERT INTO bot_runs
          (id, conversation_id, parent_run_id, parent_tool_call_id, upstream_invocation_id, requested_model,
           resolved_model, parameters_json, background, status, attempt, delivery_state, last_event_seq,
           usage_json, error_json, lease_owner, lease_until, started_at, finished_at)
@@ -606,31 +606,31 @@ export class CursorConnectStore {
     return this.run(id)!;
   }
 
-  run(id: string): CcRun | undefined {
-    const row = this.db.prepare("SELECT * FROM cc_runs WHERE id = ?").get(id);
+  run(id: string): BotRun | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_runs WHERE id = ?").get(id);
     return row ? mapRun(row) : undefined;
   }
 
   /** 后台/接口用的 run 列表。按创建顺序倒序，最新的在前。 */
-  listRuns(options: { conversationId?: string; limit?: number } = {}): CcRun[] {
+  listRuns(options: { conversationId?: string; limit?: number } = {}): BotRun[] {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
     const rows = options.conversationId
       ? this.db
-          .prepare("SELECT * FROM cc_runs WHERE conversation_id = ? ORDER BY rowid DESC LIMIT ?")
+          .prepare("SELECT * FROM bot_runs WHERE conversation_id = ? ORDER BY rowid DESC LIMIT ?")
           .all(options.conversationId, limit)
-      : this.db.prepare("SELECT * FROM cc_runs ORDER BY rowid DESC LIMIT ?").all(limit);
+      : this.db.prepare("SELECT * FROM bot_runs ORDER BY rowid DESC LIMIT ?").all(limit);
     return rows.map(mapRun);
   }
 
-  childRuns(parentRunId: string): CcRun[] {
-    return this.db.prepare("SELECT * FROM cc_runs WHERE parent_run_id = ?").all(parentRunId).map(mapRun);
+  childRuns(parentRunId: string): BotRun[] {
+    return this.db.prepare("SELECT * FROM bot_runs WHERE parent_run_id = ?").all(parentRunId).map(mapRun);
   }
 
   updateRun(
     id: string,
     patch: Partial<
       Pick<
-        CcRun,
+        BotRun,
         | "status"
         | "deliveryState"
         | "resolvedModel"
@@ -660,7 +660,7 @@ export class CursorConnectStore {
     put("usage_json", patch.usage ? JSON.stringify(patch.usage) : undefined);
     if (!sets.length) return;
     values.push(id);
-    this.db.prepare(`UPDATE cc_runs SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+    this.db.prepare(`UPDATE bot_runs SET ${sets.join(", ")} WHERE id = ?`).run(...values);
   }
 
   /**
@@ -670,7 +670,7 @@ export class CursorConnectStore {
    * 用带条件的 UPDATE 而不是「先查再写」：node:sqlite 是同步的，但多进程共享同一个库时
    * 先查再写仍会两个 worker 同时抢到。
    */
-  acquireRunLease(owner: string, leaseMs: number, statuses: RunStatus[] = ["queued", "paused"]): CcRun | undefined {
+  acquireRunLease(owner: string, leaseMs: number, statuses: RunStatus[] = ["queued", "paused"]): BotRun | undefined {
     const now = this.now();
     const nowIso = now.toISOString();
     const until = new Date(now.getTime() + leaseMs).toISOString();
@@ -681,7 +681,7 @@ export class CursorConnectStore {
     // `ORDER BY rowid` 永远排在最前，把后面所有 run 饿死。
     const candidate = this.db
       .prepare(
-        `SELECT id FROM cc_runs
+        `SELECT id FROM bot_runs
          WHERE (next_run_at IS NULL OR next_run_at <= ?)
            AND ((status IN (${placeholders}) AND (lease_until IS NULL OR lease_until <= ?))
              OR (status = 'running' AND lease_until IS NOT NULL AND lease_until <= ?))
@@ -697,7 +697,7 @@ export class CursorConnectStore {
     // 于是一个已完成的 run 被复活成 running，还带着已经写好的 finished_at。
     const claimed = this.db
       .prepare(
-        `UPDATE cc_runs SET lease_owner = ?, lease_until = ?, status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?)
+        `UPDATE bot_runs SET lease_owner = ?, lease_until = ?, status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?)
          WHERE id = ?
            AND ((status IN (${placeholders}) AND (lease_until IS NULL OR lease_until <= ?))
              OR (status = 'running' AND lease_until IS NOT NULL AND lease_until <= ?))`
@@ -714,14 +714,14 @@ export class CursorConnectStore {
    * 仍然要走租约而不是直接写 running——直接写的话 `lease_until` 是 NULL，
    * 进程中途死掉时崩溃接管分支永远看不到它。
    */
-  leaseRun(id: string, owner: string, leaseMs: number): CcRun | undefined {
+  leaseRun(id: string, owner: string, leaseMs: number): BotRun | undefined {
     const now = this.now();
     const nowIso = now.toISOString();
     const claimed = this.db
       .prepare(
         // 终态的 run 不能被重新上租约：`releaseRunLease` 把 lease_until 置了 NULL，
         // 只看租约的话一条已完成的 run 会被复活成 running。
-        `UPDATE cc_runs SET lease_owner = ?, lease_until = ?, status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?)
+        `UPDATE bot_runs SET lease_owner = ?, lease_until = ?, status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?)
          WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled')
            AND (lease_until IS NULL OR lease_until <= ?)`
       )
@@ -740,7 +740,7 @@ export class CursorConnectStore {
     // 同时不允许把已经终态的 run 改写掉——跨 worker 的 cancel 会把别人刚写完的结果覆盖。
     this.db
       .prepare(
-        `UPDATE cc_runs
+        `UPDATE bot_runs
          SET lease_owner = NULL, lease_until = NULL, status = ?, next_run_at = ?,
              finished_at = CASE WHEN ? = 1 THEN ? ELSE finished_at END
          WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled')`
@@ -764,7 +764,7 @@ export class CursorConnectStore {
     const payloads = drafts.map((draft) => JSON.stringify(draft.payload));
 
     const insert = this.db.prepare(
-      `INSERT INTO cc_events (run_id, seq, event_id, event_type, payload_json, upstream_case, attempt, created_at)
+      `INSERT INTO bot_events (run_id, seq, event_id, event_type, payload_json, upstream_case, attempt, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const events: UnifiedEvent[] = [];
@@ -775,8 +775,8 @@ export class CursorConnectStore {
     try {
       // seq 的读也必须在事务里。放在事务外的话两个并发 append 会读到同一个起点，
       // 输家撞 UNIQUE 抛出，那条事件就直接丢了。
-      const row = this.db.prepare("SELECT last_event_seq, delivery_state FROM cc_runs WHERE id = ?").get(runId);
-      if (!row) throw new Error(`cc_runs row ${runId} does not exist; refusing to append orphan events.`);
+      const row = this.db.prepare("SELECT last_event_seq, delivery_state FROM bot_runs WHERE id = ?").get(runId);
+      if (!row) throw new Error(`bot_runs row ${runId} does not exist; refusing to append orphan events.`);
       let seq = Number(row.last_event_seq);
       let delivery = (row.delivery_state as DeliveryState | undefined) ?? "none";
 
@@ -810,11 +810,11 @@ export class CursorConnectStore {
       // delivery_state 与事件在同一个事务里推进：它是 G9 判断「断线后重跑是否安全」的唯一依据，
       // 分开写就会出现「事件已交付但状态还说什么都没发过」的窗口。
       this.db
-        .prepare("UPDATE cc_runs SET last_event_seq = ?, delivery_state = ? WHERE id = ?")
+        .prepare("UPDATE bot_runs SET last_event_seq = ?, delivery_state = ? WHERE id = ?")
         .run(seq, delivery, runId);
       // 会话级水位同样在这里推进，否则 latest_event_seq 永远是 0。
       this.db
-        .prepare("UPDATE cc_conversations SET latest_event_seq = MAX(latest_event_seq, ?), updated_at = ? WHERE id = ?")
+        .prepare("UPDATE bot_conversations SET latest_event_seq = MAX(latest_event_seq, ?), updated_at = ? WHERE id = ?")
         .run(seq, createdAt, conversationId);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -829,10 +829,10 @@ export class CursorConnectStore {
    * `limit` 是单页上限，**调用方必须翻页翻到空**——只查一页就切 live 会把中间那段永久丢掉。
    */
   eventsAfter(runId: string, afterSeq = 0, limit = 1000): UnifiedEvent[] {
-    const conversationId = (this.db.prepare("SELECT conversation_id FROM cc_runs WHERE id = ?").get(runId)
+    const conversationId = (this.db.prepare("SELECT conversation_id FROM bot_runs WHERE id = ?").get(runId)
       ?.conversation_id ?? "") as string;
     return this.db
-      .prepare("SELECT * FROM cc_events WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+      .prepare("SELECT * FROM bot_events WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?")
       .all(runId, afterSeq, limit)
       .map((row) => mapEvent(row, conversationId));
   }
@@ -872,7 +872,7 @@ export class CursorConnectStore {
   }): void {
     this.db
       .prepare(
-        `INSERT INTO cc_tool_calls (run_id, call_id, tool_name, arguments_json, tool_index, status, is_error, parent_call_id, requested_at)
+        `INSERT INTO bot_tool_calls (run_id, call_id, tool_name, arguments_json, tool_index, status, is_error, parent_call_id, requested_at)
          VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
          ON CONFLICT(run_id, call_id) DO UPDATE SET
            tool_name = excluded.tool_name,
@@ -881,7 +881,7 @@ export class CursorConnectStore {
            status = excluded.status
          -- 已经提交过结果的调用不能被重新记录降级回 complete：
          -- 那会让重连后的循环把同一个工具再执行一次，幂等就白做了。
-         WHERE cc_tool_calls.status != 'submitted'`
+         WHERE bot_tool_calls.status != 'submitted'`
       )
       .run(
         input.runId,
@@ -904,21 +904,21 @@ export class CursorConnectStore {
     // 同时返回 true，然后各自再发一轮推理——正是 UNIQUE(run_id, call_id) 想挡住的重复计费。
     const changed = this.db
       .prepare(
-        `UPDATE cc_tool_calls SET status = 'submitted', result_json = ?, is_error = ?, completed_at = ?
+        `UPDATE bot_tool_calls SET status = 'submitted', result_json = ?, is_error = ?, completed_at = ?
          WHERE run_id = ? AND call_id = ? AND status != 'submitted'`
       )
       .run(JSON.stringify(result ?? null), isError ? 1 : 0, this.iso(), runId, callId);
     return Number(changed.changes) > 0;
   }
 
-  toolCalls(runId: string): CcToolCall[] {
+  toolCalls(runId: string): BotToolCall[] {
     return this.db
-      .prepare("SELECT * FROM cc_tool_calls WHERE run_id = ? ORDER BY COALESCE(tool_index, 0), rowid")
+      .prepare("SELECT * FROM bot_tool_calls WHERE run_id = ? ORDER BY COALESCE(tool_index, 0), rowid")
       .all(runId)
       .map(mapToolCall);
   }
 
-  pendingToolCalls(runId: string): CcToolCall[] {
+  pendingToolCalls(runId: string): BotToolCall[] {
     return this.toolCalls(runId).filter((call) => call.status !== "submitted");
   }
 
@@ -932,12 +932,12 @@ export class CursorConnectStore {
     depth: number;
     requestedModel?: string;
     parametersJson?: string;
-  }): CcTask {
+  }): BotTask {
     const taskId = input.taskId ?? this.newId();
     const ts = this.iso();
     this.db
       .prepare(
-        `INSERT INTO cc_tasks (task_id, run_id, parent_task_id, task_type, status, depth, requested_model, parameters_json, retry_count, created_at, updated_at)
+        `INSERT INTO bot_tasks (task_id, run_id, parent_task_id, task_type, status, depth, requested_model, parameters_json, retry_count, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?)`
       )
       .run(
@@ -954,17 +954,17 @@ export class CursorConnectStore {
     return this.task(taskId)!;
   }
 
-  task(taskId: string): CcTask | undefined {
-    const row = this.db.prepare("SELECT * FROM cc_tasks WHERE task_id = ?").get(taskId);
+  task(taskId: string): BotTask | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_tasks WHERE task_id = ?").get(taskId);
     return row ? mapTask(row) : undefined;
   }
 
   updateTaskStatus(taskId: string, status: TaskStatus): void {
-    this.db.prepare("UPDATE cc_tasks SET status = ?, updated_at = ? WHERE task_id = ?").run(status, this.iso(), taskId);
+    this.db.prepare("UPDATE bot_tasks SET status = ?, updated_at = ? WHERE task_id = ?").run(status, this.iso(), taskId);
   }
 
-  tasksForRun(runId: string): CcTask[] {
-    return this.db.prepare("SELECT * FROM cc_tasks WHERE run_id = ? ORDER BY rowid").all(runId).map(mapTask);
+  tasksForRun(runId: string): BotTask[] {
+    return this.db.prepare("SELECT * FROM bot_tasks WHERE run_id = ? ORDER BY rowid").all(runId).map(mapTask);
   }
 
   /* ------------------------------------------------------------ 摘要 */
@@ -982,11 +982,11 @@ export class CursorConnectStore {
     model?: string;
     parametersJson?: string;
     sourceHash: string;
-  }): CcSummary {
+  }): BotSummary {
     // 去重交给 UNIQUE 索引，不再先查再写：并发下"两个都没查到"会插出两行。
     this.db
       .prepare(
-        `INSERT INTO cc_summaries (id, conversation_id, run_id, covered_through_seq, summary_text, summary_json, model, parameters_json, source_hash, created_at)
+        `INSERT INTO bot_summaries (id, conversation_id, run_id, covered_through_seq, summary_text, summary_json, model, parameters_json, source_hash, created_at)
          VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
          ON CONFLICT(conversation_id, source_hash) DO NOTHING`
       )
@@ -1002,19 +1002,19 @@ export class CursorConnectStore {
         this.iso()
       );
     const row = this.db
-      .prepare("SELECT * FROM cc_summaries WHERE conversation_id = ? AND source_hash = ?")
+      .prepare("SELECT * FROM bot_summaries WHERE conversation_id = ? AND source_hash = ?")
       .get(input.conversationId, input.sourceHash);
     return mapSummary(row!);
   }
 
-  summary(id: string): CcSummary | undefined {
-    const row = this.db.prepare("SELECT * FROM cc_summaries WHERE id = ?").get(id);
+  summary(id: string): BotSummary | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_summaries WHERE id = ?").get(id);
     return row ? mapSummary(row) : undefined;
   }
 
-  latestSummary(conversationId: string): CcSummary | undefined {
+  latestSummary(conversationId: string): BotSummary | undefined {
     const row = this.db
-      .prepare("SELECT * FROM cc_summaries WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .prepare("SELECT * FROM bot_summaries WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
       .get(conversationId);
     return row ? mapSummary(row) : undefined;
   }
@@ -1023,7 +1023,7 @@ export class CursorConnectStore {
     return this.now().toISOString();
   }
 
-  private mapCredential(row: Record<string, unknown>): CcCredential {
+  private mapCredential(row: Record<string, unknown>): BotCredential {
     return {
       id: row.id as string,
       label: optional(row.label),
@@ -1074,7 +1074,7 @@ function advanceDelivery(current: DeliveryState, type: string): DeliveryState {
   return current;
 }
 
-function mapConversation(row: Record<string, unknown>): CcConversation {
+function mapConversation(row: Record<string, unknown>): BotConversation {
   return {
     id: row.id as string,
     ownerHash: row.owner_hash as string,
@@ -1088,7 +1088,7 @@ function mapConversation(row: Record<string, unknown>): CcConversation {
   };
 }
 
-function mapRun(row: Record<string, unknown>): CcRun {
+function mapRun(row: Record<string, unknown>): BotRun {
   const usageJson = optional(row.usage_json);
   return {
     id: row.id as string,
@@ -1128,7 +1128,7 @@ function mapEvent(row: Record<string, unknown>, conversationId: string): Unified
   };
 }
 
-function mapToolCall(row: Record<string, unknown>): CcToolCall {
+function mapToolCall(row: Record<string, unknown>): BotToolCall {
   return {
     runId: row.run_id as string,
     callId: row.call_id as string,
@@ -1145,7 +1145,7 @@ function mapToolCall(row: Record<string, unknown>): CcToolCall {
   };
 }
 
-function mapTask(row: Record<string, unknown>): CcTask {
+function mapTask(row: Record<string, unknown>): BotTask {
   return {
     taskId: row.task_id as string,
     runId: row.run_id as string,
@@ -1162,7 +1162,7 @@ function mapTask(row: Record<string, unknown>): CcTask {
   };
 }
 
-function mapSummary(row: Record<string, unknown>): CcSummary {
+function mapSummary(row: Record<string, unknown>): BotSummary {
   return {
     id: row.id as string,
     conversationId: row.conversation_id as string,

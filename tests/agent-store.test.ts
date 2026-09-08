@@ -140,12 +140,12 @@ test("evicted agents.update upserts (parity with ephemeral)", async () => {
 
 test("request_logs.provider round-trips, migrates a missing column, and KEEP=0 keeps rows", async () => {
   const memory = new MemoryStateStore();
-  await memory.insertRequestLog(log({ id: "mem", provider: "connect" }));
-  assert.equal((await memory.listRequestLogs({ limit: 5 })).logs[0].provider, "connect");
+  await memory.insertRequestLog(log({ id: "mem", provider: "bot" }));
+  assert.equal((await memory.listRequestLogs({ limit: 5 })).logs[0].provider, "bot");
 
   const sqlite = new SqliteStateStore(join(tempDir(), "state.sqlite"));
-  await sqlite.insertRequestLog(log({ id: "sql", provider: "connect" }));
-  assert.equal((await sqlite.listRequestLogs({ limit: 5 })).logs[0].provider, "connect");
+  await sqlite.insertRequestLog(log({ id: "sql", provider: "bot" }));
+  assert.equal((await sqlite.listRequestLogs({ limit: 5 })).logs[0].provider, "bot");
   await sqlite.insertRequestLog(log({ id: "sql-sdk", provider: "sdk" }));
   assert.equal((await sqlite.listRequestLogs({ limit: 5 })).logs.find((row) => row.id === "sql-sdk")?.provider, "sdk");
   await sqlite.insertRequestLog(log({ id: "sql-none" }));
@@ -167,13 +167,13 @@ test("request_logs.provider round-trips, migrates a missing column, and KEEP=0 k
 
   const migrated = new SqliteStateStore(legacyPath);
   assert.equal((await migrated.listRequestLogs({ limit: 5 })).logs[0].provider, undefined, "old rows have no provider");
-  await migrated.insertRequestLog(log({ id: "log-new", provider: "connect" }));
+  await migrated.insertRequestLog(log({ id: "log-new", provider: "bot" }));
   const after = await migrated.listRequestLogs({ limit: 5 });
   assert.equal(after.logs.find((row) => row.id === "log-old")?.provider, undefined);
-  assert.equal(after.logs.find((row) => row.id === "log-new")?.provider, "connect");
+  assert.equal(after.logs.find((row) => row.id === "log-new")?.provider, "bot");
 
   const keepPath = join(tempDir(), "state.sqlite");
   const unlimited = new SqliteStateStore(keepPath, { requestLogKeep: 0 });
-  for (let i = 0; i < 120; i += 1) await unlimited.insertRequestLog(log({ id: `keep-${i}`, provider: "connect" }));
+  for (let i = 0; i < 120; i += 1) await unlimited.insertRequestLog(log({ id: `keep-${i}`, provider: "bot" }));
   assert.equal((await unlimited.listRequestLogs({ limit: 1 })).total, 120, "REQUEST_LOG_KEEP=0 must keep every row");
 });

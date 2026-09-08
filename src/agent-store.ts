@@ -4,7 +4,7 @@
  * 生产用进程级有界 SQLite（createSqliteAgentStore）：一个 DatabaseSync 文件，
  * 路径由调用方传入（index.ts 用 dirname(sqlitePath)/agents.sqlite → compose 下 /data/agents.sqlite）。
  * 禁止 SDK 默认的 SqliteLocalAgentStore.open（每 agent 一份 store.db，实测残留 7~8 个句柄且 dispose 不释放），
- * 禁止 JsonlLocalAgentStore（按行追加 + 更新时全文件重写），禁止写进 state.sqlite（Connect 已对该文件另开连接）。
+ * 禁止 JsonlLocalAgentStore（按行追加 + 更新时全文件重写），禁止写进 state.sqlite（Cursor Bot 已对该文件另开连接）。
  *
  * createEphemeralAgentStore 仍导出：tests/server.test.ts 在用，语义保持 upsert + 有界内存。
  *

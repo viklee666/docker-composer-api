@@ -5,7 +5,7 @@ import {
   EXCHANGE_USER_API_KEY_PATH,
   exchangeUrl,
   exchangeUserApiKey
-} from "../src/cursor-connect/api-key-exchange.js";
+} from "../src/cursor-bot/api-key-exchange.js";
 
 const API_KEY = "crsr_supersecret_exchange_key_value";
 const SESSION = jwt({ type: "session", sub: "acct" });

@@ -4,12 +4,12 @@ import path from "node:path";
 import { gzipSync, brotliCompressSync } from "node:zlib";
 import { test } from "node:test";
 import { ApiError } from "../src/errors.js";
-import { cursorChecksum } from "../src/cursor-connect/checksum.js";
+import { cursorChecksum } from "../src/cursor-bot/checksum.js";
 import {
   assertUsableCredential,
   cursorTokenType,
-  type CursorConnectCredential
-} from "../src/cursor-connect/credentials.js";
+  type CursorBotCredential
+} from "../src/cursor-bot/credentials.js";
 import {
   DEFAULT_READ_MAX_BYTES,
   EnvelopeTooLargeError,
@@ -18,16 +18,16 @@ import {
   encodeRequestEnvelope,
   parseCompression,
   readEnvelopes
-} from "../src/cursor-connect/envelope.js";
+} from "../src/cursor-bot/envelope.js";
 import {
   connectCodeToStatus,
   endStreamError,
   httpTransportError,
   inferenceStreamError,
   parseEndStream
-} from "../src/cursor-connect/errors.js";
-import { buildConnectHeaders, redactHeaders } from "../src/cursor-connect/headers.js";
-import * as pb from "../src/cursor-connect/proto/inference_pb.js";
+} from "../src/cursor-bot/errors.js";
+import { buildConnectHeaders, redactHeaders } from "../src/cursor-bot/headers.js";
+import * as pb from "../src/cursor-bot/proto/inference_pb.js";
 
 const DESCRIPTOR_PATH = path.resolve(process.cwd(), "docs/reference/inference-descriptor-8844.txt");
 
@@ -370,7 +370,7 @@ test("checksum omits the slash when there is no mac machine id", () => {
 
 /* --------------------------------------------------------------------- headers */
 
-const CREDENTIAL: CursorConnectCredential = {
+const CREDENTIAL: CursorBotCredential = {
   id: "cred-1",
   sessionToken: "session-token-value",
   machineId: "machine-abc",

@@ -1,18 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 import type { CursorStreamEvent, GatewayToolCall, RequestUsage } from "../types.js";
-import type { CursorConnectClient } from "./client.js";
+import type { CursorBotClient } from "./client.js";
 import { conversationMessages, type PreparedConversation } from "./conversation.js";
 import { draftEventsFromFrame, type DraftEvent } from "./events.js";
 import {
   buildInferenceStreamRequest,
-  type ConnectMessage,
-  type ConnectModelConfig,
-  type ConnectRequestedModel,
-  type ConnectToolResult
+  type BotMessage,
+  type BotModelConfig,
+  type BotRequestedModel,
+  type BotToolResult
 } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
-import type { CursorConnectStore } from "./store.js";
+import type { CursorBotStore } from "./store.js";
 
 /** 一次工具执行的结果。`isError` 会原样进 `InferenceToolResultPart.is_error`。 */
 export interface ToolExecution {
@@ -26,8 +26,8 @@ export type ToolExecutor = (
 ) => Promise<ToolExecution | undefined>;
 
 export interface ToolLoopDeps {
-  client: Pick<CursorConnectClient, "stream">;
-  store?: CursorConnectStore;
+  client: Pick<CursorBotClient, "stream">;
+  store?: CursorBotStore;
   /**
    * 网关侧执行器（本地工具 G6.2 / 子代理 G7）。
    * 返回 `undefined` 表示这个工具网关不负责执行——此时循环停下来把调用交回调用方，
@@ -40,8 +40,8 @@ export interface ToolLoopDeps {
 
 export interface ToolLoopOptions {
   conversation: PreparedConversation;
-  requestedModel: ConnectRequestedModel;
-  modelConfig?: ConnectModelConfig;
+  requestedModel: BotRequestedModel;
+  modelConfig?: BotModelConfig;
   runId: string;
   /** 防跑飞。到达上限就停，并在结果里标明原因，不静默截断。 */
   maxIterations?: number;
@@ -61,7 +61,7 @@ export interface ToolLoopResult {
    * 不交出来的话它们已经在库里记成 submitted，却永远不会进入任何一次请求，
    * 调用方也拿不到——等于凭空蒸发。
    */
-  completedToolResults: ConnectToolResult[];
+  completedToolResults: BotToolResult[];
   usage?: RequestUsage;
   resolvedModel?: string;
   iterations: number;
@@ -95,7 +95,7 @@ export async function* runToolLoop(
   const newInvocationId = options.newInvocationId ?? randomUUID;
 
   // 只改本地副本：调用方传进来的 conversation 不该因为跑了一轮循环就被写脏。
-  const messages: ConnectMessage[] = [...conversationMessages(options.conversation)];
+  const messages: BotMessage[] = [...conversationMessages(options.conversation)];
   const aggregate = { text: "", reasoningText: "" };
   let usage: RequestUsage | undefined;
   let resolvedModel: string | undefined;
@@ -184,8 +184,8 @@ async function executeAll(
   options: ToolLoopOptions,
   calls: GatewayToolCall[],
   iteration: number
-): Promise<{ results: ConnectToolResult[]; handled: Set<string>; unhandled: GatewayToolCall[] }> {
-  const results: ConnectToolResult[] = [];
+): Promise<{ results: BotToolResult[]; handled: Set<string>; unhandled: GatewayToolCall[] }> {
+  const results: BotToolResult[] = [];
   const handled = new Set<string>();
   const unhandled: GatewayToolCall[] = [];
 
@@ -236,7 +236,7 @@ function finish(
   usage: RequestUsage | undefined,
   resolvedModel: string | undefined,
   pendingToolCalls: GatewayToolCall[],
-  completedToolResults: ConnectToolResult[],
+  completedToolResults: BotToolResult[],
   iterations: number,
   stoppedBecause: ToolLoopStop
 ): ToolLoopResult {

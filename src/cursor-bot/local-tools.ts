@@ -84,7 +84,7 @@ export class LocalToolRegistry {
     }
     const unknown = [...this.allowlist].filter((name) => !this.tools.has(name));
     if (unknown.length) {
-      console.warn(`[cursor-connect] local tool allowlist names unknown tools: ${unknown.join(", ")}`);
+      console.warn(`[cursor-bot] local tool allowlist names unknown tools: ${unknown.join(", ")}`);
     }
   }
 

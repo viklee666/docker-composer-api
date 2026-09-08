@@ -83,38 +83,38 @@ export interface GatewayConfig {
   /** 默认系统提示词正文。env: SYSTEM_PROMPT，后台可改。 */
   systemPrompt?: string;
 
-  /* ------------------------------- Cursor Connect 路线（aiserver.v1.InferenceService/Stream） */
+  /* ------------------------------- Cursor Bot 路线（aiserver.v1.InferenceService/Stream） */
 
   /**
-   * 以下 Connect 字段全部**可选**：既有部署与测试里的 config 字面量不必知道这条路线的存在。
-   * 缺省值由 `connectSettings(config)` 统一填，不要在使用处各写各的 `?? default`。
+   * 以下 Bot 字段全部**可选**：既有部署与测试里的 config 字面量不必知道这条路线的存在。
+   * 缺省值由 `botSettings(config)` 统一填，不要在使用处各写各的 `?? default`。
    */
 
   /**
-   * 默认走哪条 provider。默认 `sdk`：Connect 路线的工具循环尚未实测过，
+   * 默认走哪条 provider。默认 `sdk`：Bot 路线的工具循环尚未实测过，
    * 不能默认接管全部流量。env: GATEWAY_PROVIDER，后台可改。
    */
   defaultProvider?: GatewayProvider;
-  /** Connect 出站 base URL。env: CURSOR_CONNECT_BASE_URL。 */
-  connectBaseUrl?: string;
-  /** Connect 请求体编码；json 只作调试。env: CURSOR_CONNECT_CODEC。 */
-  connectCodec?: "proto" | "json";
-  /** 单帧 payload 上限（字节）。env: CURSOR_CONNECT_MAX_FRAME_BYTES。 */
-  connectReadMaxBytes?: number;
-  /** 是否向上游声明工具。默认 false，见计划 §P2 未实测的接续假设。env: CURSOR_CONNECT_SEND_TOOLS。 */
-  connectSendTools?: boolean;
-  /** 允许启用的网关本地工具名（默认全关）。env: CURSOR_CONNECT_LOCAL_TOOLS。 */
-  connectLocalTools?: string[];
-  /** 是否启用网关编排子代理。env: CURSOR_CONNECT_SUBAGENTS。 */
-  connectSubagents?: boolean;
-  /** background worker 是否启动。env: CURSOR_CONNECT_BACKGROUND。 */
-  connectBackground?: boolean;
-  /** 从 env 播种的 Connect session token（首次启动时写入 cc_credentials）。env: CURSOR_CONNECT_TOKEN。 */
-  connectSessionToken?: string;
-  /** 播种凭据的设备标识；不给则自动生成一个并持久化（**生命周期内不可变**）。env: CURSOR_CONNECT_MACHINE_ID。 */
-  connectMachineId?: string;
-  /** 播种凭据的客户端版本号。env: CURSOR_CONNECT_CLIENT_VERSION。 */
-  connectClientVersion?: string;
+  /** Bot 出站 base URL。env: CURSOR_BOT_BASE_URL。 */
+  botBaseUrl?: string;
+  /** Bot 请求体编码；json 只作调试。env: CURSOR_BOT_CODEC。 */
+  botCodec?: "proto" | "json";
+  /** 单帧 payload 上限（字节）。env: CURSOR_BOT_MAX_FRAME_BYTES。 */
+  botReadMaxBytes?: number;
+  /** 是否向上游声明工具。默认 false，见计划 §P2 未实测的接续假设。env: CURSOR_BOT_SEND_TOOLS。 */
+  botSendTools?: boolean;
+  /** 允许启用的网关本地工具名（默认全关）。env: CURSOR_BOT_LOCAL_TOOLS。 */
+  botLocalTools?: string[];
+  /** 是否启用网关编排子代理。env: CURSOR_BOT_SUBAGENTS。 */
+  botSubagents?: boolean;
+  /** background worker 是否启动。env: CURSOR_BOT_BACKGROUND。 */
+  botBackground?: boolean;
+  /** 从 env 播种的 Bot session token（首次启动时写入 bot_credentials）。env: CURSOR_BOT_TOKEN。 */
+  botSessionToken?: string;
+  /** 播种凭据的设备标识；不给则自动生成一个并持久化（**生命周期内不可变**）。env: CURSOR_BOT_MACHINE_ID。 */
+  botMachineId?: string;
+  /** 播种凭据的客户端版本号。env: CURSOR_BOT_CLIENT_VERSION。 */
+  botClientVersion?: string;
 }
 
 /** Cursor SDK 会话生命周期：durable 复用 agent；stateless 为今日每请求新建。 */
@@ -406,14 +406,14 @@ export interface CursorRunRequest {
    * 交给 ProviderRoutingRunner 分发。缺省即 SDK 路线，行为与改造前一致。
    */
   provider?: GatewayProvider;
-  /** 入站原始请求体，仅 Connect 路线用来做结构化解析（SDK 路线拿不到也用不上）。 */
+  /** 入站原始请求体，仅 Bot 路线用来做结构化解析（SDK 路线拿不到也用不上）。 */
   rawBody?: unknown;
-  /** 入站协议，供 Connect 路线选择结构化解析器。 */
+  /** 入站协议，供 Bot 路线选择结构化解析器。 */
   inboundProtocol?: "openai-chat" | "openai-responses" | "anthropic";
 }
 
-/** 两条推理路线：SDK（@cursor/sdk）与 Connect（aiserver.v1.InferenceService/Stream）。 */
-export type GatewayProvider = "sdk" | "connect";
+/** 两条推理路线：SDK（@cursor/sdk）与 Bot（aiserver.v1.InferenceService/Stream，上游客户端是 Grok Bot）。 */
+export type GatewayProvider = "sdk" | "bot";
 
 export interface CursorRunResult {
   text: string;
@@ -568,7 +568,7 @@ export interface RequestLogRecord {
   effectiveParams?: EffectiveParamField[];
   /** 实际使用的通道（sdk / sand）。 */
   clientType?: CursorClientType;
-  /** 本次请求走哪条推理路线（sdk / connect）。M3/M2 落库。 */
+  /** 本次请求走哪条推理路线（sdk / bot）。M3/M2 落库。 */
   provider?: GatewayProvider;
   agentMode?: AgentMode;
   /** 实际下发给 Cursor 的 model.params，JSON 序列化后存库。 */

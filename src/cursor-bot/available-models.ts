@@ -1,7 +1,7 @@
 import { ApiError } from "../errors.js";
 import type { ModelParameterDefinition, ModelVariantDefinition } from "../types.js";
 import { buildConnectHeaders, type ConnectCodec } from "./headers.js";
-import { assertUsableCredential, type CursorConnectCredential } from "./credentials.js";
+import { assertUsableCredential, type CursorBotCredential } from "./credentials.js";
 import { postConnectUnary, type ConnectFetch } from "./transport.js";
 import {
   AvailableModelsRequest,
@@ -11,7 +11,7 @@ import {
   type AvailableModelsResponse_AvailableModel,
   type ModelParameterDefinition as ProtoModelParameterDefinition
 } from "./proto/available_models_pb.js";
-import { DEFAULT_CONNECT_BASE_URL, methodUrl } from "./client.js";
+import { DEFAULT_BOT_BASE_URL, methodUrl } from "./client.js";
 
 /**
  * `aiserver.v1.AiService/AvailableModels`（Unary）。
@@ -19,14 +19,14 @@ import { DEFAULT_CONNECT_BASE_URL, methodUrl } from "./client.js";
  * 字段来自 `docs/reference/available-models-descriptor.txt`，由
  * `scripts/extract-descriptor.mjs` 从本机 Cursor 3.18.9 的 bundle 机械抽取，没有一处是猜的。
  *
- * Connect 的 Unary 与 ServerStreaming 走同一套 envelope，所以这里复用同一个 transport：
+ * Connect 的 Unary 与 ServerStreaming 走同一套 envelope（协议事实），所以这里复用同一个 transport：
  * 一发一收，响应里恰好一条消息帧加一条 endStream。
  */
 export const AI_SERVICE = "aiserver.v1.AiService";
 export const AVAILABLE_MODELS_METHOD = "AvailableModels";
 
 export interface AvailableModelsOptions {
-  credential: CursorConnectCredential;
+  credential: CursorBotCredential;
   baseUrl?: string;
   codec?: ConnectCodec;
   readMaxBytes?: number;
@@ -36,7 +36,7 @@ export interface AvailableModelsOptions {
 }
 
 /** 目录里一个模型的网关视角摘要。只留网关真正会用到的字段。 */
-export interface ConnectModelEntry {
+export interface BotModelEntry {
   id: string;
   displayName?: string;
   defaultOn: boolean;
@@ -55,8 +55,8 @@ export interface ConnectModelEntry {
   aliases: string[];
 }
 
-export interface ConnectCatalog {
-  models: ConnectModelEntry[];
+export interface BotCatalog {
+  models: BotModelEntry[];
   /** 子代理的服务端默认模型配置（`subagent_model_configs`，字段 16）。 */
   subagentModels: Record<string, string>;
   /** 对话默认模型（`composer_model_config`）。 */
@@ -64,7 +64,7 @@ export interface ConnectCatalog {
   fetchedAt: number;
 }
 
-export async function fetchAvailableModels(options: AvailableModelsOptions): Promise<ConnectCatalog> {
+export async function fetchAvailableModels(options: AvailableModelsOptions): Promise<BotCatalog> {
   assertUsableCredential(options.credential);
   const codec = options.codec ?? "proto";
 
@@ -77,7 +77,7 @@ export async function fetchAvailableModels(options: AvailableModelsOptions): Pro
   // `application/proto` 而不是 `application/connect+proto`。发成流式那套会拿到 415。
   const payload = codec === "json" ? new TextEncoder().encode(request.toJsonString()) : request.toBinary();
   const raw = await postConnectUnary({
-    url: methodUrl(options.baseUrl?.trim() || DEFAULT_CONNECT_BASE_URL, AI_SERVICE, AVAILABLE_MODELS_METHOD),
+    url: methodUrl(options.baseUrl?.trim() || DEFAULT_BOT_BASE_URL, AI_SERVICE, AVAILABLE_MODELS_METHOD),
     headers: buildConnectHeaders({
       credential: options.credential,
       codec,
@@ -97,7 +97,7 @@ export async function fetchAvailableModels(options: AvailableModelsOptions): Pro
   return toCatalog(response);
 }
 
-function toCatalog(response: AvailableModelsResponse): ConnectCatalog {
+function toCatalog(response: AvailableModelsResponse): BotCatalog {
   const subagentModels: Record<string, string> = {};
   for (const [feature, config] of Object.entries(response.subagentModelConfigs)) {
     if (config.defaultModel) subagentModels[feature] = config.defaultModel;
@@ -110,7 +110,7 @@ function toCatalog(response: AvailableModelsResponse): ConnectCatalog {
   };
 }
 
-function toEntry(model: AvailableModelsResponse_AvailableModel): ConnectModelEntry {
+function toEntry(model: AvailableModelsResponse_AvailableModel): BotModelEntry {
   return {
     id: model.name,
     ...(model.clientDisplayName ? { displayName: model.clientDisplayName } : {}),
@@ -137,7 +137,7 @@ function toEntry(model: AvailableModelsResponse_AvailableModel): ConnectModelEnt
   };
 }
 
-function degradationOf(status: AvailableModelsResponse_DegradationStatus | undefined): ConnectModelEntry["degradation"] {
+function degradationOf(status: AvailableModelsResponse_DegradationStatus | undefined): BotModelEntry["degradation"] {
   if (status === AvailableModelsResponse_DegradationStatus.DEGRADED) return "degraded";
   if (status === AvailableModelsResponse_DegradationStatus.DISABLED) return "disabled";
   return "ok";

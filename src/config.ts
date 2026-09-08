@@ -1,5 +1,5 @@
-import { DEFAULT_CONNECT_BASE_URL } from "./cursor-connect/client.js";
-import { DEFAULT_READ_MAX_BYTES } from "./cursor-connect/envelope.js";
+import { DEFAULT_BOT_BASE_URL } from "./cursor-bot/client.js";
+import { DEFAULT_READ_MAX_BYTES } from "./cursor-bot/envelope.js";
 import { DEFAULT_AUTO_DISABLE_THRESHOLD } from "./key-pool.js";
 import { parseModelParamPolicyEnv } from "./model-param-policy.js";
 import { parseModelParamsSpec } from "./model-params.js";
@@ -63,27 +63,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     systemPromptMode: parseSystemPromptMode(env.SYSTEM_PROMPT_MODE),
     systemPrompt: optionalString(env.SYSTEM_PROMPT),
 
-    // Connect 路线。默认全关 / 全保守：这条路线还没跑过真实流量，
+    // Cursor Bot 路线。默认全关 / 全保守：这条路线还没跑过真实流量，
     // 默认接管流量或默认开工具都会让一次配置失误直接打到生产请求上。
     defaultProvider: parseProvider(env.GATEWAY_PROVIDER),
-    connectBaseUrl: stringValue(env.CURSOR_CONNECT_BASE_URL, DEFAULT_CONNECT_BASE_URL),
-    connectCodec: env.CURSOR_CONNECT_CODEC?.trim().toLowerCase() === "json" ? "json" : "proto",
-    connectReadMaxBytes: integerValue(env.CURSOR_CONNECT_MAX_FRAME_BYTES, DEFAULT_READ_MAX_BYTES),
-    connectSendTools: booleanValue(env.CURSOR_CONNECT_SEND_TOOLS, false),
-    connectLocalTools: parseList(env.CURSOR_CONNECT_LOCAL_TOOLS),
-    connectSubagents: booleanValue(env.CURSOR_CONNECT_SUBAGENTS, false),
-    connectBackground: booleanValue(env.CURSOR_CONNECT_BACKGROUND, false),
-    connectSessionToken: optionalString(env.CURSOR_CONNECT_TOKEN),
-    connectMachineId: optionalString(env.CURSOR_CONNECT_MACHINE_ID),
-    connectClientVersion: stringValue(env.CURSOR_CONNECT_CLIENT_VERSION, DEFAULT_CONNECT_CLIENT_VERSION)
+    botBaseUrl: stringValue(env.CURSOR_BOT_BASE_URL, DEFAULT_BOT_BASE_URL),
+    botCodec: env.CURSOR_BOT_CODEC?.trim().toLowerCase() === "json" ? "json" : "proto",
+    botReadMaxBytes: integerValue(env.CURSOR_BOT_MAX_FRAME_BYTES, DEFAULT_READ_MAX_BYTES),
+    botSendTools: booleanValue(env.CURSOR_BOT_SEND_TOOLS, false),
+    botLocalTools: parseList(env.CURSOR_BOT_LOCAL_TOOLS),
+    botSubagents: booleanValue(env.CURSOR_BOT_SUBAGENTS, false),
+    botBackground: booleanValue(env.CURSOR_BOT_BACKGROUND, false),
+    botSessionToken: optionalString(env.CURSOR_BOT_TOKEN),
+    botMachineId: optionalString(env.CURSOR_BOT_MACHINE_ID),
+    botClientVersion: stringValue(env.CURSOR_BOT_CLIENT_VERSION, DEFAULT_BOT_CLIENT_VERSION)
   };
 }
 
 /** 播种凭据的默认客户端版本。与本地 Cursor 一致，便于上游按版本识别。 */
-export const DEFAULT_CONNECT_CLIENT_VERSION = "3.18.9";
+export const DEFAULT_BOT_CLIENT_VERSION = "3.18.9";
 
 function parseProvider(value: string | undefined): GatewayProvider {
-  return value?.trim().toLowerCase() === "connect" ? "connect" : "sdk";
+  // "connect" / "cursor-connect" 是改名前的旧值（env 里可能残留），仅读侧承认，对外一律产出 "bot"。
+  const trimmed = value?.trim().toLowerCase();
+  return trimmed === "bot" || trimmed === "cursor-bot" || trimmed === "connect" || trimmed === "cursor-connect" ? "bot" : "sdk";
 }
 
 function parseList(value: string | undefined): string[] {

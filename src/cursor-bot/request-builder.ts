@@ -19,9 +19,9 @@ import {
   InferenceToolResultPart
 } from "./proto/inference_pb.js";
 
-export type ConnectRole = "system" | "user" | "assistant" | "tool";
+export type BotRole = "system" | "user" | "assistant" | "tool";
 
-const ROLE_ENUM: Record<ConnectRole, InferenceMessageRole> = {
+const ROLE_ENUM: Record<BotRole, InferenceMessageRole> = {
   system: InferenceMessageRole.SYSTEM,
   user: InferenceMessageRole.USER,
   assistant: InferenceMessageRole.ASSISTANT,
@@ -29,7 +29,7 @@ const ROLE_ENUM: Record<ConnectRole, InferenceMessageRole> = {
 };
 
 /** 上一轮的思考片段。`signature` 存在时必须原样带回，否则 extended thinking 的连续性会断。 */
-export interface ConnectReasoningPart {
+export interface BotReasoningPart {
   text: string;
   signature?: string;
   isRedacted?: boolean;
@@ -37,25 +37,25 @@ export interface ConnectReasoningPart {
   modelName?: string;
 }
 
-export interface ConnectToolResult {
+export interface BotToolResult {
   toolCallId: string;
   toolName: string;
   result: unknown;
   isError?: boolean;
 }
 
-export interface ConnectMessage {
-  role: ConnectRole;
+export interface BotMessage {
+  role: BotRole;
   text?: string;
   images?: GatewayImage[];
   /** assistant 轮次里模型发起的工具调用；与 content 不是 oneof，可以和文本共存。 */
   toolCalls?: GatewayToolCall[];
-  reasoning?: ConnectReasoningPart[];
+  reasoning?: BotReasoningPart[];
   /** 仅 role=tool 有意义。 */
-  toolResults?: ConnectToolResult[];
+  toolResults?: BotToolResult[];
 }
 
-export interface ConnectRequestedModel {
+export interface BotRequestedModel {
   modelId: string;
   maxMode?: boolean;
   parameters?: ModelParameterValue[];
@@ -68,26 +68,26 @@ export interface ConnectRequestedModel {
   isVariantStringRepresentation?: boolean;
 }
 
-export interface ConnectModelConfig {
+export interface BotModelConfig {
   maxTokens?: number;
   temperature?: number;
   topP?: number;
   stopSequences?: string[];
 }
 
-export interface ConnectConversation {
-  messages: ConnectMessage[];
+export interface BotConversation {
+  messages: BotMessage[];
   tools?: GatewayTool[];
   /** 同一段对话内保持稳定。 */
   conversationId: string;
   conversationGroupId?: string;
   /** 每次请求新生成。 */
   invocationId: string;
-  requestedModel: ConnectRequestedModel;
-  modelConfig?: ConnectModelConfig;
+  requestedModel: BotRequestedModel;
+  modelConfig?: BotModelConfig;
 }
 
-export function buildInferenceStreamRequest(conversation: ConnectConversation): InferenceStreamRequest {
+export function buildInferenceStreamRequest(conversation: BotConversation): InferenceStreamRequest {
   const requestedModel = buildRequestedModel(conversation.requestedModel);
   const request = new InferenceStreamRequest({
     messages: conversation.messages.map(buildCoreMessage),
@@ -104,7 +104,7 @@ export function buildInferenceStreamRequest(conversation: ConnectConversation): 
   return request;
 }
 
-export function buildRequestedModel(model: ConnectRequestedModel): InferenceRequestedModel {
+export function buildRequestedModel(model: BotRequestedModel): InferenceRequestedModel {
   return new InferenceRequestedModel({
     modelId: model.modelId,
     maxMode: model.maxMode ?? false,
@@ -116,7 +116,7 @@ export function buildRequestedModel(model: ConnectRequestedModel): InferenceRequ
   });
 }
 
-function buildModelConfig(config: ConnectModelConfig | undefined): InferenceModelConfig | undefined {
+function buildModelConfig(config: BotModelConfig | undefined): InferenceModelConfig | undefined {
   if (!config) return undefined;
   const message = new InferenceModelConfig();
   let set = false;
@@ -139,7 +139,7 @@ function buildModelConfig(config: ConnectModelConfig | undefined): InferenceMode
   return set ? message : undefined;
 }
 
-function buildCoreMessage(message: ConnectMessage): InferenceCoreMessage {
+function buildCoreMessage(message: BotMessage): InferenceCoreMessage {
   const core = new InferenceCoreMessage({ role: ROLE_ENUM[message.role] });
 
   // content 是 oneof：text / parts / tool_content 三者只能设一个。
@@ -175,7 +175,7 @@ function buildCoreMessage(message: ConnectMessage): InferenceCoreMessage {
   return core;
 }
 
-function buildContentParts(message: ConnectMessage): InferenceContentParts {
+function buildContentParts(message: BotMessage): InferenceContentParts {
   const parts: InferenceContentPart[] = [];
   if (message.text) {
     parts.push(new InferenceContentPart({ part: { case: "text", value: new InferenceTextPart({ text: message.text }) } }));
@@ -186,7 +186,7 @@ function buildContentParts(message: ConnectMessage): InferenceContentParts {
     // 模型收到的会是一串没意义的文本。宁可明确拒绝，也不静默送错或静默丢弃。
     if (image.source === "url") {
       throw new ApiError(
-        "Cursor Connect provider cannot send URL images yet; inline the image as base64.",
+        "Cursor Bot provider cannot send URL images yet; inline the image as base64.",
         400,
         "unsupported_image_source"
       );
@@ -198,7 +198,7 @@ function buildContentParts(message: ConnectMessage): InferenceContentParts {
   return new InferenceContentParts({ parts });
 }
 
-function buildToolResultContent(message: ConnectMessage): InferenceToolResultContent {
+function buildToolResultContent(message: BotMessage): InferenceToolResultContent {
   const parts = (message.toolResults ?? []).map(
     (result) =>
       new InferenceToolResultPart({

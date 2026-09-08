@@ -2,14 +2,14 @@ import { Readable } from "node:stream";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { registerAdminRoutes } from "./admin.js";
 import { authenticate, explicitSessionId, extractToken, sessionAffinity } from "./auth.js";
-import { registerConnectRoutes } from "./cursor-connect/routes.js";
+import { registerBotRoutes } from "./cursor-bot/routes.js";
 import {
-  CONNECT_MODEL_PREFIX,
-  connectModelScope,
-  isConnectModelId,
+  BOT_MODEL_PREFIX,
+  botModelScope,
+  isBotModelId,
   selectProvider
-} from "./cursor-connect/router.js";
-import type { CursorConnectService } from "./cursor-connect/service.js";
+} from "./cursor-bot/router.js";
+import type { CursorBotService } from "./cursor-bot/service.js";
 import { shouldUseDurableHub } from "./config.js";
 import { durableIdentity, explicitSessionIdFromHeaders } from "./durable-id.js";
 import {
@@ -114,10 +114,10 @@ export interface AppDeps {
   /** 模型列表来源，默认走 Cursor SDK（测试时可注入桩）。 */
   modelLister?: ModelLister;
   /**
-   * Cursor Connect 路线。没配凭据时不提供，此时选路一律回落 SDK，
-   * `/v1/cursor-connect/*` 与后台的 Connect 面板会明确报「未配置」而不是静默 404。
+   * Cursor Bot 路线（上游客户端是 Grok Bot）。没配凭据时不提供，此时选路一律回落 SDK，
+   * `/v1/cursor-bot/*` 与后台的 Bot 面板会明确报「未配置」而不是静默 404。
    */
-  connect?: CursorConnectService;
+  bot?: CursorBotService;
   /** SDK 网络配置应用器，测试时可注入桩以避免加载真实 SDK。 */
   applyCursorSdkNetworkConfig?: (useHttp1ForAgent: boolean) => Promise<void>;
   /**
@@ -228,9 +228,9 @@ export function createApp(deps: AppDeps): FastifyInstance {
     return openAiModelList(models);
   });
 
-  // `connect/grok-4.6` 这种 id 含斜杠，普通 `:id` 匹配不到。单独挂一条，否则目录里看得见、点进去 404。
-  app.get("/v1/models/connect/:id", async (request) => {
-    const id = `${CONNECT_MODEL_PREFIX}${routeParam(request.params, "id")}`;
+  // `bot/grok-4.6` 这种 id 含斜杠，普通 `:id` 匹配不到。单独挂一条，否则目录里看得见、点进去 404。
+  app.get("/v1/models/bot/:id", async (request) => {
+    const id = `${BOT_MODEL_PREFIX}${routeParam(request.params, "id")}`;
     const { models } = await listModels(deps, request);
     const found = models.find((model) => model.id === id || model.aliases.includes(id));
     if (!found) throw new ApiError(`Model '${id}' not found.`, 404, "not_found", "model");
@@ -413,13 +413,13 @@ export function createApp(deps: AppDeps): FastifyInstance {
   });
 
   registerAdminRoutes(app, deps);
-  registerConnectRoutes(app, {
-    ...(deps.connect ? { connect: deps.connect, store: deps.connect.store } : {}),
-    // 与主 API 共用同一套入站鉴权，不给 Connect 端点开后门。
+  registerBotRoutes(app, {
+    ...(deps.bot ? { bot: deps.bot, store: deps.bot.store } : {}),
+    // 与主 API 共用同一套入站鉴权，不给 Bot 端点开后门。
     authorize: (request) => {
       authFor(deps, request);
     },
-    ...(deps.connect ? { subscribe: (runId, listener) => deps.connect!.subscribe(runId, listener) } : {})
+    ...(deps.bot ? { subscribe: (runId, listener) => deps.bot!.subscribe(runId, listener) } : {})
   });
 
   return app;
@@ -462,62 +462,62 @@ async function listModels(deps: AppDeps, request: Parameters<typeof authenticate
     }
   }
   const listed = await lister(source.apiKey);
-  return withConnectModels(deps, await filterListedModels(deps, listed, auth), auth);
+  return withBotModels(deps, await filterListedModels(deps, listed, auth), auth);
 }
 
 /**
- * Connect 可用时，把 `connect/{id}` 并进 /v1/models，让客户端能从目录里选路。
+ * Bot 可用时，把 `bot/{id}` 并进 /v1/models，让客户端能从目录里选路。
  *
- * 来源两层：Connect 自己的 AvailableModels，再补上 SDK 目录的同名镜像。
- * 目录拉失败时至少还能靠镜像露出前缀；SDK 白名单不参与过滤（见 `connectModelScope`）。
+ * 来源两层：Bot 自己的 AvailableModels，再补上 SDK 目录的同名镜像。
+ * 目录拉失败时至少还能靠镜像露出前缀；SDK 白名单不参与过滤（见 `botModelScope`）。
  */
-async function withConnectModels(
+async function withBotModels(
   deps: AppDeps,
   listed: ModelListResult,
   auth?: AuthContext
 ): Promise<ModelListResult> {
-  if (!deps.connect?.available) return listed;
+  if (!deps.bot?.available) return listed;
   const byId = new Map<string, ModelEntry>();
   for (const model of listed.models) {
-    const clone = sdkModelAsConnect(model);
+    const clone = sdkModelAsBot(model);
     if (clone) byId.set(clone.id.toLowerCase(), clone);
   }
   try {
-    for (const model of await deps.connect.listModels()) {
-      const entry = connectCatalogEntry(model);
+    for (const model of await deps.bot.listModels()) {
+      const entry = botCatalogEntry(model);
       if (entry) byId.set(entry.id.toLowerCase(), entry);
     }
   } catch (error) {
     console.warn(
-      `[cursor-connect] /v1/models catalog unavailable: ${error instanceof Error ? error.message : String(error)}`
+      `[cursor-bot] /v1/models catalog unavailable: ${error instanceof Error ? error.message : String(error)}`
     );
   }
-  const visible = filterModelsByScope([...byId.values()], connectModelScope(auth?.modelScope));
+  const visible = filterModelsByScope([...byId.values()], botModelScope(auth?.modelScope));
   if (!visible.length) return listed;
   return { models: [...listed.models, ...visible], source: listed.source };
 }
 
-function connectCatalogEntry(model: { id?: string; displayName?: string; parameters?: ModelEntry["parameters"]; variants?: ModelEntry["variants"] }): ModelEntry | undefined {
+function botCatalogEntry(model: { id?: string; displayName?: string; parameters?: ModelEntry["parameters"]; variants?: ModelEntry["variants"] }): ModelEntry | undefined {
   const id = model.id?.trim();
-  if (!id || isConnectModelId(id)) return undefined;
+  if (!id || isBotModelId(id)) return undefined;
   return {
-    id: `${CONNECT_MODEL_PREFIX}${id}`,
-    name: model.displayName ? `${model.displayName} (Connect)` : `${id} (Connect)`,
+    id: `${BOT_MODEL_PREFIX}${id}`,
+    name: model.displayName ? `${model.displayName} (Bot)` : `${id} (Bot)`,
     aliases: [],
-    provider: "connect",
+    provider: "bot",
     ...(model.parameters?.length ? { parameters: model.parameters } : {}),
     ...(model.variants?.length ? { variants: model.variants } : {})
   };
 }
 
-function sdkModelAsConnect(model: ModelEntry): ModelEntry | undefined {
+function sdkModelAsBot(model: ModelEntry): ModelEntry | undefined {
   const id = model.id?.trim();
-  if (!id || isConnectModelId(id) || model.provider === "connect") return undefined;
+  if (!id || isBotModelId(id) || model.provider === "bot") return undefined;
   return {
-    id: `${CONNECT_MODEL_PREFIX}${id}`,
-    name: `${model.name || id} (Connect)`,
+    id: `${BOT_MODEL_PREFIX}${id}`,
+    name: `${model.name || id} (Bot)`,
     aliases: [],
-    provider: "connect",
+    provider: "bot",
     ...(model.parameters?.length ? { parameters: model.parameters } : {}),
     ...(model.variants?.length ? { variants: model.variants } : {})
   };
@@ -577,11 +577,11 @@ async function scopedModelIdentity(deps: AppDeps, auth: AuthContext, model: stri
  */
 function enforceGatewayModelScope(identity: ModelIdentity, scope: ModelScope | undefined, model: string): void {
   if (!scope) return;
-  const connect = isConnectModelId(model);
-  // Connect 模型名是另一套命名空间：SDK 白名单不能把 connect/grok-4.6 挡成 403。
-  const effective = connect ? connectModelScope(scope) : scope;
+  const bot = isBotModelId(model);
+  // Bot 模型名是另一套命名空间：SDK 白名单不能把 bot/grok-4.6 挡成 403。
+  const effective = bot ? botModelScope(scope) : scope;
   if (!effective) return;
-  const checked = connect ? modelIdentity(model) : identity;
+  const checked = bot ? modelIdentity(model) : identity;
   // 先判真命中：能明确说出「这个模型被排除了」时就不该退而报「查不到」，后者会把运维引去查上游。
   if (!identityAllowed(checked, effective)) {
     throw new ApiError(
@@ -608,8 +608,8 @@ function enforceGatewayModelScope(identity: ModelIdentity, scope: ModelScope | u
  * 三个推理入口在 runner 里还会再查一遍，count_tokens 不进 runner，只有这一处能拦。
  */
 function enforceRegisteredKeyScope(identity: ModelIdentity, scope: ModelScope | undefined, model: string): void {
-  // Connect 不走 Cursor Key 池，key 上的 SDK 范围管不到这条路。
-  if (!scope || isConnectModelId(model)) return;
+  // Bot 不走 Cursor Key 池，key 上的 SDK 范围管不到这条路。
+  if (!scope || isBotModelId(model)) return;
   if (!identityAllowed(identity, scope)) {
     throw new ApiError(
       `This Cursor API key is not allowed to use model "${model}": the model is outside the scope registered for this key in the admin panel. Widen that scope or request another model.`,
@@ -932,7 +932,7 @@ function loggedRunRequest(
     headers: input.request.headers as Record<string, string | string[] | undefined>,
     model: input.prepared.model,
     defaultProvider: deps.config.defaultProvider,
-    connectAvailable: deps.connect?.available === true
+    botAvailable: deps.bot?.available === true
   });
   const run: CursorRunRequest = {
     ...toRunRequest({
@@ -955,10 +955,10 @@ function loggedRunRequest(
     ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
     ownerHash: input.auth.ownerHash,
     provider: selection.provider,
-    // `connect/xxx` 只是选路命名空间，不是模型名的一部分。
+    // `bot/xxx` 只是选路命名空间，不是模型名的一部分。
     ...(selection.model && selection.model !== input.prepared.model ? { model: selection.model } : {}),
-    // Connect 路线要用结构化 system；SDK 路线拿不到也用不上这两个字段。
-    ...(selection.provider === "connect"
+    // Bot 路线要用结构化 system；SDK 路线拿不到也用不上这两个字段。
+    ...(selection.provider === "bot"
       ? { rawBody: input.request.body, inboundProtocol: inboundProtocolOf(input.protocol) }
       : {})
   };
@@ -970,7 +970,7 @@ function loggedRunRequest(
   return run;
 }
 
-/** `ProtocolKind` → Connect 侧结构化解析器要的入站协议名。 */
+/** `ProtocolKind` → Bot 侧结构化解析器要的入站协议名。 */
 function inboundProtocolOf(protocol: CursorRunRequest["protocol"]): "openai-chat" | "openai-responses" | "anthropic" {
   if (protocol === "anthropic-messages") return "anthropic";
   return protocol === "openai-responses" ? "openai-responses" : "openai-chat";

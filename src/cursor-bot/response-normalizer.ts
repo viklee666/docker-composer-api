@@ -4,7 +4,7 @@ import { ApiError } from "../errors.js";
 import type { InferenceStreamResponse } from "./proto/inference_pb.js";
 
 /** 一次 run 从帧流里攒出来的全部状态。 */
-export interface ConnectRunState {
+export interface BotRunState {
   text: string;
   reasoningText: string;
   toolCalls: GatewayToolCall[];
@@ -37,7 +37,7 @@ interface PendingToolCall {
  * 这样 server.ts / SSE 输出层一行都不用改。
  */
 export class ResponseNormalizer {
-  readonly state: ConnectRunState = {
+  readonly state: BotRunState = {
     text: "",
     reasoningText: "",
     toolCalls: [],

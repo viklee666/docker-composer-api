@@ -1,6 +1,6 @@
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "../model-params.js";
 import type { ModelParameterValue } from "../types.js";
-import type { ConnectRequestedModel } from "./request-builder.js";
+import type { BotRequestedModel } from "./request-builder.js";
 
 /**
  * 目录查询口。
@@ -141,7 +141,7 @@ export interface ResolveRequestedModelInput {
 }
 
 export interface ResolvedRequestedModel {
-  requestedModel: ConnectRequestedModel;
+  requestedModel: BotRequestedModel;
   parameters: ModelParameterValue[];
   /** 语义意图没落到任何参数上的部分，供日志。 */
   dropped: string[];

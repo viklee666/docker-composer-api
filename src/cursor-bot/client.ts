@@ -2,11 +2,11 @@ import { ApiError } from "../errors.js";
 import { encodeRequestEnvelope, type ConnectCompression } from "./envelope.js";
 import { endStreamError, envelopeError, parseEndStream } from "./errors.js";
 import { buildConnectHeaders, type ConnectCodec } from "./headers.js";
-import { assertUsableCredential, type CursorConnectCredential } from "./credentials.js";
+import { assertUsableCredential, type CursorBotCredential } from "./credentials.js";
 import { postConnectStream, type ConnectFetch } from "./transport.js";
 import { InferenceStreamRequest, InferenceStreamResponse } from "./proto/inference_pb.js";
 
-export const DEFAULT_CONNECT_BASE_URL = "https://api2.cursor.sh";
+export const DEFAULT_BOT_BASE_URL = "https://api2.cursor.sh";
 
 /** 与客户端的 `acceptCompression: [gzip, br]` 对齐；envelope 层两种都能解。 */
 export const DEFAULT_ACCEPT_ENCODING = "gzip, br";
@@ -20,8 +20,8 @@ export const DEFAULT_ACCEPT_ENCODING = "gzip, br";
 export const INFERENCE_SERVICE = "aiserver.v1.InferenceService";
 export const STREAM_METHOD = "Stream";
 
-export interface CursorConnectClientOptions {
-  credential: CursorConnectCredential;
+export interface CursorBotClientOptions {
+  credential: CursorBotCredential;
   /** 必须可配置：客户端自己也是从配置读 baseUrl 的，不能写死。 */
   baseUrl?: string;
   /** 默认 proto（客户端 `useBinaryFormat:!0`）。json 只作调试用。 */
@@ -40,13 +40,13 @@ export function methodUrl(baseUrl: string, service: string, method: string): str
   return `${baseUrl.replace(/\/+$/, "")}/${service}/${method}`;
 }
 
-export class CursorConnectClient {
+export class CursorBotClient {
   private readonly baseUrl: string;
   private readonly codec: ConnectCodec;
 
-  constructor(private readonly options: CursorConnectClientOptions) {
+  constructor(private readonly options: CursorBotClientOptions) {
     assertUsableCredential(options.credential);
-    this.baseUrl = options.baseUrl?.trim() || DEFAULT_CONNECT_BASE_URL;
+    this.baseUrl = options.baseUrl?.trim() || DEFAULT_BOT_BASE_URL;
     this.codec = options.codec ?? "proto";
   }
 
@@ -99,7 +99,7 @@ export class CursorConnectClient {
       throw envelopeError(error) ?? error;
     }
     if (!sawEndStream) {
-      throw new ApiError("Cursor Connect stream ended without an end-of-stream frame.", 502, "upstream_error");
+      throw new ApiError("Cursor Bot stream ended without an end-of-stream frame.", 502, "upstream_error");
     }
   }
 

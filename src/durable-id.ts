@@ -25,7 +25,7 @@ export function durableSessionId(input: DurableSessionIdInput): string | undefin
   });
 }
 
-/** 由稳定字符串派生 RFC 4122 version-4 UUID 形状（算法同 cursor-connect/provider.ts:205-211）。 */
+/** 由稳定字符串派生 RFC 4122 version-4 UUID 形状（算法同 cursor-bot/provider.ts:205-211）。 */
 export function stableUuid(input: string): string {
   const bytes = Buffer.from(createHash("sha256").update(input).digest().subarray(0, 16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;

@@ -3,8 +3,8 @@ import { ApiError } from "../errors.js";
 import { modelAllowed } from "../routing.js";
 import type { GatewayTool, GatewayToolCall, ModelParameterValue, ModelScope, RequestUsage } from "../types.js";
 import type { PreparedConversation } from "./conversation.js";
-import type { ConnectRequestedModel } from "./request-builder.js";
-import type { CursorConnectStore } from "./store.js";
+import type { BotRequestedModel } from "./request-builder.js";
+import type { CursorBotStore } from "./store.js";
 import type { ToolExecution } from "./tool-loop.js";
 
 /**
@@ -69,7 +69,7 @@ export interface SubagentRunContext {
   parentRunId: string;
   parentToolCallId: string;
   depth: number;
-  requestedModel: ConnectRequestedModel;
+  requestedModel: BotRequestedModel;
   prompt: string;
   /**
    * child 可用的工具。**默认空数组**——child 不继承 parent 的本地工具。
@@ -88,7 +88,7 @@ export type SubagentRunner = (
 ) => Promise<{ text: string; isError?: boolean; usage?: RequestUsage }>;
 
 export interface SubagentSchedulerOptions {
-  store: CursorConnectStore;
+  store: CursorBotStore;
   runChild: SubagentRunner;
   limits?: Partial<SubagentLimits>;
   /** 子代理默认模型；不传就继承父模型。 */
@@ -165,7 +165,7 @@ export class SubagentScheduler {
    * 作为 tool-loop 的执行器接入。不是 `spawn_subagent` 的调用一律返回 `undefined`，
    * 交回调用方——scheduler 不该把别人的工具也吞掉。
    */
-  executor(parent: { runId: string; conversation: PreparedConversation; depth: number; model: ConnectRequestedModel }) {
+  executor(parent: { runId: string; conversation: PreparedConversation; depth: number; model: BotRequestedModel }) {
     return async (call: GatewayToolCall): Promise<ToolExecution | undefined> => {
       if (call.name !== SUBAGENT_TOOL_NAME) return undefined;
       try {
@@ -179,7 +179,7 @@ export class SubagentScheduler {
   }
 
   private async spawn(
-    parent: { runId: string; conversation: PreparedConversation; depth: number; model: ConnectRequestedModel },
+    parent: { runId: string; conversation: PreparedConversation; depth: number; model: BotRequestedModel },
     call: GatewayToolCall
   ): Promise<string> {
     const request = parseRequest(call.arguments);

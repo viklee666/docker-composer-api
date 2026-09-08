@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
-import type { CursorConnectClient } from "./client.js";
+import type { CursorBotClient } from "./client.js";
 import { conversationMessages, type PreparedConversation } from "./conversation.js";
 import {
   buildInferenceStreamRequest,
-  type ConnectMessage,
-  type ConnectRequestedModel
+  type BotMessage,
+  type BotRequestedModel
 } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
-import type { CcSummary, CursorConnectStore } from "./store.js";
+import type { BotSummary, CursorBotStore } from "./store.js";
 
 /**
  * Summary checkpoint（计划 §G8）。
@@ -51,8 +51,8 @@ export function shouldSummarize(input: SummaryTriggerInput): boolean {
 }
 
 export interface SummarizeDeps {
-  client: Pick<CursorConnectClient, "stream">;
-  store: CursorConnectStore;
+  client: Pick<CursorBotClient, "stream">;
+  store: CursorBotStore;
   newInvocationId?: () => string;
 }
 
@@ -61,14 +61,14 @@ export interface SummarizeOptions {
   /** 网关侧 conversation 行的 id（不是 upstream conversation_id）。 */
   conversationRowId: string;
   runId: string;
-  requestedModel: ConnectRequestedModel;
+  requestedModel: BotRequestedModel;
   coveredThroughSeq: number;
   prompt?: string;
   signal?: AbortSignal;
 }
 
 export interface SummarizeResult {
-  summary: CcSummary;
+  summary: BotSummary;
   /** true 表示命中了同一段消息的已有摘要，没有真的发请求。 */
   reused: boolean;
 }
@@ -163,7 +163,7 @@ export function contextFromSummary(
       .flatMap((message) => (message.role === "tool" ? (message.toolResults ?? []).map((r) => r.toolCallId) : []))
   );
 
-  const keep = (message: ConnectMessage, index: number): boolean => {
+  const keep = (message: BotMessage, index: number): boolean => {
     if (index >= tailStart) return true;
     if (message.role === "assistant" && message.toolCalls?.length) {
       return message.toolCalls.some((call) => unanswered.has(call.id) || tailResultIds.has(call.id));
@@ -183,7 +183,7 @@ export function contextFromSummary(
 }
 
 /** 被摘要消息序列的 hash，用于挡住重复摘要。只 hash 结构与文本，不含时间戳。 */
-export function hashMessages(messages: ConnectMessage[]): string {
+export function hashMessages(messages: BotMessage[]): string {
   const canonical = messages.map((message) => ({
     role: message.role,
     text: message.text ?? "",

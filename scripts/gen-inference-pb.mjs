@@ -1,5 +1,5 @@
 /**
- * 从 `docs/reference/inference-descriptor-8844.txt` 生成 `src/cursor-connect/proto/inference_pb.ts`。
+ * 从 `docs/reference/inference-descriptor-8844.txt` 生成 `src/cursor-bot/proto/inference_pb.ts`。
  *
  * 该 txt 是 Cursor 3.18.9 `extensions/cursor-agent-host/dist/657.js` 里 protobuf descriptor
  * 模块 8844 的原文，是本仓库唯一的协议字段来源：字段号、kind、oneof、枚举值一律从它读，不猜、不外查。
@@ -17,8 +17,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** 需要生成的 descriptor → 生成物。新增一份参考文件时在这里加一行。 */
 const TARGETS = [
-  { descriptor: "docs/reference/inference-descriptor-8844.txt", output: "src/cursor-connect/proto/inference_pb.ts" },
-  { descriptor: "docs/reference/available-models-descriptor.txt", output: "src/cursor-connect/proto/available_models_pb.ts" }
+  { descriptor: "docs/reference/inference-descriptor-8844.txt", output: "src/cursor-bot/proto/inference_pb.ts" },
+  { descriptor: "docs/reference/available-models-descriptor.txt", output: "src/cursor-bot/proto/available_models_pb.ts" }
 ];
 
 /** descriptor 的 `kind:"scalar"` T 值 → protobuf-es ScalarType 与 TS 类型/零值。 */
