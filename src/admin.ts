@@ -693,6 +693,19 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
   });
 
+  /**
+   * 按 id 回传 session token 明文（JWT）。理由同 /admin/api/keys/:id/reveal：
+   * 单人运维的内页，遮住管理员自己的凭据没有安全收益。只回 sessionToken，
+   * 不附 machineId 等字段——复制场景用不到，别多给。
+   */
+  app.post("/admin/api/bot/credentials/:id/reveal", async (request) => {
+    requireAdmin(request, deps);
+    const bot = requireBot(deps);
+    const record = bot.store.credential(keyId(request));
+    if (!record) throw new ApiError("Credential not found.", 404, "not_found");
+    return { sessionToken: record.sessionToken };
+  });
+
   app.get("/admin/api/bot/models", async (request) => {
     requireAdmin(request, deps);
     const bot = requireBot(deps);
@@ -830,6 +843,22 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { ok: true };
   });
 
+  /**
+   * 按 id 回传 Cursor Key 明文（运维要把它配到客户端时用）。
+   * 安全取舍：这等于「持有后台口令即可导出池里的全部 key」。之前靠「永不回传」挡的是
+   * 已拿到后台会话的攻击者——但那种攻击者本来就能增删 key、改路由、看请求历史（含 keyLabel），
+   * 后台沦陷即全量失守，真正的边界始终是 requireAdmin 的口令强度。
+   * POST 而非 GET：敏感读取不该被浏览器预取、被代理缓存、出现在书签里。
+   * 不落库不落日志（admin API 本就不经 loggedRunRequest），与现有 admin 读接口同一水位。
+   * 若未来要多人运维，应加审计行（who/when/which id）与频控——本注释即留话。
+   */
+  app.post("/admin/api/keys/:id/reveal", async (request) => {
+    requireAdmin(request, deps);
+    const record = await deps.keyPool.get(keyId(request));
+    if (!record) throw new ApiError("Key not found.", 404, "not_found");
+    return { apiKey: record.apiKey };
+  });
+
   app.get("/admin/api/gateway-keys", async (request) => {
     requireAdmin(request, deps);
     const pool = requireGatewayKeyPool(deps);
@@ -920,6 +949,20 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     const ok = await pool.remove(id);
     if (!ok) throw new ApiError("Gateway key not found.", 404, "not_found");
     return { ok: true };
+  });
+
+  /**
+   * 按 id 回传入站密钥明文。列表只给掩码、创建只 reveal 一次的旧约束下，
+   * 运维丢了明文只能作废重发；实际威胁模型是单人运维 + password 鉴权的内页，
+   * 「防止管理员自己拿到自己配的 key」没有价值，故开放按需取回。
+   * env 播种（source === "env"）同样允许：GATEWAY_API_KEY 的值运维本来就在 env 里握着。
+   */
+  app.post("/admin/api/gateway-keys/:id/reveal", async (request) => {
+    requireAdmin(request, deps);
+    const pool = requireGatewayKeyPool(deps);
+    const record = await pool.get(keyId(request));
+    if (!record) throw new ApiError("Gateway key not found.", 404, "not_found");
+    return { apiKey: record.apiKey };
   });
 
   /**

@@ -224,6 +224,37 @@ test("a credential can be created, tested, disabled and deleted from the admin A
   await app.close();
 });
 
+test("the bot credential reveal endpoint returns the plaintext token to admins only", async () => {
+  const { app, botStore } = await buildApp({ withCredential: true });
+  const credential = botStore.listCredentials()[0];
+  const id = credential.id;
+
+  // 复制场景只需要 token 本体；错一个字符客户端就连不上。
+  const revealed = await app.inject({
+    method: "POST",
+    url: `/admin/api/bot/credentials/${id}/reveal`,
+    headers: adminAuth
+  });
+  assert.equal(revealed.statusCode, 200);
+  assert.equal((revealed.json() as { sessionToken: string }).sessionToken, "session-token");
+  assert.deepEqual(
+    Object.keys(revealed.json() as Record<string, unknown>),
+    ["sessionToken"],
+    "reveal 只回 sessionToken，不附 machineId 等多余字段"
+  );
+
+  const anonymous = await app.inject({ method: "POST", url: `/admin/api/bot/credentials/${id}/reveal` });
+  assert.equal(anonymous.statusCode, 401);
+
+  const missing = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/no-such-id/reveal",
+    headers: adminAuth
+  });
+  assert.equal(missing.statusCode, 404);
+  await app.close();
+});
+
 test("a bot credential can be imported from a Cursor key in the pool", async () => {
   const calls: Array<{ url: string; authorization: string; body: string }> = [];
   const accessToken = jwt({ type: "session", sub: "acct" });

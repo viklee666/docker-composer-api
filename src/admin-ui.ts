@@ -307,6 +307,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 <input id="new-allowed" placeholder="初始白名单（可选，逗号分隔模型 id）" style="flex:1;min-width:200px" autocomplete="off">
                 <input id="new-excluded" placeholder="初始黑名单（可选，逗号分隔模型 id）" style="flex:1;min-width:200px" autocomplete="off">
               </div>
+              <div class="row" style="margin-bottom:14px">
+                <select id="key-test-model" style="min-width:200px" title="行内「测试」按钮使用的模型"></select>
+                <span class="hint">行内「测试」使用上面选中的模型</span>
+              </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr>
@@ -613,6 +617,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 <select id="test-provider" style="min-width:160px" title="SDK 走密钥池；Bot 走 Bot 凭据">
                   <option value="sdk">SDK（密钥池）</option>
                   <option value="bot">Bot</option>
+                </select>
+                <select id="test-key" style="min-width:180px" title="留空走密钥池轮换；选某把 key 则定向测试">
+                  <option value="">自动（密钥池轮换）</option>
                 </select>
                 <select id="test-model" style="min-width:180px"></select>
                 <input id="test-prompt" value="Reply with exactly: pong" style="flex:1;min-width:220px">
@@ -984,6 +991,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   function fillModelSelects(){
     if (testProvider() === 'bot') fillSelect($('test-model'), botModelIds(), null);
     else fillSelect($('test-model'), modelIds(), null);
+    fillSelect($('key-test-model'), modelIds(), null);
     fillSelect($('log-model'), modelIds(), '全部模型');
   }
   function fillCcChatModels(){
@@ -999,9 +1007,26 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   function updateTestRouteHint(){
     var hint = $('test-route-hint');
     if (!hint) return;
-    hint.textContent = testProvider() === 'bot'
-      ? '走 Bot 凭据（InferenceService/Stream），不经过 Cursor Key 池。请先在 Bot 凭据页拉好 token。'
-      : '下方按钮走密钥池（测当前队首可用 key）。';
+    if (testProvider() === 'bot') {
+      hint.textContent = '走 Bot 凭据（InferenceService/Stream），不经过 Cursor Key 池。请先在 Bot 凭据页拉好 token。';
+    } else if ($('test-key') && $('test-key').value) {
+      hint.textContent = '定向测试选中的 key：绕过密钥池轮换，直接用这一把（成功会清它的失败计数，失败按 transient 记、不计入自动禁用）。';
+    } else {
+      hint.textContent = '下方按钮走密钥池（测当前队首可用 key）。';
+    }
+  }
+  // 诊断页「指定 Cursor Key」下拉：选项跟随 Key 池渲染回填，保留当前选中并标注已禁用的 key。
+  function fillTestKeySelect(){
+    var sel = $('test-key');
+    if (!sel) return;
+    var current = sel.value;
+    var opts = ['<option value="">自动（密钥池轮换）</option>'];
+    lastKeys.forEach(function(key){
+      var label = (key.label || key.maskedKey || key.id) + (key.status === 'disabled' ? '（已禁用）' : '');
+      opts.push('<option value="' + esc(key.id) + '">' + esc(label) + '</option>');
+    });
+    sel.innerHTML = opts.join('');
+    if (current) sel.value = current;
   }
   function setModelCatalog(data){
     var list = (data && data.models) ? data.models : [];
@@ -1125,6 +1150,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       var warn = item.tokenType === 'web' ? ' <span class="chip bad">web token</span>' : '';
       if (item.sourceCursorKeyId) warn += ' <span class="chip">Key 池</span>';
       var actions = [
+        '<button data-bot-copy="' + esc(item.id) + '" title="复制完整 session token 到剪贴板（页面不显示明文）">复制</button>',
         '<button data-bot-test="' + esc(item.id) + '">测试</button>',
         item.status === 'active'
           ? '<button data-bot-disable="' + esc(item.id) + '">停用</button>'
@@ -1513,6 +1539,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (!lastKeys.length) {
       body.innerHTML = '';
       fillLogKeyFilters();
+      fillTestKeySelect();
+      updateTestRouteHint();
       return;
     }
     var html = '';
@@ -1531,7 +1559,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '<button data-action="up" data-id="' + esc(key.id) + '" title="上移（提高优先级）"' + (index === 0 ? ' disabled' : '') + '>↑</button>'
         + '<button data-action="down" data-id="' + esc(key.id) + '" title="下移（降低优先级）"' + (index === lastKeys.length - 1 ? ' disabled' : '') + '>↓</button>'
         + '</div>';
-      var actions = '<button data-action="test" data-id="' + esc(key.id) + '">测试</button>';
+      var actions = '<button data-action="copy" data-id="' + esc(key.id) + '" title="复制完整 key 到剪贴板（页面不显示明文）">复制</button>';
+      actions += '<button data-action="test" data-id="' + esc(key.id) + '">测试</button>';
       actions += '<button data-action="models" data-id="' + esc(key.id) + '">模型范围</button>';
       actions += '<button data-action="bot-import" data-id="' + esc(key.id) + '" title="用这把 key 向 Cursor 兑换 Bot session token">拉取 Bot</button>';
       if (key.status === 'active') {
@@ -1556,6 +1585,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     });
     body.innerHTML = html;
     fillLogKeyFilters();
+    fillTestKeySelect();
+    updateTestRouteHint();
   }
 
   function renderGwAvailability(){
@@ -1574,7 +1605,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var html = '';
     lastGwKeys.forEach(function(key){
       var fromEnv = key.source === 'env';
-      var actions = '<button data-action="edit" data-id="' + esc(key.id) + '">编辑</button>';
+      var actions = '<button data-action="copy" data-id="' + esc(key.id) + '" title="复制完整密钥到剪贴板（页面不显示明文）">复制</button>';
+      actions += '<button data-action="edit" data-id="' + esc(key.id) + '">编辑</button>';
       actions += '<button data-action="models" data-id="' + esc(key.id) + '">模型范围</button>';
       if (key.status === 'active') {
         actions += '<button data-action="disable" data-id="' + esc(key.id) + '">禁用</button>';
@@ -1633,6 +1665,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (gwCur) gwSel.value = gwCur;
   }
 
+  // 行内测试与诊断页完全解耦：模型取本面板头部的下拉（目录没拉到时走硬编码兜底），
+  // prompt 固定默认值——之前两者都偷偷共用诊断页的输入框，用户在那边改什么这边就跟着变。
   function testKey(id, button){
     var original = button.textContent;
     button.disabled = true;
@@ -1640,8 +1674,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     api('POST', '/admin/api/test', {
       keyId: id,
       provider: 'sdk',
-      model: testProvider() === 'bot' ? (modelIds()[0] || 'composer-2.5') : $('test-model').value,
-      prompt: $('test-prompt').value
+      model: $('key-test-model').value || modelIds()[0] || 'composer-2.5',
+      prompt: 'Reply with exactly: pong'
     })
       .then(function(data){
         if (data.ok) {
@@ -2092,6 +2126,31 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       toast('复制失败', true);
     }
   }
+  // 敏感凭据复制：reveal 拿到明文后只写剪贴板，不经过 innerHTML/textContent，不在页面停留。
+  // 剪贴板不可用（非安全上下文、被浏览器拒）时用 window.prompt 兜底手动复制，比静默失败好。
+  // 三个 handler 共用，避免三份重复的 disabled/toast/finally 样板。
+  function copySecret(path, secretField, button){
+    var original = button.textContent;
+    button.disabled = true;
+    button.textContent = '复制中…';
+    api('POST', path).then(function(data){
+      var secret = data && data[secretField];
+      if (!secret) throw new Error('响应里没有明文');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(secret).then(function(){
+          toast('已复制到剪贴板');
+        }, function(){
+          window.prompt('剪贴板不可用，请手动复制', secret);
+        });
+      }
+      window.prompt('剪贴板不可用，请手动复制', secret);
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') toast('复制失败：' + err.message, true);
+    }).finally(function(){
+      button.disabled = false;
+      button.textContent = original;
+    });
+  }
   function showGwReveal(apiKey){
     revealedGwKey = apiKey || '';
     $('gw-reveal-key').textContent = revealedGwKey;
@@ -2185,7 +2244,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('bot-body').addEventListener('click', function(event){
     var target = event.target;
     if (!target || target.tagName !== 'BUTTON') return;
-    var id = target.getAttribute('data-bot-test');
+    var id = target.getAttribute('data-bot-copy');
+    if (id) {
+      copySecret('/admin/api/bot/credentials/' + encodeURIComponent(id) + '/reveal', 'sessionToken', target);
+      return;
+    }
+    id = target.getAttribute('data-bot-test');
     if (id) {
       target.disabled = true;
       target.textContent = '测试中…';
@@ -2491,6 +2555,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var id = button.getAttribute('data-id');
     var action = button.getAttribute('data-action');
     if (action === 'up' || action === 'down') { moveKey(id, action === 'up' ? -1 : 1); return; }
+    if (action === 'copy') { copySecret('/admin/api/keys/' + encodeURIComponent(id) + '/reveal', 'apiKey', button); return; }
     if (action === 'test') { testKey(id, button); return; }
     if (action === 'models') {
       var key = findKey(id);
@@ -2525,6 +2590,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var id = button.getAttribute('data-id');
     var action = button.getAttribute('data-action');
     var gw = findGw(id);
+    if (action === 'copy') { copySecret('/admin/api/gateway-keys/' + encodeURIComponent(id) + '/reveal', 'apiKey', button); return; }
     if (action === 'edit') { if (gw) openBindModal(gw); return; }
     if (action === 'models') {
       modalState = { kind: 'gw-scope', id: id };
@@ -2601,7 +2667,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     api('POST', '/admin/api/test', {
       provider: opts.provider,
       model: opts.model,
-      prompt: opts.prompt
+      prompt: opts.prompt,
+      // 诊断页选了具体 key 时定向测试（后端早已支持 keyId）；行内 testKey 自带 keyId 不走这里。
+      ...(opts.provider === 'sdk' && $('test-key') && $('test-key').value ? { keyId: $('test-key').value } : {})
     }).then(function(data){
       var route = data.provider === 'bot' ? 'Bot' : 'SDK';
       if (data.ok) {
@@ -2622,10 +2690,22 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   }
 
   $('test-provider').addEventListener('change', function(){
+    // Bot 路线不使用 Cursor Key 池，选了 key 也是 400：显式禁用并清空，
+    // 比「提交时静默忽略」好——静默失效正是这类设置最常见的坑。
+    var keySel = $('test-key');
+    if (keySel) {
+      if (testProvider() === 'bot') {
+        keySel.value = '';
+        keySel.disabled = true;
+      } else {
+        keySel.disabled = false;
+      }
+    }
     updateTestRouteHint();
     if (testProvider() === 'bot' && !botCatalog.length) loadBotModels(false);
     fillModelSelects();
   });
+  $('test-key').addEventListener('change', updateTestRouteHint);
 
   $('btn-test').addEventListener('click', function(){
     runAdminChatTest({

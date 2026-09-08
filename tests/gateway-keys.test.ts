@@ -448,6 +448,42 @@ test("an env-sourced gateway key is 409 on delete but can still be disabled", as
   assert.equal((await gatewayKeyPool.list()).length, 1);
 });
 
+test("the gateway key reveal endpoint returns plaintext to admins only", async () => {
+  const { app, gatewayKeyPool } = await createTestApp();
+  const record = await gatewayKeyPool.add("reveal-me-inbound-key-7");
+  await gatewayKeyPool.seedFromEnv(LEGACY_KEY);
+  const seeded = (await gatewayKeyPool.list()).find((key) => key.source === "env");
+  assert.ok(seeded, "env 播种的密钥应存在");
+
+  // 明文正确：这是运维把密钥配到客户端的唯一途径，错一个字符就是配置失败。
+  const revealed = await app.inject({
+    method: "POST",
+    url: `/admin/api/gateway-keys/${record.id}/reveal`,
+    headers: adminHeaders()
+  });
+  assert.equal(revealed.statusCode, 200);
+  assert.equal(revealed.json().apiKey, "reveal-me-inbound-key-7");
+
+  // env 播种的密钥同样可 reveal：GATEWAY_API_KEY 的值运维本来就在 env 里握着。
+  const envRevealed = await app.inject({
+    method: "POST",
+    url: `/admin/api/gateway-keys/${seeded.id}/reveal`,
+    headers: adminHeaders()
+  });
+  assert.equal(envRevealed.statusCode, 200);
+  assert.equal(envRevealed.json().apiKey, LEGACY_KEY);
+
+  const anonymous = await app.inject({ method: "POST", url: `/admin/api/gateway-keys/${record.id}/reveal` });
+  assert.equal(anonymous.statusCode, 401);
+
+  const missing = await app.inject({
+    method: "POST",
+    url: "/admin/api/gateway-keys/no-such-id/reveal",
+    headers: adminHeaders()
+  });
+  assert.equal(missing.statusCode, 404);
+});
+
 test("the admin model catalogue is the union across every active cursor key", async () => {
   const catalogues: Record<string, ModelListResult> = {
     "cursor-key-a": {

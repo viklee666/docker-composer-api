@@ -2153,6 +2153,51 @@ test("admin connectivity test can target a specific key instead of the pool head
   assert.equal(missing.statusCode, 404);
 });
 
+test("the cursor key reveal endpoint returns plaintext to admins only", async () => {
+  const { app } = await createTestApp({ keys: ["key-a"] });
+  const adminHeaders = { authorization: "Bearer gateway-key" };
+  const listed = await app.inject({ method: "GET", url: "/admin/api/keys", headers: adminHeaders });
+  const id = listed.json().keys[0].id;
+
+  const revealed = await app.inject({
+    method: "POST",
+    url: `/admin/api/keys/${id}/reveal`,
+    headers: adminHeaders
+  });
+  assert.equal(revealed.statusCode, 200);
+  assert.equal(revealed.json().apiKey, "key-a");
+
+  const anonymous = await app.inject({ method: "POST", url: `/admin/api/keys/${id}/reveal` });
+  assert.equal(anonymous.statusCode, 401);
+
+  const missing = await app.inject({
+    method: "POST",
+    url: "/admin/api/keys/no-such-id/reveal",
+    headers: adminHeaders
+  });
+  assert.equal(missing.statusCode, 404);
+});
+
+test("admin connectivity test passes the requested model through alongside keyId", async () => {
+  const runner = new FakeRunner({ text: "pong" });
+  const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"] });
+  const adminHeaders = { authorization: "Bearer gateway-key" };
+  const keyB = (await keyPool.list()).find((key) => key.apiKey === "key-b");
+  assert.ok(keyB, "key-b should exist");
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/admin/api/test",
+    headers: adminHeaders,
+    payload: { keyId: keyB.id, model: "grok-4.6" }
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().ok, true);
+  assert.equal(runner.lastApiKey, "key-b");
+  // 现有用例只断言了 key 定向；model 也必须原样透传，否则行内测试换模型就成了空操作。
+  assert.equal(runner.lastInput?.model, "grok-4.6");
+});
+
 test("admin settings can toggle Cursor SDK HTTP/1.1 mode", async () => {
   const applied: boolean[] = [];
   const { app, store } = await createTestApp({
