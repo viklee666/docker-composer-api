@@ -107,7 +107,7 @@ test("extractDurableTurn 产出 assistantDigest（chat/anthropic），Responses 
   assert.equal(firstTurn.assistantDigest, undefined);
 });
 
-test("护栏 1：空 userText 不 send，退 stateless 全量（不 400）", async () => {
+test("护栏 1：空 userText 不 send、不建槽、不退 stateless（0 create / 0 send / 空 assistant）", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const created: TrackingAgent[] = [];
   const factory: AgentFactory = {
@@ -118,21 +118,24 @@ test("护栏 1：空 userText 不 send，退 stateless 全量（不 400）", asy
     }
   };
   const runner = durableRunner(hub, factory);
-  const flatten = "Conversation:\nASSISTANT: stateless full prompt must run\nUSER: hi";
+  resetDurableTelemetry();
 
   const result = await runner.run(baseRun({
-    prompt: flatten,
+    prompt: "Conversation:\nUSER: hi",
     conversationSeed: "seed-empty-guard",
     durableTurn: { kind: "new_user", userText: "", ...FP }
   }));
 
-  // 空轮次被护栏拦下：durable send 不发生，stateless 全量跑了一条。
-  assert.equal(created.length, 1);
-  assert.equal(created[0].sends.length, 1);
-  assert.equal(sendText(created[0].sends[0]), flatten);
-  assert.equal(created[0].disposed, true);
-  assert.equal(result.text, "reply 1");
+  // 空轮次静默 noop：模型一个字都不出、agent 不建、槽不增。
+  assert.equal(created.length, 0, "不得 create agent");
+  assert.equal(result.text, "");
+  assert.equal(result.toolCalls.length, 0);
   assert.equal(hub.size, 0, "空轮次守卫发生在 ensureDurableSlot 之前，不留 Hub 槽");
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok(
+    (snapshot.decisions["reuse:empty_turn_guard"] ?? 0) >= 1,
+    "必须留下 empty_turn_guard 打点（且不建 Hub 也照记）"
+  );
 });
 
 test("护栏 1：空轮次守卫在 debug 快照里标红（noteUpstreamTurn blocked）", async () => {
@@ -498,19 +501,95 @@ test("护栏 7：held execute 只驱动一次 —— 重放同一条 tool_result
   await hub.dropAll();
 });
 
-test("护栏 4（400 文案分叉）：kind=empty 的 400 使用可区分的 message/code", async () => {
+test("护栏 4：kind=empty 静默 noop —— 0 create / 0 send / 空 assistant（不再 400）", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-empty-400-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  resetDurableTelemetry();
+
+  // 400 会让客户端重试/打出错误条，空轮更吵；改为静默 200 空 assistant。
+  const result = await runner.run(baseRun({
+    conversationSeed: "seed-empty-400-message",
+    durableTurn: { kind: "empty", ...FP }
+  }));
+
+  assert.equal(created.length, 0, "empty 轮不得 create agent");
+  assert.equal(result.text, "");
+  assert.equal(result.toolCalls.length, 0);
+  assert.equal(hub.size, 0);
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok(
+    (snapshot.decisions["reuse:empty_turn_noop"] ?? 0) >= 1,
+    "必须留下 empty_turn_noop 打点"
+  );
+  await hub.dropAll();
+});
+
+test("空轮次收口：已有活槽时空轮不得碰 slot 历史（lastUserText / digest 不变、不重发）", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new TrackingAgent("agent-empty-live-slot");
+  const factory: AgentFactory = { create: async () => agent };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-empty-live-slot";
+  const sessionId = sessionHash(seed);
+
+  // 第一轮真问题：建槽、发一次增量、记录 lastUserText 与 digest。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    durableTurn: userTurnWithAssistant("hello", "reply 1")
+  }));
+  const slot = hub.get(sessionId);
+  assert.ok(slot);
+  assert.equal(slot.lastUserText, "hello");
+
+  // 第二轮空轮（empty.json 形状）：上游收不到任何 send，槽历史原样保留。
+  const result = await runner.run(baseRun({
+    conversationSeed: seed,
+    durableTurn: { kind: "empty", assistantDigest: assistantTextDigest("reply 1"), ...FP }
+  }));
+  assert.equal(agent.sends.length, 1, "空轮不得触发 durable send");
+  assert.equal(result.text, "");
+  const liveSlot = hub.get(sessionId);
+  assert.ok(liveSlot, "空轮不得销毁槽");
+  assert.equal(liveSlot.lastUserText, "hello", "空轮不得把 lastUserText 覆盖成占位符");
+  assert.equal(liveSlot.lastAssistantDigest, assistantTextDigest("reply 1"));
+
+  // 空轮之后的下一句真问题仍走 durable 增量（没被粘性 stateless）。
+  const next = await runner.run(baseRun({
+    conversationSeed: seed,
+    durableTurn: userTurnWithAssistant("follow up", "reply 1")
+  }));
+  assert.equal(agent.sends.length, 2, "空轮后的真问题仍走 durable 增量 send");
+  assert.equal(next.text, "reply 2");
+  await hub.dropAll();
+});
+
+test("空轮次收口：debug 快照记 empty_turn_noop（对照 empty.json 的 new_user send）", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
   const factory: AgentFactory = { create: async () => new TrackingAgent() };
   const runner = durableRunner(hub, factory);
-  await assert.rejects(
-    () => runner.run(baseRun({
-      conversationSeed: "seed-empty-400-message",
-      durableTurn: { kind: "empty", ...FP }
-    })),
-    (error) => error instanceof Error
-      && error.message.includes("no sendable content")
-      && (error as { code?: string }).code === "request_empty"
-  );
+  const turns: Array<{ channel: string; payload: unknown }> = [];
+  await runner.run(baseRun({
+    conversationSeed: "seed-empty-noop-debug",
+    durableTurn: { kind: "empty", ...FP },
+    debugRef: {
+      noteUpstreamTurn(channel, payload) {
+        turns.push({ channel, payload });
+      },
+      noteSelectedKey: () => undefined
+    }
+  }));
+  const blocked = turns.find((turn) => (turn.payload as { blocked?: string })?.blocked === "empty_turn_noop");
+  assert.ok(blocked, "debug 快照必须能看出空轮被 empty_turn_noop 拦下");
+  const payload = blocked!.payload as { kind?: string };
+  assert.equal(payload.kind, "empty");
   await hub.dropAll();
 });
 

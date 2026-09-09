@@ -48,12 +48,57 @@ interface TurnBits {
  * `slotHints` 需要活 slot。gateway 选 key 之前 server 往往还没有 durableSessionId，
  * 指纹 / lastUserText 由 runner `ensureDurableSlot` 对齐；入口能拿到 hints 时仍应传入。
  */
+/**
+ * 入站最后一条 user 的正文里，Cursor CLI 空轮次的占位符（实测 empty.json：
+ * `{ role: "user", content: "(no content)" }`，content 是字符串而非 text 块数组）。
+ */
+const NO_CONTENT_PLACEHOLDER = "(no content)";
+
+/** harness 壳块：空 stdout / slash command 回显 / caveat / system-reminder，判定意图前整段剥掉。 */
+const HARNESS_BLOCK_PATTERN =
+  "<local-command-caveat>[\\s\\S]*?</local-command-caveat>" +
+  "|<command-name>[\\s\\S]*?</command-name>" +
+  "|<command-message>[\\s\\S]*?</command-message>" +
+  "|<command-args>[\\s\\S]*?</command-args>" +
+  "|<command-stdout>[\\s\\S]*?</command-stdout>" +
+  "|<local-command-stdout>[\\s\\S]*?</local-command-stdout>" +
+  "|<system-reminder>[\\s\\S]*?</system-reminder>";
+
+/**
+ * 判定已经抽好的 `userText` 是否携带可发送的用户意图（空轮次收口的唯一口径）。
+ *
+ * 只拿 extract 产出的字符串做判定，不谈 content 形状：anthropic 的字符串 content
+ * （empty.json 实锤）与 text 块数组拼出的 `<user_query>` 壳都会在这里被覆盖。
+ * 判定不影响 send 原文——new_user 仍发客户端原文，剥壳只用于本函数。
+ *
+ * 注意必须整段等值匹配占位符：正文里「讨论」`(no content)` 三个词不算占位（有意图）；
+ * 用户真正文里字面引用完整的占位标签（如让模型解释这个格式）同样不算——
+ * 最后一个 user_query 是占位/为空时，还要看所有 user_query 块之外是否仍有实质内容。
+ */
+export function hasSendableUserIntent(userText: string): boolean {
+  const trimmed = userText.trim();
+  if (trimmed.toLowerCase() === NO_CONTENT_PLACEHOLDER) return false;
+  const stripped = trimmed.replace(new RegExp(HARNESS_BLOCK_PATTERN, "gi"), "");
+  const queries = [...stripped.matchAll(/<user_query>([\s\S]*?)<\/user_query>/gi)];
+  if (!queries.length) return stripped.trim().length > 0;
+  const inner = queries[queries.length - 1][1].trim();
+  if (inner && inner.toLowerCase() !== NO_CONTENT_PLACEHOLDER) return true;
+  // 最后一个 user_query 是占位/为空：user_query 块之外还有真正文 ⇒ 是在引用标签，不是空轮。
+  const outside = stripped.replace(/<user_query>[\s\S]*?<\/user_query>/gi, "").trim();
+  return outside.length > 0;
+}
+
 export function extractDurableTurn(
   protocol: ProtocolKind,
   body: unknown,
   previous?: DurablePrevious,
   slotHints?: DurableSlotHints,
-  systemPrompt?: SystemPromptSettings
+  systemPrompt?: SystemPromptSettings,
+  /**
+   * 空轮次收口开关（默认开）：`(no content)` / 纯 harness 壳收成 `kind=empty`，runner 侧静默 noop。
+   * 显式 false 恢复旧行为——占位符正文仍按 `new_user` 发出去（env: DROP_EMPTY_DURABLE_TURNS）。
+   */
+  dropEmpty?: boolean
 ): DurableTurn {
   const record = asRecord(body) ?? {};
   const systemText = resolveSystemText(systemSeedText(record), systemPrompt);
@@ -90,7 +135,9 @@ export function extractDurableTurn(
   if (slotHints?.lastUserText !== undefined && slotHints.lastUserText === userText) {
     return withDigest({ kind: "empty", systemFingerprint, toolsFingerprint });
   }
-  if (!userText && !images) {
+  // 开关关上时保持旧口径（只看空串）；开着（缺省）用意图判定收占位轮。
+  const noUserIntent = dropEmpty === false ? !userText : !hasSendableUserIntent(userText);
+  if (!images && noUserIntent) {
     return withDigest({ kind: "empty", systemFingerprint, toolsFingerprint });
   }
   return withDigest({ kind: "new_user", systemFingerprint, toolsFingerprint, userText, images });

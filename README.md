@@ -347,6 +347,14 @@ SOCKS 的两点协议限制值得留意：`socks5://` 按协议语义由网关�
 
 受 SDK 限制，代理只能是**进程级全局**设置，无法按 key 分别配置（SDK 的传输层没有可注入的按请求钩子）。
 
+## 丢掉 Cursor 空轮次（不打上游）
+
+Cursor CLI（Claude Code / Composer agent 等）在人没输入新问题时，仍会对 SDK 路线发一条「空轮次」：最后一条 user 的正文是 `(no content)` 占位符，或只剩 harness 壳（slash command 空 stdout、`/clear` 后的空 `<user_query>` 等）。旧行为下网关会把它当正常 `new_user` 增量发给上游，于是模型编出一句「上一则没有新的问题或指令」，一轮空转约 20 万 input token。
+
+`DROP_EMPTY_DURABLE_TURNS`（默认 `true`）开启时，`extractDurableTurn` 会把这类轮次收成 `kind=empty`，runner 静默收尾：不 `durableSend`、不退 stateless 全量重跑、不建槽，直接返回 200 与空 assistant。判定是纯文本口径（整段等值匹配占位符 + 剥 harness 块后取最后一个 `<user_query>` inner），只用于「是否算空轮」；真问题的 `userText` 仍按客户端原文发送。正文里讨论「(no content)」三个词不算占位。对 SDK 路线全部模型生效（Composer / Claude / GPT / Grok），不按模型过滤；Bot 路线不经过这套逻辑。
+
+需要对照旧行为时在 `.env` 写 `DROP_EMPTY_DURABLE_TURNS=false`：占位符正文重新按 `new_user` 发给上游。生效情况可在 `/admin` 的 durable 决策计数里看 `reuse:empty_turn_noop`，Debug 快照里则是 `blocked: empty_turn_noop`。
+
 ## 默认系统提示词
 
 后台「系统提示词」页设置，三种模式：

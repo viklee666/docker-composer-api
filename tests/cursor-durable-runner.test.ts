@@ -653,19 +653,21 @@ test("chat, responses, and messages all attach durableTurn and conversationSeed"
   await app.close();
 });
 
-test("empty durable turn is 400", async () => {
+test("empty durable turn is silently dropped (no 400, no upstream send)", async () => {
   const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new TrackingAgent();
   const factory: AgentFactory = {
-    create: async () => new TrackingAgent()
+    create: async () => agent
   };
   const runner = durableRunner(hub, factory);
-  await assert.rejects(
-    () => runner.run(baseRun({
-      conversationSeed: "seed-empty",
-      durableTurn: { kind: "empty", ...FP }
-    })),
-    (error) => error instanceof ApiError && error.statusCode === 400
-  );
+  const result = await runner.run(baseRun({
+    conversationSeed: "seed-empty",
+    durableTurn: { kind: "empty", ...FP }
+  }));
+  // 空轮次静默 noop：不 400（客户端会重试）、不打上游、返回空 assistant。
+  assert.equal(agent.sends.length, 0);
+  assert.equal(result.text, "");
+  assert.equal(result.toolCalls.length, 0);
   await hub.dropAll();
 });
 

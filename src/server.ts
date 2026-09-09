@@ -299,7 +299,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const promptSettings = gatewaySystemPrompt(deps.config);
     const prepared = prepareOpenAiChat(request.body, { systemPrompt: promptSettings });
     // slotHints 要等选 key 之后才能算 durableSessionId；指纹 / lastUserText 由 runner 对齐。
-    const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings);
+    const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings, deps.config.dropEmptyDurableTurns);
     const seed = noteDurableIdentity(request, request.body, "openai-chat", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
@@ -352,7 +352,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       body,
       previous ? { response: previous.response, inputItems: previous.inputItems } : undefined,
       undefined,
-      promptSettings
+      promptSettings,
+      deps.config.dropEmptyDurableTurns
     );
     const log = beginLog(deps, "/v1/responses", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
@@ -437,7 +438,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     noteGatewayKeyUse(deps, auth);
     const promptSettings = gatewaySystemPrompt(deps.config);
     const prepared = prepareAnthropicMessages(request.body, { systemPrompt: promptSettings });
-    const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings);
+    const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings, deps.config.dropEmptyDurableTurns);
     const seed = noteDurableIdentity(request, request.body, "anthropic-messages", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;

@@ -315,34 +315,17 @@ export class CursorSdkRunner implements CursorRunner {
     const turn = input.durableTurn;
 
     if (turn?.kind === "empty") {
-      // 包 E 第 5 条：入站请求本身无可发送内容。文案与 new_user 重试分支（已不再 400）区分开。
-      throw new ApiError(
-        "Empty durable turn: the request has no sendable content (no new user message).",
-        400,
-        "request_empty"
-      );
+      // 空轮次（占位符 / 无有效意图）静默收尾：不 400（客户端会重试打得更吵）、不退 stateless
+      // （aff0a15 已实测：拦了 durable send、stateless 全量照样让模型编一句「没看到问题」）。
+      // 不 ensureDurableSlot、不 touchSlotHistory：空轮不该建槽，也不该把 lastUserText 覆盖成占位符。
+      yield* this.noopEmptyTurn(hub, sessionId, input, "empty_turn_noop");
+      return;
     }
 
-    // 包 E 第 1 条：禁止发空轮次。new_user（或缺 durableTurn 的直连调用）且没有
-    // userText / images 时绝不 send——按不一致处理退 stateless，并在 debug 快照标红。
+    // 包 E 第 1 条：new_user（或缺 durableTurn 的直连调用）且没有 userText / images 时绝不 send。
+    // 与 extract 收口对齐后应几乎走不到，留作兜底——同样静默 noop，禁止再退 stateless 全量重跑。
     if ((turn?.kind ?? "new_user") === "new_user" && !turn?.userText && !turn?.images?.length) {
-      recordDurableDecision({
-        decision: "fallback",
-        reason: "empty_turn_guard",
-        session: sessionId.slice(0, 12),
-        kind: turn?.kind,
-        liveSessions: hub.size
-      });
-      try {
-        input.debugRef?.noteUpstreamTurn("sdk", {
-          kind: "new_user",
-          blocked: "empty_turn_guard",
-          remark: "blocked: no user text and no images, would have sent an empty turn upstream"
-        });
-      } catch {
-        // 观测路径不得影响主流程。
-      }
-      yield* this.streamStatelessFallback(input, signal);
+      yield* this.noopEmptyTurn(hub, sessionId, input, "empty_turn_guard");
       return;
     }
 
@@ -510,6 +493,40 @@ export class CursorSdkRunner implements CursorRunner {
     liveSlot = hub.get(sessionId) ?? liveSlot;
     touchSlotHistory(liveSlot, userText);
     yield* this.consumeDurablePump(hub, sessionId, liveSlot, input, signal);
+  }
+
+  /**
+   * 空轮次（kind=empty / 空 new_user 兜底）的静默收尾：不打上游、不建槽、不碰 slot 历史。
+   *
+   * digest 风险（有意先不改，线上跑一轮再验证）：返回 200 空 assistant 后，若客户端把空回复
+   * 写进 transcript，下一轮的 assistantDigest 对不上槽里上一轮真回复会触发 history_mismatch →
+   * 粘性 stateless。验收发现真被粘住时，再在 noop 路径把 lastAssistantDigest 更新成空串摘要并补
+   * 护栏测试；不预先改，以免客户端其实不落空 assistant 时误伤。
+   */
+  private async *noopEmptyTurn(
+    hub: SessionHub,
+    sessionId: string,
+    input: CursorRunRequest,
+    reason: "empty_turn_noop" | "empty_turn_guard"
+  ): AsyncIterable<CursorStreamEvent> {
+    const slot = hub.get(sessionId);
+    recordDurableDecision({
+      decision: "reuse",
+      reason,
+      ...(slot ? { session: sessionId.slice(0, 12) } : {}),
+      kind: input.durableTurn?.kind,
+      ...(slot ? { liveSessions: hub.size } : {})
+    });
+    try {
+      input.debugRef?.noteUpstreamTurn("sdk", {
+        kind: "empty",
+        blocked: reason,
+        remark: "blocked: no sendable user intent, no upstream send"
+      });
+    } catch {
+      // 观测路径不得影响主流程。
+    }
+    yield { type: "done", result: { text: "", toolCalls: [] } };
   }
 
   /**

@@ -62,6 +62,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     proxyUrl: optionalString(env.PROXY_URL),
     systemPromptMode: parseSystemPromptMode(env.SYSTEM_PROMPT_MODE),
     systemPrompt: optionalString(env.SYSTEM_PROMPT),
+    // 默认开：Cursor 空轮次（(no content) 占位）不再打到上游。对照需要关时 .env 写 false。
+    dropEmptyDurableTurns: booleanValue(env.DROP_EMPTY_DURABLE_TURNS, true),
 
     // Cursor Bot 路线。默认全关 / 全保守：这条路线还没跑过真实流量，
     // 默认接管流量或默认开工具都会让一次配置失误直接打到生产请求上。

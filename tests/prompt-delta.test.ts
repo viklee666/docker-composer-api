@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractDurableTurn, fingerprintTools, type DurableSlotHints } from "../src/prompt-delta.js";
+import { extractDurableTurn, fingerprintTools, hasSendableUserIntent, type DurableSlotHints } from "../src/prompt-delta.js";
 import type { DurableTurn, ProtocolKind } from "../src/types.js";
 
 const LOOKUP_CHAT = {
@@ -531,6 +531,141 @@ test("gateway SYSTEM_PROMPT append is in durable systemText and fingerprint", ()
   assert.notEqual(appended.systemFingerprint, off.systemFingerprint);
   const overridden = extractDurableTurn("openai-chat", body, undefined, undefined, { mode: "override", text: "gateway" });
   assert.equal(overridden.systemText, "gateway");
+});
+
+/* ------------------------------- 空轮次收口（hasSendableUserIntent，计划 §2/§7） */
+
+test("hasSendableUserIntent: 空串 / 纯空白 → 无意图", () => {
+  assert.equal(hasSendableUserIntent(""), false);
+  assert.equal(hasSendableUserIntent("   \n\t "), false);
+});
+
+test("hasSendableUserIntent: (no content) 占位（忽略大小写）→ 无意图", () => {
+  assert.equal(hasSendableUserIntent("(no content)"), false);
+  assert.equal(hasSendableUserIntent("(NO CONTENT)"), false);
+  assert.equal(hasSendableUserIntent("\n(no content)\n"), false);
+});
+
+test("hasSendableUserIntent: <user_query> 包裹的占位 → 无意图（本机 harness 壳，防御）", () => {
+  assert.equal(hasSendableUserIntent("<user_query>\n(no content)\n</user_query>"), false);
+});
+
+test("hasSendableUserIntent: 仅 caveat + 空 user_query → 无意图", () => {
+  const text = [
+    "<local-command-caveat>Caveat: local command stdout below.</local-command-caveat>",
+    "<command-name>/effort</command-name>",
+    "<local-command-stdout>Cancelled</local-command-stdout>",
+    "<user_query></user_query>"
+  ].join("\n");
+  assert.equal(hasSendableUserIntent(text), false);
+});
+
+test("hasSendableUserIntent: 真问题 → 有意图", () => {
+  assert.equal(hasSendableUserIntent("<user_query>另起一个计划</user_query>"), true);
+  assert.equal(hasSendableUserIntent("直接提问"), true);
+});
+
+test("hasSendableUserIntent: 正文讨论 (no content) 字样但非整段占位 → 有意图", () => {
+  assert.equal(hasSendableUserIntent("请解释什么叫 (no content) 占位"), true);
+  assert.equal(hasSendableUserIntent("<user_query>请解释 (no content)</user_query>"), true);
+});
+
+test("hasSendableUserIntent: 取最后一个 user_query 的 inner", () => {
+  const text = "<user_query>(no content)</user_query>\n<user_query>真正的问题</user_query>";
+  assert.equal(hasSendableUserIntent(text), true);
+});
+
+test("hasSendableUserIntent: 真正文里字面引用完整占位标签 → 有意图（不得误判空轮）", () => {
+  // 用户在真正文里让模型解释这个格式：最后一个 user_query 的 inner 恰是整段占位，
+  // 但 user_query 块之外仍有实质内容 ⇒ 是引用，不是空轮。
+  const quoted = "请看这个例子 <user_query>(no content)</user_query> 它是什么意思";
+  assert.equal(hasSendableUserIntent(quoted), true);
+  // harness 占位轮：标签外没有任何真正文 ⇒ 仍是空轮。
+  assert.equal(hasSendableUserIntent("<user_query>\n(no content)\n</user_query>\n"), false);
+});
+
+test("extract: anthropic 真正文引用占位标签 → 仍 new_user（防误伤收口）", () => {
+  const turn = extractDurableTurn("anthropic-messages", {
+    max_tokens: 1024,
+    messages: [
+      { role: "user", content: "请看这个例子 <user_query>(no content)</user_query> 它是什么意思" }
+    ]
+  });
+  assert.equal(turn.kind, "new_user");
+});
+
+/* ------------------------------- extract 空轮收口 */
+
+test("extract: anthropic 最后一条 user 为字符串占位 (no content) → empty（empty.json 实锤）", () => {
+  const turn = extractDurableTurn("anthropic-messages", {
+    max_tokens: 1024,
+    messages: [
+      { role: "user", content: "上一个问题" },
+      { role: "assistant", content: [{ type: "text", text: "上一条回复" }] },
+      { role: "user", content: "(no content)" }
+    ]
+  });
+  assert.equal(turn.kind, "empty");
+});
+
+test("extract: 真问题仍是 new_user 且 userText 保留原文（不剥 harness 壳）", () => {
+  const original = "<local-command-caveat>noise</local-command-caveat>\n<user_query>真问题</user_query>";
+  const turn = extractDurableTurn("openai-chat", {
+    messages: [
+      { role: "user", content: original }
+    ]
+  });
+  assert.equal(turn.kind, "new_user");
+  assert.equal(turn.userText, original);
+});
+
+test("extract: 关掉开关时占位仍按 new_user 发出（旧行为）", () => {
+  const turn = extractDurableTurn("anthropic-messages", {
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "(no content)" }]
+  }, undefined, undefined, undefined, false);
+  assert.equal(turn.kind, "new_user");
+  assert.equal(turn.userText, "(no content)");
+});
+
+test("extract: 空字符串 userText 的旧 empty 用例不受开关影响", () => {
+  const on = extractDurableTurn("anthropic-messages", {
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "" }]
+  });
+  const off = extractDurableTurn("anthropic-messages", {
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "" }]
+  }, undefined, undefined, undefined, false);
+  assert.equal(on.kind, "empty");
+  assert.equal(off.kind, "empty");
+});
+
+test("extract: chat 空轮（占位符）同样收成 empty（三套协议共用）", () => {
+  const turn = extractDurableTurn("openai-chat", {
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+      { role: "user", content: "(no content)" }
+    ]
+  });
+  assert.equal(turn.kind, "empty");
+});
+
+test("extract: 纯图片轮次不受占位判定影响", () => {
+  const turn = extractDurableTurn("openai-chat", {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "(no content)" },
+          { type: "image_url", image_url: { url: NEW_IMAGE } }
+        ]
+      }
+    ]
+  });
+  assert.equal(turn.kind, "new_user");
+  assert.deepEqual((turn.images ?? []).map((image) => image.data), [NEW_IMAGE]);
 });
 
 function resolveHints(row: Row): DurableSlotHints | undefined {

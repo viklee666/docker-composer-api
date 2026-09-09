@@ -94,6 +94,12 @@ export interface GatewayConfig {
   systemPromptMode: SystemPromptMode;
   /** 默认系统提示词正文。env: SYSTEM_PROMPT，后台可改。 */
   systemPrompt?: string;
+  /**
+   * SDK durable 空轮次收口：入站最后一条 user 无有效意图（`(no content)` 占位 / 纯 harness 壳）
+   * 时收成 `kind=empty`，runner 静默 noop、不打上游。默认开。env: DROP_EMPTY_DURABLE_TURNS。
+   * 关掉即恢复旧行为：占位符正文仍按 `new_user` 发给上游。
+   */
+  dropEmptyDurableTurns?: boolean;
 
   /* ------------------------------- Cursor Bot 路线（aiserver.v1.InferenceService/Stream） */
 
