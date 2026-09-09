@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "./errors.js";
 import {
+  bucketExhausted,
+  pruneExhaustedBuckets,
+  type QuotaBucket
+} from "./quota-buckets.js";
+import {
   denyRuleUnverifiable,
   identityAllowed,
   intersectScopes,
@@ -11,6 +16,7 @@ import {
   NO_KEY_SENTINEL
 } from "./routing.js";
 import type {
+  CursorKeyPatch,
   CursorKeyRecord,
   ModelIdentity,
   ModelScope,
@@ -60,6 +66,11 @@ export interface PickOptions {
   allowedKeyIds?: string[];
   /** 会话粘性标识（已散列）；配合 sessionAffinity 生效。 */
   sessionHash?: string;
+  /**
+   * 包 B：本次请求模型所属的额度桶。该桶已耗尽且未到期的 key 不参与候选；
+   * 全池该桶都耗尽时按原顺序照常尝试（分桶不能把请求打成无 key 可用）。
+   */
+  quotaBucket?: QuotaBucket;
 }
 
 /** 候选为空的原因，让上层能给出准确报错而不是笼统的额度耗尽。 */
@@ -241,8 +252,17 @@ export class CursorKeyPool {
     if (!servable.length) return { reason: uncertainKeyScope ? "model-unverified" : "model-not-allowed" };
 
     // 只有走到这里才可能是「试过但都失败了」，前面几种落空都比 exhausted 更具体。
-    const candidates = servable.filter((key) => !excludedIds.has(key.id));
+    let candidates = servable.filter((key) => !excludedIds.has(key.id));
     if (!candidates.length) return { reason: "exhausted" };
+
+    // 包 B（计划 §3.6）：额度桶过滤。该桶已耗尽且未到期的 key 不参与候选；全池该桶都耗尽时
+    // 按原顺序照常尝试——分桶只是优化选路，不能把请求打成无 key 可用。
+    const quotaBucket = options.quotaBucket;
+    if (quotaBucket) {
+      await this.pruneExpiredBucketMarks(candidates);
+      const usable = candidates.filter((key) => !bucketExhausted(key.exhaustedBuckets, quotaBucket));
+      if (usable.length) candidates = usable;
+    }
 
     const sticky = await this.stickyKey(candidates, options.sessionHash);
     if (sticky) return { key: sticky, sticky: true };
@@ -392,7 +412,11 @@ export class CursorKeyPool {
   /**
    * 记录一次 key 级失败并按策略决定是否禁用，返回是否真的禁用了。
    * - transient：原因不明（上游临时容量/会话问题），只留错误痕迹，不计入自动禁用。
-   * - quota/auth：累计连续失败次数，达到阈值且开启自动禁用时才禁；否则本次只是软失败，换下一个 key。
+   * - quota：账号级欠费（402 / unpaid invoice 等）。包 B 起一次即整把禁用，不再等阈值累计——
+   *   transient 已在 classifyKeyFailure 里先于 quota 排除（upstream_run_failed 优先），
+   *   能走到这里的 quota 都是确定性的欠费，留着只会让后续请求白撞一次。
+   * - auth：仍按阈值累计，连续失败达到阈值且开启自动禁用时才禁（autoDisableThreshold 只留给它）。
+   * - 三类都尊重 policy.enabled：后台关掉自动禁用后统一只轮换不禁用，旧约定不变。
    */
   async reportFailure(id: string, kind: KeyFailureKind, detail?: string): Promise<boolean> {
     const lastError = detail ? truncate(detail, 500) : null;
@@ -402,14 +426,54 @@ export class CursorKeyPool {
     }
     await this.store.updateCursorKey(id, { lastError, incrementFailureCount: true });
     if (!this.policy.enabled) return false;
+    if (kind === "quota") return this.disable(id, "quota", detail);
     const failures = (await this.get(id))?.failureCount ?? 1;
     if (failures < this.policy.threshold) return false;
     return this.disable(id, kind, detail);
   }
 
-  /** 一次成功即认为 key 健康：清空连续失败计数与残留错误，让后台不再挂着早已恢复的红字。 */
-  async recordSuccess(id: string): Promise<void> {
-    await this.store.updateCursorKey(id, { failureCount: 0, lastError: null });
+  /**
+   * 一次成功即认为 key 健康：清空连续失败计数与残留错误，让后台不再挂着早已恢复的红字。
+   * 包 B：顺带清额度桶标记——该桶能跑通说明额度已恢复。bucket 给出时只清那一个桶，
+   * 避免一次 other 桶的成功把 cursor 桶的标记误清掉；没有标记时不多写那一列。
+   */
+  async recordSuccess(id: string, bucket?: QuotaBucket): Promise<void> {
+    const marks = (await this.get(id))?.exhaustedBuckets;
+    const patch: CursorKeyPatch = { failureCount: 0, lastError: null };
+    if (marks && Object.keys(marks).length) {
+      const next = { ...marks };
+      if (bucket) delete next[bucket];
+      else for (const name of Object.keys(next)) delete next[name];
+      patch.exhaustedBuckets = Object.keys(next).length ? next : null;
+    }
+    await this.store.updateCursorKey(id, patch);
+  }
+
+  /**
+   * 包 B：把某把 key 的某个额度桶标记为耗尽（到 expiresAt 为止）。key 保持 active，
+   * 只是选路时该桶的请求避开它。来源是 Bot 凭据 / SDK 路线撞上额度失败后的联动标记。
+   */
+  async markQuotaBucketExhausted(id: string, bucket: QuotaBucket, expiresAt: string): Promise<boolean> {
+    // 委托 store 的单条读改写：这里的 get → await → update 在读与写之间会让出事件循环，
+    // 两次并发标记会互相覆盖（后写的整包冲掉先落的桶）。
+    return this.store.markCursorKeyBucketExhausted(id, bucket, expiresAt);
+  }
+
+  /**
+   * 包 B：后台「清除额度标记」。只清 exhausted_buckets，不动启停状态与失败计数——
+   * 那是人工 enable 按钮的语义，两个按钮各管各的。
+   */
+  async clearQuotaBuckets(id: string): Promise<boolean> {
+    return this.store.updateCursorKey(id, { exhaustedBuckets: null });
+  }
+
+  /** 懒清除（包 B 恢复路径 a）：读到已到期的标记就当未耗尽，顺手把列清掉。 */
+  private async pruneExpiredBucketMarks(keys: CursorKeyRecord[]): Promise<void> {
+    for (const key of keys) {
+      const pruned = pruneExhaustedBuckets(key.exhaustedBuckets);
+      if (pruned === key.exhaustedBuckets) continue;
+      await this.store.updateCursorKey(key.id, { exhaustedBuckets: pruned ?? null });
+    }
   }
 
   async recordUse(id: string): Promise<void> {

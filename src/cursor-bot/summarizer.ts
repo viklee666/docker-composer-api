@@ -98,7 +98,8 @@ export async function summarizeConversation(
     requestedModel: options.requestedModel
   });
 
-  const normalizer = new ResponseNormalizer();
+  // 摘要请求不声明 tools：默认关闭正文标记解析，纯文本回复不会被误拆（包 F 口径）。
+  const normalizer = new ResponseNormalizer({ parseToolMarkers: false });
   for await (const frame of deps.client.stream(request, options.signal)) {
     for (const _ of normalizer.accept(frame)) {
       // 摘要不对外流式输出，只要最终文本。

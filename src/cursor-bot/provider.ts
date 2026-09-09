@@ -15,6 +15,7 @@ import type { ConnectCompression } from "./envelope.js";
 import type { ConnectCodec } from "./headers.js";
 import { buildInferenceStreamRequest, type BotConversation, type BotMessage } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
+import { InferenceStreamRequest } from "./proto/inference_pb.js";
 import type { ConnectFetch } from "./transport.js";
 
 export interface CursorBotProviderOptions {
@@ -80,12 +81,25 @@ export class CursorBotProvider implements CursorRunner {
     // 一份缺字段的凭据要先白跑一次目录查询（可能是网络往返）才会被拒。
     const client = new CursorBotClient(this.clientOptions(credential));
     const conversation = await this.buildConversation(input, credential);
-    const normalizer = new ResponseNormalizer();
+    // 声明了 tools 才解析正文标记（包 F）：没声明工具时模型把 XML 当普通正文讨论是正常行为。
+    // 声明表一并交给 normalizer：marker 还原出的调用按声明过滤 + 别名归一（与 SDK 侧同口径）。
+    const normalizer = new ResponseNormalizer({
+      parseToolMarkers: (conversation.tools?.length ?? 0) > 0,
+      tools: conversation.tools
+    });
 
     this.recordRequestTelemetry(input, conversation);
 
     try {
-      for await (const frame of client.stream(buildInferenceStreamRequest(conversation), signal)) {
+      const request = buildInferenceStreamRequest(conversation);
+      // 包 D：Bot 的 Connect 请求体全文（JSON 视角——与 json codec 出门格式一致，proto 的字段语义相同）。
+      // 在 stream 之前记：编码成信封之后就没有可读副本了。
+      try {
+        input.debugRef?.noteUpstreamTurn("bot", safeRequestJson(request));
+      } catch {
+        // 观测路径不得影响请求。
+      }
+      for await (const frame of client.stream(request, signal)) {
         yield* normalizer.accept(frame);
       }
     } finally {
@@ -208,4 +222,22 @@ function stableUuid(seed: string): string {
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * `InferenceStreamRequest` → 可落盘的 JSON（包 D）。proto 的 toJsonString 可能因为
+ * 未初始化的 optional 字段或 BigInt 抛异常，快照绝不能因此打断请求——失败时退回
+ * 「messages 数量 + conversationId」的最小摘要并如实标注 parse 失败。
+ */
+function safeRequestJson(request: InferenceStreamRequest): unknown {
+  try {
+    return JSON.parse(request.toJsonString()) as unknown;
+  } catch (error) {
+    return {
+      parseFailed: true,
+      error: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      conversationId: request.conversationId,
+      messageCount: request.messages.length
+    };
+  }
 }

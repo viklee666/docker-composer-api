@@ -70,6 +70,18 @@ export interface GatewayConfig {
   cursorModelParams?: ModelParameterValue[];
   /** 默认 Cursor 会话模式 agent/plan（env: CURSOR_AGENT_MODE）。 */
   cursorAgentMode?: AgentMode;
+  /**
+   * SDK 路线的运行设置覆盖（包 A，计划 §3.5）。字段与顶层同名设置一一对应：
+   * undefined（未覆盖）时回落顶层值（env / 既有后台设置），因此现有部署零迁移、行为不变。
+   * 后台「运行设置」的 per-provider 分支写入，启动时由 gateway-settings 恢复。
+   */
+  sdkOverrides?: ProviderRunOverrides;
+  /**
+   * Bot 路线的运行设置覆盖（包 A，计划 §3.5）。除 run 字段外还允许覆盖
+   * botSendTools / botCodec —— 语义与 sdkOverrides 相同：undefined 时回落顶层值。
+   * botSettings(config) 读它，后台保存后写回 config 立即生效（无需重启）。
+   */
+  botOverrides?: ProviderRunOverrides;
   /** key 取用策略：fill-first（默认，吃满第一个 key 以命中 Cursor 缓存）或 round-robin。 */
   routingStrategy: RoutingStrategy;
   /** 会话粘性：同一会话固定复用上次成功的 key，保住上游缓存。env: SESSION_AFFINITY，后台可改。 */
@@ -115,6 +127,19 @@ export interface GatewayConfig {
   botMachineId?: string;
   /** 播种凭据的客户端版本号。env: CURSOR_BOT_CLIENT_VERSION。 */
   botClientVersion?: string;
+
+  /* ------------------------------- Debug 模式（包 D，计划 §3.1） */
+
+  /**
+   * Debug 快照总开关的 env 默认值。env 只做总开关；运行期后台可改（gateway-settings 落库优先）。
+   * 开启后每个请求按 owner / endpoint / 模型过滤落一条 JSON 快照到 `dirname(SQLITE_PATH)/debug/`。
+   * 纯观测增量，不影响任何请求行为。env: GATEWAY_DEBUG。
+   */
+  debugEnabled?: boolean;
+  /** Debug 快照单日条数上限，0 = 不限制。env: GATEWAY_DEBUG_MAX_ENTRIES，后台可改。 */
+  debugMaxEntries?: number;
+  /** Debug 快照总体积上限（字节），0 = 不限制。env: GATEWAY_DEBUG_MAX_TOTAL_BYTES，后台可改。 */
+  debugMaxTotalBytes?: number;
 }
 
 /** Cursor SDK 会话生命周期：durable 复用 agent；stateless 为今日每请求新建。 */
@@ -272,6 +297,13 @@ export interface DurableTurn {
    * First durable send may prefix `SYSTEM:\n{systemText}`. Omitted when empty.
    */
   systemText?: string;
+  /**
+   * 包 E：入站 transcript 上一条 assistant 文本的一致性摘要（normalize 后 sha256）。
+   * 与 slot 记录的上一轮输出摘要比对；两侧都有值且对不上 ⇒ 历史分叉，退 stateless。
+   * 纯文本会话（从未发过工具调用）唯一的历史护栏。Responses 协议历史走
+   * previous_response_id、transcript 里看不到 assistant 轮，此字段缺省（护栏不触发）。
+   */
+  assistantDigest?: string;
 }
 
 export interface KeyUsageRef {
@@ -410,10 +442,38 @@ export interface CursorRunRequest {
   rawBody?: unknown;
   /** 入站协议，供 Bot 路线选择结构化解析器。 */
   inboundProtocol?: "openai-chat" | "openai-responses" | "anthropic";
+  /**
+   * Debug 快照引出通道（包 D）：server 侧开启 Debug 模式时挂上，
+   * runner / bot 侧在上游轮次发出前把全文写回来。可选字段，不改协议类型的外部形状；
+   * 不挂或未开启时调用方全部短路，对请求路径零侵入。
+   */
+  debugRef?: import("./debug-recorder.js").DebugUpstreamSink;
 }
 
 /** 两条推理路线：SDK（@cursor/sdk）与 Bot（aiserver.v1.InferenceService/Stream，上游客户端是 Grok Bot）。 */
 export type GatewayProvider = "sdk" | "bot";
+
+/**
+ * 单条 provider 路线的运行设置覆盖（包 A，计划 §3.5）。每个字段与 GatewayConfig
+ * 顶层的同名/对应字段一一对应，undefined 表示「不覆盖、回落顶层值」。
+ * 顶层值本身来自 env 或后台既有设置，因此只设 override 的部署对未覆盖字段零影响。
+ * maxModePolicy / fastPolicy 是按模型解析的（policyIntent），不是简单的值替换。
+ * sendTools / codec 仅 Bot 路线有意义。
+ */
+export interface ProviderRunOverrides {
+  requestTimeoutMs?: number;
+  autoDisableKeys?: boolean;
+  autoDisableThreshold?: number;
+  reasoningEffort?: string;
+  maxModePolicy?: ModelParamPolicy;
+  fastPolicy?: ModelParamPolicy;
+  modelParams?: ModelParameterValue[];
+  agentMode?: AgentMode;
+  /** Bot 路线：是否向上游声明工具（顶层 botSendTools 的覆盖）。 */
+  sendTools?: boolean;
+  /** Bot 路线：请求体编码（顶层 botCodec 的覆盖）。 */
+  codec?: "proto" | "json";
+}
 
 export interface CursorRunResult {
   text: string;
@@ -488,6 +548,11 @@ export interface CursorKeyRecord {
   modelScope: ModelScope;
   /** round-robin 的加权份额，越大越常被选中。fill-first 策略下不生效。 */
   weight: number;
+  /**
+   * 额度分桶（包 B）：桶名 → 耗尽截止时间（ISO）。某个桶的模型额度耗尽时只标该桶，
+   * key 保持 active，选路时该桶的请求避开它；到期或一次成功即清。空 / 缺省 = 没有耗尽标记。
+   */
+  exhaustedBuckets?: Record<string, string>;
   createdAt: string;
 }
 
@@ -504,6 +569,8 @@ export interface CursorKeyPatch {
   incrementFailureCount?: boolean;
   modelScope?: ModelScope;
   weight?: number;
+  /** 包 B：整包替换额度桶标记；null = 清空（后台「清除额度标记」）。undefined = 不动。 */
+  exhaustedBuckets?: Record<string, string> | null;
 }
 
 /** 对外提供给客户端的网关 API 密钥（不是 Cursor key）。 */
@@ -543,6 +610,17 @@ export interface GatewayKeyPatch {
  */
 export type EffectiveParamField = "reasoningEffort" | "maxMode" | "fast";
 
+/**
+ * 流式请求被 abort 的归因（包 C）。只有真正触发 abort 的请求才会写，
+ * 非流式与其他请求不写——后台据此在 499 行上直接看出「客户端走了还是空闲超时」。
+ */
+export type AbortReason =
+  | "client_disconnect"
+  | "idle_timeout"
+  /** 预留：上游侧主动取消（当前全仓无写入点，保留取值以兼容历史日志行的读取与校验）。 */
+  | "upstream_canceled"
+  | "local_abort";
+
 export interface RequestLogRecord {
   id: string;
   ts: string;
@@ -555,6 +633,8 @@ export interface RequestLogRecord {
   durationMs: number;
   stream: boolean;
   error?: string;
+  /** 流式请求被 abort 的归因（socket 断连 / 空闲超时 / 主动取消），见 AbortReason。 */
+  abortReason?: AbortReason;
   /** 命中的网关 API 密钥（多密钥模式下用于分账）。 */
   gatewayKeyId?: string;
   gatewayKeyLabel?: string;
@@ -642,6 +722,11 @@ export interface StateStore {
   getCursorKeyByValue(apiKey: string): Promise<CursorKeyRecord | undefined>;
   insertCursorKey(record: CursorKeyRecord): Promise<void>;
   updateCursorKey(id: string, patch: CursorKeyPatch): Promise<boolean>;
+  /**
+   * 把某把 key 的某个额度桶标记为耗尽（到 expiresAt 为止）。读改写必须在单次调用内
+   * 原子完成（同步读改写或同事务）：拆成读 → await → 写会让并发标记互相覆盖。
+   */
+  markCursorKeyBucketExhausted(id: string, bucket: string, expiresAt: string): Promise<boolean>;
   deleteCursorKey(id: string): Promise<boolean>;
   /** 按给定 id 序列重排取用优先级；未包含的 key 保持相对顺序排在末尾。 */
   reorderCursorKeys(ids: string[]): Promise<void>;

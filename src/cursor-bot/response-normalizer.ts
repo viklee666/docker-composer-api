@@ -1,7 +1,9 @@
-import type { CursorRunResult, CursorStreamEvent, GatewayToolCall, RequestUsage } from "../types.js";
+import type { CursorRunResult, CursorStreamEvent, GatewayTool, GatewayToolCall, RequestUsage } from "../types.js";
+import { matchesClientTool, normalizeToolCallForClient } from "../tool-compat.js";
 import { inferenceStreamError } from "./errors.js";
 import { ApiError } from "../errors.js";
 import type { InferenceStreamResponse } from "./proto/inference_pb.js";
+import { markerEventsFromText, markerFlushEvents, ToolMarkerFilter } from "./tool-markers.js";
 
 /** 一次 run 从帧流里攒出来的全部状态。 */
 export interface BotRunState {
@@ -37,6 +39,28 @@ interface PendingToolCall {
  * 这样 server.ts / SSE 输出层一行都不用改。
  */
 export class ResponseNormalizer {
+  /**
+   * 是否启用正文工具标记还原（计划包 F 第 3 条）。
+   *
+   * 只在**本轮声明了 tools** 时开：模型没被告知工具存在时把 XML 当普通正文讨论
+   * （引用示例、教学文本）是完全正常的行为，这时候拆掉它会污染纯文本回复。
+   * 调用方（provider / tool-loop / service）把「本轮要不要解析」传进来。
+   */
+  private readonly markerFilter?: ToolMarkerFilter;
+
+  /**
+   * 本轮声明给上游的工具表（包 F 复审）。marker 还原出的调用按它过滤与归一——
+   * 与 SDK 侧 keepDeclaredOnly + normalizeToolCallsForClient 同一套口径：
+   * 未声明的工具名丢弃，别名（如 shell→Bash）归一，参数键改名。未提供时原样放行
+   *（旧装配 / 纯标记单测不需要这层判定）。
+   */
+  private readonly declaredTools?: GatewayTool[];
+
+  constructor(options: { parseToolMarkers?: boolean; tools?: GatewayTool[] } = {}) {
+    if (options.parseToolMarkers) this.markerFilter = new ToolMarkerFilter();
+    this.declaredTools = options.tools;
+  }
+
   readonly state: BotRunState = {
     text: "",
     reasoningText: "",
@@ -68,8 +92,27 @@ export class ResponseNormalizer {
       case "textPart": {
         // is_final 的帧 text 常常是空的：只表示「文本到此为止」，不应产生空文本块。
         if (response.value.text) {
-          this.state.text += response.value.text;
-          yield { type: "text", text: response.value.text };
+          // 正文里出现完整 tool_call 标记时还原成 tool_call 事件（包 F）；未开启时直通。
+          // state.text 只累积**实际下发**的正文（与事件流同口径）：marker 路径下从过滤后的事件取回，
+          // 否则 result() 聚合出的文本会带着标记原文，与流式订阅者看到的不一致。
+          if (this.markerFilter) {
+            for (const event of markerEventsFromText(this.markerFilter, response.value.text)) {
+              if (event.type === "tool_call") {
+                // 包 F 复审：marker 还原出的调用与 SDK 侧同口径——未声明的工具名不转发，
+                // 命中声明的做别名归一与参数键改名后再下发。
+                const toolCall = this.admitMarkerToolCall(event.toolCall);
+                if (!toolCall) continue;
+                this.state.toolCalls.push(toolCall);
+                yield { type: "tool_call", toolCall };
+              } else if (event.type === "text") {
+                this.state.text += event.text;
+                yield event;
+              }
+            }
+          } else {
+            this.state.text += response.value.text;
+            yield { type: "text", text: response.value.text };
+          }
         }
         return;
       }
@@ -151,9 +194,24 @@ export class ResponseNormalizer {
       this.pending.delete(key);
       yield { type: "tool_call", toolCall: this.completeToolCall(key, pending) };
     }
+    // 标记过滤器的收尾：held 正文与未闭合的尾部作为普通文本放行，不能凭空蒸发。
+    // 放行的同时记进 state.text——这些内容已经作为事件下发了，聚合口径（result()）
+    // 必须包含，否则流式订阅者看到的正文会比聚合结果多一截。
+    if (this.markerFilter) {
+      for (const event of markerFlushEvents(this.markerFilter)) {
+        if (event.type === "text") this.state.text += event.text;
+        yield event;
+      }
+    }
   }
 
   result(): CursorRunResult {
+    // 开了标记还原时，流式路径可能还有暂存的 held / 未闭合尾部没进 state.text
+    //（flush 事件只在有人迭代时才产出）；这里收进聚合结果，与事件流的最终口径一致。
+    if (this.markerFilter) {
+      const rest = this.markerFilter.flush();
+      if (rest) this.state.text += rest;
+    }
     return {
       text: this.state.text,
       toolCalls: this.state.toolCalls,
@@ -164,6 +222,17 @@ export class ResponseNormalizer {
   /** 只记 case 名去重后的列表，不记 payload——payload 里可能有用户内容，而且帧数不可控。 */
   private noteCase(name: string): void {
     if (!this.state.unknownCases.includes(name)) this.state.unknownCases.push(name);
+  }
+
+  /**
+   * marker 还原出的调用先过「调用方声明过没有」这道筛，再归一工具名与参数键。
+   * 未声明的返回 undefined（丢弃）；没拿到声明表时原样放行，保持旧装配行为。
+   */
+  private admitMarkerToolCall(toolCall: GatewayToolCall): GatewayToolCall | undefined {
+    const tools = this.declaredTools;
+    if (!tools?.length) return toolCall;
+    if (!matchesClientTool(toolCall, tools)) return undefined;
+    return normalizeToolCallForClient(toolCall, tools);
   }
 
   /**

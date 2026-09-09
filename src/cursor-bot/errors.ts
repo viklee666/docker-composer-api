@@ -57,6 +57,15 @@ export function isConnectCode(value: string): value is ConnectCode {
   return Object.hasOwn(CONNECT_CODE_STATUS, value);
 }
 
+/**
+ * 上游 EndStream 帧来源标记（包 B）。endStreamError 造出的错误会带上原始 Connect code，
+ * 下游据此区分「上游亲口说的 resource_exhausted」（额度桶耗尽，只标桶不禁用）与其他来源的 429：
+ * 本地 EnvelopeTooLargeError 映射成的是 502、InferenceStreamError 的 RATE_LIMIT 不带这个标记，
+ * 两者都不会撞进额度判据。用 symbol 挂属性而不是扩 ApiError 的构造参数：这是 Bot 路线
+ * 自己的判定细节，不属于对外错误形状。
+ */
+const upstreamConnectCode = Symbol("upstreamConnectCode");
+
 export function connectCodeToStatus(code: string): number {
   return isConnectCode(code) ? CONNECT_CODE_STATUS[code] : 500;
 }
@@ -85,7 +94,18 @@ export function endStreamError(error: NonNullable<EndStreamResponse["error"]>): 
   // 上游经常只回一个 `"Error"`，对运维毫无信息量。始终带上 Connect code：
   // 「unauthenticated」比「Error」能直接指向该换 token 这件事。
   const message = detail && detail.toLowerCase() !== "error" ? `${detail} (connect: ${code})` : `Cursor Connect rejected the request: ${code}`;
-  return new ApiError(message, status, apiErrorCode(status));
+  const apiError = new ApiError(message, status, apiErrorCode(status));
+  (apiError as { [upstreamConnectCode]?: string })[upstreamConnectCode] = code;
+  return apiError;
+}
+
+/**
+ * 是否为「上游 EndStream 帧带回的 resource_exhausted」——桶级额度耗尽的唯一判据（包 B）。
+ * 任何其他 429（本地构造的、HTTP 层透传的）都返回 false，往「不标桶」的保守方向退。
+ */
+export function isUpstreamResourceExhausted(error: unknown): boolean {
+  const marked = (error as { [upstreamConnectCode]?: unknown } | null | undefined)?.[upstreamConnectCode];
+  return marked === "resource_exhausted";
 }
 
 /**

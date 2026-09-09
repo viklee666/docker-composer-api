@@ -7,6 +7,7 @@ import {
   AvailableModelsRequest,
   AvailableModelsResponse,
   AvailableModelsResponse_DegradationStatus,
+  AvailableModelsResponse_ModelVendorId,
   AvailableModelsScope,
   type AvailableModelsResponse_AvailableModel,
   type ModelParameterDefinition as ProtoModelParameterDefinition
@@ -49,6 +50,11 @@ export interface BotModelEntry {
   contextTokenLimitForMaxMode?: number;
   /** `DISABLED` 的模型不对外暴露；`DEGRADED` 暴露但要标注。 */
   degradation: "ok" | "degraded" | "disabled";
+  /**
+   * 包 B：该模型的 vendor 是不是 Cursor 自家（`vendor.id === CURSOR`）。额度分桶的兜底信号：
+   * 人工维护表查不到时，cursor 系模型归 `cursor` 桶，其余归 `other`。查不到目录就没有这个提示。
+   */
+  vendorIsCursor?: boolean;
   /** 参数定义是参数 id 与值域的权威来源，优先于 model-params.ts 的硬编码兜底。 */
   parameters: ModelParameterDefinition[];
   variants: ModelVariantDefinition[];
@@ -125,6 +131,7 @@ function toEntry(model: AvailableModelsResponse_AvailableModel): BotModelEntry {
       ? {}
       : { contextTokenLimitForMaxMode: model.contextTokenLimitForMaxMode }),
     degradation: degradationOf(model.degradationStatus),
+    ...(model.vendor?.id !== undefined ? { vendorIsCursor: model.vendor.id === AvailableModelsResponse_ModelVendorId.CURSOR } : {}),
     parameters: model.parameterDefinitions.map(toParameterDefinition).filter((definition) => definition.values.length),
     variants: model.variants.map((variant) => ({
       displayName: variant.displayName,

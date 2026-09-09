@@ -428,7 +428,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
           <div class="panel">
             <div class="head">
               <h2>运行设置</h2>
-              <span class="hint">这些值来自环境变量，改完需要重启进程。这里只做回显，避免后台改了却与实际出站不一致。</span>
+              <span class="hint">回显当前生效值（env + 运行设置页的 Bot 覆盖）。「向上游声明工具」「编码」已可在「运行设置」页的 Bot 块实时修改；其余项仍来自环境变量，改完需重启。</span>
             </div>
             <div class="body">
               <div class="table-scroll">
@@ -694,7 +694,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
 
               <div class="settings-block">
-                <h3>模型默认（客户端显式指定时以客户端为准）</h3>
+                <h3>SDK 运行设置 · 模型默认（客户端显式指定时以客户端为准）</h3>
+                <p class="lede">这些是 SDK 路线（无 bot/ 前缀）的运行默认值；Bot 路线未单独覆盖时也回落到这里（下面的「Bot 运行设置」可逐项盖掉）。</p>
                 <div class="settings-grid">
                   <div class="setting-field">
                     <label>Fast 策略 <span class="env">CURSOR_FAST</span></label>
@@ -759,6 +760,99 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               </div>
 
               <div class="settings-block">
+                <h3>Bot 运行设置（bot/ 前缀与 Bot 凭据路线）</h3>
+                <p class="lede">每项都是对上面「SDK 运行设置 / 公共默认」的 Bot 侧覆盖：选「跟随」就不覆盖、沿用上面的值。保存后立即生效（sendTools / 编码无需重启）。</p>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label>Fast 策略（Bot 覆盖）</label>
+                    <select id="bot-fast-policy">
+                      <option value="">跟随公共默认</option>
+                      <option value="passthrough">默认关闭（客户端可覆盖）</option>
+                      <option value="force-all">全部支持的模型强制开启</option>
+                      <option value="force-selected">仅下列模型强制开启</option>
+                    </select>
+                  </div>
+                  <div class="setting-field hidden" id="bot-fast-models-field">
+                    <label>强制开启 Fast 的模型（逗号分隔）</label>
+                    <input id="bot-fast-models" type="text" placeholder="grok-4.6, composer-2.5" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>Max Mode 策略（Bot 覆盖）</label>
+                    <select id="bot-max-mode-policy">
+                      <option value="">跟随公共默认</option>
+                      <option value="passthrough">默认关闭（客户端可覆盖）</option>
+                      <option value="force-all">全部支持的模型强制开启</option>
+                      <option value="force-selected">仅下列模型强制开启</option>
+                    </select>
+                  </div>
+                  <div class="setting-field hidden" id="bot-max-mode-models-field">
+                    <label>强制开启 Max Mode 的模型（逗号分隔）</label>
+                    <input id="bot-max-mode-models" type="text" placeholder="grok-4.6, claude-4.8" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>默认思考强度（Bot 覆盖）</label>
+                    <select id="bot-reasoning-effort">
+                      <option value="">跟随公共默认</option>
+                      <option value="none">none</option>
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                      <option value="xhigh">xhigh</option>
+                      <option value="max">max</option>
+                    </select>
+                  </div>
+                  <div class="setting-field">
+                    <label>默认 Cursor 会话模式（Bot 覆盖）</label>
+                    <select id="bot-agent-mode">
+                      <option value="">跟随公共默认</option>
+                      <option value="agent">agent</option>
+                      <option value="plan">plan</option>
+                    </select>
+                  </div>
+                  <div class="setting-field">
+                    <label>默认 model.params（Bot 覆盖）</label>
+                    <input id="bot-model-params" type="text" placeholder="留空 = 跟随公共默认" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>向上游声明工具 <span class="env">CURSOR_BOT_SEND_TOOLS</span></label>
+                    <select id="bot-send-tools">
+                      <option value="">跟随 env / 公共默认</option>
+                      <option value="on">开启</option>
+                      <option value="off">关闭</option>
+                    </select>
+                    <div class="hint">开启后 Bot 路线才会把客户端 tools 发给上游（工具循环的前提）。改完立即生效。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>请求体编码 <span class="env">CURSOR_BOT_CODEC</span></label>
+                    <select id="bot-codec">
+                      <option value="">跟随 env / 公共默认</option>
+                      <option value="proto">proto（默认）</option>
+                      <option value="json">json（调试用）</option>
+                    </select>
+                    <div class="hint">改完立即生效，对下一个 Bot 请求生效。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>Bot 上游空闲超时（ms）</label>
+                    <input id="bot-request-timeout" type="number" min="5000" step="1000" placeholder="留空 = 跟随公共默认">
+                    <div class="hint">只作用于走 Bot 路线的请求。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>Bot 凭据自动禁用</label>
+                    <select id="bot-auto-disable">
+                      <option value="">跟随默认（开启）</option>
+                      <option value="on">开启</option>
+                      <option value="off">关闭</option>
+                    </select>
+                    <div class="hint">只管 Bot 凭据（401/403 连续失败停用），与 SDK key 池的自动禁用互不影响。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>Bot 凭据禁用阈值</label>
+                    <input id="bot-auto-disable-threshold" type="number" min="1" max="50" step="1" placeholder="留空 = 默认 5">
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-block">
                 <h3>通道、协议与自动禁用</h3>
               <div class="row" style="margin-bottom:10px">
                 <label class="toggle" style="font-size:13px;color:var(--text)">Cursor local agent 的 HTTP/1.1 + SSE
@@ -781,6 +875,50 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                   次后才禁用
                 </label>
               </div>
+              </div>
+              <div class="settings-block">
+                <h3>Debug 快照（排障取证）</h3>
+                <p class="lede">开启后每个请求落一份 JSON 快照到 <code>data/debug/&lt;日期&gt;/&lt;logId&gt;.json</code>：入站 headers / body（密钥掩码）、选路与选中 key、上游实际发出的轮次全文、abort 归因、出站 SSE 逐事件。默认关——开了会把请求原文写进磁盘，务必只在排障时短开，并配合过滤缩小范围。</p>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label class="setting-check"><input type="checkbox" id="debug-toggle"> 开启 Debug 快照 <span class="env">GATEWAY_DEBUG</span></label>
+                  </div>
+                  <div class="setting-field">
+                    <label>owner 过滤（网关密钥标签或哈希前缀）</label>
+                    <input id="debug-filter-owner" type="text" placeholder="留空 = 不过滤" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>endpoint 过滤（子串匹配）</label>
+                    <input id="debug-filter-endpoint" type="text" placeholder="如 /v1/messages" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>模型过滤（子串匹配）</label>
+                    <input id="debug-filter-model" type="text" placeholder="如 grok" autocomplete="off">
+                  </div>
+                  <div class="setting-field">
+                    <label>单日最多条数 <span class="env">GATEWAY_DEBUG_MAX_ENTRIES</span></label>
+                    <input id="debug-max-entries" type="number" min="0" step="100">
+                    <div class="hint">超过按最旧清理（LRU）。默认 2000。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>总体积上限（字节） <span class="env">GATEWAY_DEBUG_MAX_TOTAL_BYTES</span></label>
+                    <input id="debug-max-total-bytes" type="number" min="0" step="10485760">
+                    <div class="hint">超过从最旧的日期目录删起。默认 209715200（200MB）。</div>
+                  </div>
+                </div>
+              </div>
+              <div class="settings-block">
+                <h3>模型额度分桶</h3>
+                <p class="lede">Cursor 自家模型与第三方模型的额度是两个池子。某类模型额度耗尽只让 key 避开那一类（标记 1 小时到期，或一次成功自动清除），账号级欠费（402）才会整把禁用。下表手工维护「模型 → 桶」：表里查不到时按目录 vendor 推断（Cursor 系归 cursor 桶），再查不到按 default。</p>
+                <div class="setting-field">
+                  <label>分桶表 JSON（<code>{"models": {...}, "default": "other"}</code>，模型名小写、桶取 cursor / other）</label>
+                  <textarea id="quota-buckets-json" rows="8" style="font-family:ui-monospace,monospace" spellcheck="false" placeholder='{"models": {"composer": "cursor", "claude-4-sonnet": "other"}, "default": "other"}'></textarea>
+                  <div class="hint">留空保存 = 清空模型表（全靠 vendor 推断 + default）。文件：data/model-quota-buckets.json。</div>
+                </div>
+                <div class="row" style="margin-top:8px">
+                  <button id="btn-save-quota-buckets">保存分桶表</button>
+                  <span class="muted small" id="quota-buckets-hint"></span>
+                </div>
               </div>
               <div class="row">
                 <button id="btn-save-settings">保存设置</button>
@@ -1072,6 +1210,28 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (name === 'history') loadLogs();
     if (name === 'proxy') loadProxy();
     if (name === 'bot') loadBot();
+    // 包 B：分桶表是独立端点（不在 overview 里），进设置页时拉一次。刻意不挂到 10 秒轮询：
+    // textarea 正在被编辑时被轮询覆写，跟 applySettingsForm 的聚焦保护同一个道理。
+    if (name === 'settings') loadQuotaBuckets();
+  }
+
+  /** 包 B：回填模型额度分桶表编辑框。用户正在编辑时不覆盖（保存后由本函数主动刷新）。 */
+  function loadQuotaBuckets(force){
+    var box = $('quota-buckets-json');
+    if (!box) return;
+    if (!force && document.activeElement === box) return;
+    api('GET', '/admin/api/quota-buckets').then(function(data){
+      if (force && document.activeElement === box) return;
+      var table = data.table || {};
+      var models = table.models || {};
+      var lines = Object.keys(models).sort().map(function(model){
+        return '  "' + model + '": "' + models[model] + '"';
+      });
+      box.value = '{\n  "models": {\n' + (lines.length ? lines.join(',\n') + '\n' : '') + '  },\n  "default": "' + (table.default || 'other') + '"\n}';
+      $('quota-buckets-hint').textContent = '';
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') $('quota-buckets-hint').textContent = '读取失败：' + err.message;
+    });
   }
 
   /* ------------------------------------------------ Cursor Bot 面板 */
@@ -1149,6 +1309,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       var badge = item.status === 'active' ? '<span class="chip ok">● 可用</span>' : '<span class="chip bad">● 停用</span>';
       var warn = item.tokenType === 'web' ? ' <span class="chip bad">web token</span>' : '';
       if (item.sourceCursorKeyId) warn += ' <span class="chip">Key 池</span>';
+      // 包 B：额度桶耗尽标记。凭据仍可用，只是该桶的模型暂时避开它。
+      var buckets = item.exhaustedBuckets || {};
+      var bucketNames = Object.keys(buckets).filter(function(name){ return buckets[name] && Date.parse(buckets[name]) > Date.now(); });
+      if (bucketNames.length) {
+        warn += ' <span class="chip warn" title="该桶的模型额度耗尽：选凭据时暂时避开，到期或一次成功后自动恢复">额度桶：' + esc(bucketNames.join(', ')) + '</span>';
+      }
       var actions = [
         '<button data-bot-copy="' + esc(item.id) + '" title="复制完整 session token 到剪贴板（页面不显示明文）">复制</button>',
         '<button data-bot-test="' + esc(item.id) + '">测试</button>',
@@ -1329,6 +1495,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     for (var i = 0; i < boxes.length; i++) if (boxes[i].checked) out.push(boxes[i].value);
     return out;
   }
+  // Bot 侧的强制名单用逗号分隔文本框（Bot 目录与 SDK 目录不同，不复用上面的勾选列表）。
+  function parseBotModelList(value){
+    return (value || '').split(',').map(function(id){ return id.trim(); }).filter(Boolean);
+  }
   // 重建列表前把 DOM 勾选现状写回 policySelected。只在列表已渲染（有 checkbox）时收集：
   // 列表还没建过（空目录占位）时 DOM 里没有用户可改的东西，回写空数组反而会清掉手动添加项。
   function syncPolicySelection(dim){
@@ -1361,7 +1531,34 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('reasoning-effort').value = cfg.cursorReasoningEffort || '';
     $('agent-mode').value = cfg.cursorAgentMode || '';
     $('model-params').value = cfg.cursorModelParams || '';
+    // 包 A：Bot 侧覆盖回填。botOverrides 的 null/空 = 未覆盖（跟随上面的公共默认）。
+    // Bot 的策略是四态（多一个「跟随公共默认」），不能复用 applyPolicyForm（它只认三态）。
+    var bot = cfg.botOverrides || {};
+    $('bot-fast-policy').value = bot.fastPolicy || '';
+    $('bot-max-mode-policy').value = bot.maxModePolicy || '';
+    togglePolicyModelsField('bot-fast');
+    togglePolicyModelsField('bot-max-mode');
+    $('bot-fast-models').value = (bot.fastModels || []).join(', ');
+    $('bot-max-mode-models').value = (bot.maxModeModels || []).join(', ');
+    $('bot-reasoning-effort').value = bot.reasoningEffort || '';
+    $('bot-agent-mode').value = bot.agentMode || '';
+    $('bot-model-params').value = bot.modelParams || '';
+    $('bot-send-tools').value = bot.sendTools == null ? '' : (bot.sendTools ? 'on' : 'off');
+    $('bot-codec').value = bot.codec || '';
+    $('bot-request-timeout').value = bot.requestTimeoutMs == null ? '' : bot.requestTimeoutMs;
+    $('bot-auto-disable').value = bot.autoDisableKeys == null ? '' : (bot.autoDisableKeys ? 'on' : 'off');
+    $('bot-auto-disable-threshold').value = bot.autoDisableThreshold == null ? '' : bot.autoDisableThreshold;
+    applyDebugForm(cfg);
     renderBootEnv(cfg);
+  }
+  function applyDebugForm(cfg){
+    $('debug-toggle').checked = cfg.debugEnabled === true;
+    var filters = cfg.debugFilters || {};
+    $('debug-filter-owner').value = filters.owner || '';
+    $('debug-filter-endpoint').value = filters.endpoint || '';
+    $('debug-filter-model').value = filters.model || '';
+    $('debug-max-entries').value = cfg.debugMaxEntries == null ? 2000 : cfg.debugMaxEntries;
+    $('debug-max-total-bytes').value = cfg.debugMaxTotalBytes == null ? 209715200 : cfg.debugMaxTotalBytes;
   }
   function renderBootEnv(cfg){
     var rows = [
@@ -1553,6 +1750,13 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       if (key.status === 'active' && key.failureCount > 0) {
         reason += '<span class="muted small">连续失败 ' + key.failureCount + ' / ' + autoDisableThreshold + ' 次</span>';
       }
+      // 包 B：额度桶耗尽标记（桶名 → 截止时间）。key 仍可用，只是该桶的模型暂时避开它。
+      var buckets = key.exhaustedBuckets || {};
+      var bucketNames = Object.keys(buckets).filter(function(name){ return buckets[name] && Date.parse(buckets[name]) > Date.now(); });
+      if (bucketNames.length) {
+        reason += '<span class="badge disabled" title="该桶的模型额度耗尽：选 key 时暂时避开，到期或一次成功后自动恢复">'
+          + '额度桶耗尽：' + esc(bucketNames.join(', ')) + '</span>';
+      }
       if (key.lastError) reason += '<div class="err-text">' + esc(key.lastError) + '</div>';
       var order = '<div class="actions" style="flex-wrap:nowrap;align-items:center">'
         + '<span class="muted mono" style="min-width:18px;text-align:right">' + (index + 1) + '</span>'
@@ -1567,6 +1771,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         actions += '<button data-action="disable" data-id="' + esc(key.id) + '">禁用</button>';
       } else {
         actions += '<button data-action="enable" data-id="' + esc(key.id) + '">启用</button>';
+      }
+      // 包 B：清除额度桶标记（只动桶标记，与 enable 的「清失败计数」语义分开），无标记时不占位。
+      if (Object.keys(key.exhaustedBuckets || {}).length) {
+        actions += '<button data-action="clear-quota" data-id="' + esc(key.id) + '" title="清除额度桶耗尽标记（不改变 key 的启用状态）">清除额度标记</button>';
       }
       actions += '<button class="danger" data-action="delete" data-id="' + esc(key.id) + '">删除</button>';
       html += '<tr>'
@@ -1752,6 +1960,10 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var lines = [];
     var tip = paramsTip(log.modelParams);
     lines.push('model.params: ' + (tip || '—'));
+    if (log.abortReason) {
+      // 包 C：499 行上的 abort 归因——client_disconnect / idle_timeout / upstream_canceled / local_abort。
+      lines.push('abortReason: ' + log.abortReason);
+    }
     if (log.usage) {
       lines.push('tokens: in=' + (log.usage.inputTokens || 0)
         + ' out=' + (log.usage.outputTokens || 0)
@@ -1787,7 +1999,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '<td><span class="badge ' + esc(log.authMode || '') + '">' + esc(log.authMode || '—') + '</span></td>'
         + '<td class="muted small">' + esc(log.keyLabel || '—') + '</td>'
         + '<td class="muted small">' + esc(log.gatewayKeyLabel || '—') + '</td>'
-        + '<td><span class="badge ' + statusClass(log.status) + '">' + esc(log.status) + '</span></td>'
+        + '<td><span class="badge ' + statusClass(log.status) + '">' + esc(log.status) + '</span>'
+        + (log.abortReason ? ' <span class="muted small" title="流式请求被 abort 的归因（包 C）">' + esc(log.abortReason) + '</span>' : '')
+        + '</td>'
         + '<td class="muted">' + (log.durationMs == null ? '—' : (log.durationMs / 1000).toFixed(1) + 's') + '</td>'
         + '<td>' + boolMark(log.stream) + '</td>'
         + '<td class="muted small">' + paramCell(log, 'reasoningEffort', esc(log.reasoningEffort || '—')) + '</td>'
@@ -1800,6 +2014,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         + '<td>' + (log.error ? '<div class="err-text">' + esc(log.error) + '</div>' : '<span class="muted">—</span>')
         + '<button data-action="expand" data-i="' + i + '" style="margin-top:4px;padding:2px 8px;font-size:11px">详情</button>'
         + '<div class="log-detail hidden" id="log-extra-' + i + '">' + esc(logExtra(log)) + '</div>'
+        + '<button data-action="debug-snapshot" data-i="' + i + '" data-log-id="' + esc(log.id || '') + '" style="margin-top:4px;padding:2px 8px;font-size:11px">Debug 快照</button>'
+        + '<div class="log-detail hidden" id="log-debug-' + i + '" style="max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all">'
+        + '</div>'
         + '</td>'
         + '</tr>';
     });
@@ -2443,6 +2660,8 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   });
   $('fast-policy').addEventListener('change', function(){ togglePolicyModelsField('fast'); });
   $('max-mode-policy').addEventListener('change', function(){ togglePolicyModelsField('max-mode'); });
+  $('bot-fast-policy').addEventListener('change', function(){ togglePolicyModelsField('bot-fast'); });
+  $('bot-max-mode-policy').addEventListener('change', function(){ togglePolicyModelsField('bot-max-mode'); });
   $('fast-models-add').addEventListener('click', function(){ addPolicyModel('fast'); });
   $('max-mode-models-add').addEventListener('click', function(){ addPolicyModel('max-mode'); });
   $('btn-test-proxy').addEventListener('click', function(){
@@ -2470,6 +2689,40 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     });
   });
 
+  // 包 B：分桶表独立保存（不混进「保存设置」——那张表是文件不是 env，字段错了也不该挡住别的设置）。
+  $('btn-save-quota-buckets').addEventListener('click', function(){
+    var raw = $('quota-buckets-json').value.trim();
+    var table;
+    if (!raw) {
+      table = { models: {}, default: 'other' };
+    } else {
+      try {
+        table = JSON.parse(raw);
+      } catch (err) {
+        toast('不是合法的 JSON：' + err.message, true);
+        return;
+      }
+      if (!table || typeof table !== 'object' || Array.isArray(table)) { toast('分桶表需是 {"models": {...}, "default": ...} 对象', true); return; }
+      if (table.models == null) table.models = {};
+      if (table.default !== 'cursor' && table.default !== 'other') {
+        toast('default 需为 "cursor" 或 "other"', true);
+        return;
+      }
+      var bad = Object.keys(table.models).filter(function(model){
+        return !model.trim() || (table.models[model] !== 'cursor' && table.models[model] !== 'other');
+      });
+      if (bad.length) { toast('模型项的桶只能是 "cursor" / "other"：' + bad[0], true); return; }
+    }
+    var button = this;
+    button.disabled = true;
+    api('PUT', '/admin/api/quota-buckets', { table: table }).then(function(){
+      toast('已保存分桶表');
+      loadQuotaBuckets(true);
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') toast('保存失败：' + err.message, true);
+    }).finally(function(){ button.disabled = false; });
+  });
+
   $('btn-save-settings').addEventListener('click', function(){
     var threshold = parseInt($('auto-disable-threshold').value, 10);
     if (!(threshold >= 1 && threshold <= 50)) { toast('连续失败次数需为 1-50 的整数', true); return; }
@@ -2487,6 +2740,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     if (!(maxAttempts >= 1 && maxAttempts <= 100)) { toast('轮换次数需为 1–100', true); return; }
     var transient = parseInt($('max-transient-attempts').value, 10);
     if (!(transient >= 1 && transient <= 50)) { toast('软失败重试需为 1–50', true); return; }
+    var debugEntries = parseInt($('debug-max-entries').value, 10);
+    if (!(debugEntries >= 0 && debugEntries <= 1000000)) { toast('Debug 单日条数需为 0–1000000 的整数', true); return; }
+    var debugBytes = parseInt($('debug-max-total-bytes').value, 10);
+    if (!(debugBytes >= 0 && debugBytes <= 107374182400)) { toast('Debug 总体积需为 0–107374182400 的整数', true); return; }
+    // 包 A：Bot 侧覆盖。「跟随」/ 留空 = null（恢复跟随公共默认）；策略四态里的空串同样转 null。
+    var botTimeoutRaw = $('bot-request-timeout').value.trim();
+    var botTimeout = botTimeoutRaw ? parseInt(botTimeoutRaw, 10) : null;
+    if (botTimeout !== null && !(botTimeout >= 5000)) { toast('Bot 上游超时至少 5000 ms', true); return; }
+    var botThresholdRaw = $('bot-auto-disable-threshold').value.trim();
+    var botThreshold = botThresholdRaw ? parseInt(botThresholdRaw, 10) : null;
+    if (botThreshold !== null && !(botThreshold >= 1 && botThreshold <= 50)) { toast('Bot 凭据禁用阈值需为 1-50 的整数', true); return; }
     var http1Mode = $('sdk-http1-mode').value;
     var body = {
       cursorFastPolicy: $('fast-policy').value,
@@ -2507,7 +2771,30 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       maxTransientAttempts: transient,
       cursorReasoningEffort: $('reasoning-effort').value,
       cursorAgentMode: $('agent-mode').value,
-      cursorModelParams: $('model-params').value
+      cursorModelParams: $('model-params').value,
+      debugEnabled: $('debug-toggle').checked,
+      debugMaxEntries: debugEntries,
+      debugMaxTotalBytes: debugBytes,
+      debugFilters: {
+        owner: $('debug-filter-owner').value.trim() || null,
+        endpoint: $('debug-filter-endpoint').value.trim() || null,
+        model: $('debug-filter-model').value.trim() || null
+      },
+      // 包 A：Bot 侧运行设置覆盖，整包提交（后端按字段合并落库，互不影响 SDK 侧）。
+      botOverrides: {
+        fastPolicy: $('bot-fast-policy').value || null,
+        fastModels: parseBotModelList($('bot-fast-models').value),
+        maxModePolicy: $('bot-max-mode-policy').value || null,
+        maxModeModels: parseBotModelList($('bot-max-mode-models').value),
+        reasoningEffort: $('bot-reasoning-effort').value || null,
+        agentMode: $('bot-agent-mode').value || null,
+        modelParams: $('bot-model-params').value.trim() || null,
+        sendTools: $('bot-send-tools').value === '' ? null : $('bot-send-tools').value === 'on',
+        codec: $('bot-codec').value || null,
+        requestTimeoutMs: botTimeout,
+        autoDisableKeys: $('bot-auto-disable').value === '' ? null : $('bot-auto-disable').value === 'on',
+        autoDisableThreshold: botThreshold
+      }
     };
     // 只有真的操作过这个控件才提交 null/布尔值；未触碰时省略字段，
     // 否则旧页面把「未设置」送给后端会清掉另一位管理员刚保存的显式选择。
@@ -2578,6 +2865,17 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         .catch(function(err){ if (err.message !== 'unauthorized') toast(err.message, true); });
       return;
     }
+    if (action === 'clear-quota') {
+      // 包 B：只清额度桶标记（连它兑换出的 Bot 凭据一起清），不是禁用/启用。
+      button.disabled = true;
+      api('POST', '/admin/api/keys/' + encodeURIComponent(id) + '/clear-quota').then(function(){
+        toast('已清除额度标记');
+        loadAll();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast(err.message, true);
+      }).finally(function(){ button.disabled = false; });
+      return;
+    }
     api('POST', '/admin/api/keys/' + id + '/' + action).then(function(){
       toast(action === 'enable' ? '已启用' : '已禁用');
       loadAll();
@@ -2610,10 +2908,37 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   });
 
   $('logs-body').addEventListener('click', function(event){
-    var button = event.target.closest('button[data-action="expand"]');
-    if (!button) return;
-    var box = $('log-extra-' + button.getAttribute('data-i'));
-    if (box) box.classList.toggle('hidden');
+    var expand = event.target.closest('button[data-action="expand"]');
+    if (expand) {
+      var box = $('log-extra-' + expand.getAttribute('data-i'));
+      if (box) box.classList.toggle('hidden');
+      return;
+    }
+    var debug = event.target.closest('button[data-action="debug-snapshot"]');
+    if (!debug) return;
+    var logId = debug.getAttribute('data-log-id') || '';
+    var debugBox = $('log-debug-' + debug.getAttribute('data-i'));
+    if (!debugBox || !logId) return;
+    // 再点一次收起，跟「详情」的交互保持一致。
+    if (!debugBox.classList.contains('hidden')) {
+      debugBox.classList.add('hidden');
+      return;
+    }
+    debugBox.textContent = '加载中…';
+    debugBox.classList.remove('hidden');
+    api('GET', '/admin/api/logs/' + encodeURIComponent(logId) + '/debug').then(function(data){
+      if (!data || !data.found) {
+        debugBox.textContent = '无快照（未开启 Debug、不在过滤范围或已过期清理）';
+        return;
+      }
+      if (data.parseError) {
+        debugBox.textContent = '快照文件存在但无法解析（JSON 损坏）';
+        return;
+      }
+      debugBox.textContent = JSON.stringify(data.snapshot, null, 2);
+    }).catch(function(err){
+      debugBox.textContent = '加载快照失败：' + err.message;
+    });
   });
   $('btn-log-apply').addEventListener('click', function(){
     logOffset = 0;

@@ -142,6 +142,7 @@ const SCHEMA = `
     allowed_models TEXT,
     excluded_models TEXT,
     failure_count INTEGER NOT NULL DEFAULT 0,
+    exhausted_buckets TEXT,
     last_used_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
@@ -284,6 +285,11 @@ export interface BotCredential {
   allowedModels?: string[];
   excludedModels?: string[];
   failureCount: number;
+  /**
+   * 额度分桶（包 B）：桶名 → 耗尽截止时间（ISO）。某个桶的模型额度耗尽时只标该桶，
+   * 凭据保持 active，pickCredential 避开该桶；到期或一次成功即清。空 / 缺省 = 没有标记。
+   */
+  exhaustedBuckets?: Record<string, string>;
   lastUsedAt?: string;
   lastError?: string;
   createdAt: string;
@@ -356,7 +362,9 @@ export class CursorBotStore {
       ["bot_tool_calls", "idempotency_key", "TEXT"],
       ["bot_conversations", "latest_event_seq", "INTEGER NOT NULL DEFAULT 0"],
       ["bot_credentials", "note", "TEXT"],
-      ["bot_credentials", "source_cursor_key_id", "TEXT"]
+      ["bot_credentials", "source_cursor_key_id", "TEXT"],
+      // 包 B：额度桶标记（桶名 → 耗尽截止时间）。可空，老记录读出来是 undefined = 无标记。
+      ["bot_credentials", "exhausted_buckets", "TEXT"]
     ];
     for (const [table, column, type] of columns) {
       if (this.hasColumn(table, column)) continue;
@@ -567,7 +575,17 @@ export class CursorBotStore {
       .run(status, this.iso(), id);
   }
 
-  recordCredentialUse(id: string): void {
+  recordCredentialUse(id: string, bucket?: string): void {
+    // 包 B：一次成功即清该桶标记（与 key 池 recordSuccess 同一口径）。bucket 未知时不动标记——
+    // 目录连通性测试成功只证明账号活着，不代表模型额度恢复。
+    if (bucket) {
+      const current = this.credential(id)?.exhaustedBuckets;
+      if (current?.[bucket]) {
+        const next = { ...current };
+        delete next[bucket];
+        this.setCredentialExhaustedBuckets(id, Object.keys(next).length ? next : undefined);
+      }
+    }
     this.db
       .prepare("UPDATE bot_credentials SET last_used_at = ?, failure_count = 0, last_error = NULL WHERE id = ?")
       .run(this.iso(), id);
@@ -579,6 +597,29 @@ export class CursorBotStore {
       .prepare("UPDATE bot_credentials SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
       .run(error.slice(0, 400), this.iso(), id);
     return Number(this.db.prepare("SELECT failure_count FROM bot_credentials WHERE id = ?").get(id)?.failure_count ?? 0);
+  }
+
+  /** 整包替换额度桶标记（包 B）。undefined = 清空。 */
+  setCredentialExhaustedBuckets(id: string, buckets: Record<string, string> | undefined): void {
+    this.db
+      .prepare("UPDATE bot_credentials SET exhausted_buckets = ?, updated_at = ? WHERE id = ?")
+      .run(buckets && Object.keys(buckets).length ? JSON.stringify(buckets) : null, this.iso(), id);
+  }
+
+  /** 标记某个额度桶耗尽（包 B）：凭据保持 active，只留错误痕迹供排查。 */
+  markCredentialBucketExhausted(id: string, bucket: string, expiresAt: string, detail?: string): void {
+    const current = this.credential(id)?.exhaustedBuckets;
+    this.setCredentialExhaustedBuckets(id, { ...(current ?? {}), [bucket]: expiresAt });
+    if (detail) {
+      this.db
+        .prepare("UPDATE bot_credentials SET last_error = ?, updated_at = ? WHERE id = ?")
+        .run(detail.slice(0, 400), this.iso(), id);
+    }
+  }
+
+  /** 后台/联动清除全部额度桶标记（包 B）。 */
+  clearCredentialQuotaBuckets(id: string): void {
+    this.setCredentialExhaustedBuckets(id, undefined);
   }
 
   /* -------------------------------------------------------------- run */
@@ -1024,6 +1065,8 @@ export class CursorBotStore {
   }
 
   private mapCredential(row: Record<string, unknown>): BotCredential {
+    // 包 B：先解析额度桶标记，解析不出（脏 JSON / 空列）当无标记，不挡选路。到期判断在选路时做。
+    const exhaustedBuckets = parseBuckets(optional(row.exhausted_buckets));
     return {
       id: row.id as string,
       label: optional(row.label),
@@ -1043,6 +1086,7 @@ export class CursorBotStore {
       allowedModels: parseList(optional(row.allowed_models)),
       excludedModels: parseList(optional(row.excluded_models)),
       failureCount: Number(row.failure_count ?? 0),
+      ...(exhaustedBuckets ? { exhaustedBuckets } : {}),
       lastUsedAt: optional(row.last_used_at),
       lastError: optional(row.last_error),
       createdAt: row.created_at as string,
@@ -1056,6 +1100,21 @@ function parseList(json: string | undefined): string[] | undefined {
   if (!json) return undefined;
   const parsed = safeParse(json);
   return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : undefined;
+}
+
+/**
+ * 包 B：解析额度桶标记列（桶名 → 截止时间）。只保留合法的 string→string 项，
+ * 脏 JSON / 非对象一律当无标记——读不出来不能挡着凭据选路。
+ */
+function parseBuckets(json: string | undefined): Record<string, string> | undefined {
+  if (!json) return undefined;
+  const parsed = safeParse(json);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const buckets: Record<string, string> = {};
+  for (const [bucket, expiresAt] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof expiresAt === "string" && expiresAt) buckets[bucket] = expiresAt;
+  }
+  return Object.keys(buckets).length ? buckets : undefined;
 }
 
 export function isTerminal(status: RunStatus): boolean {

@@ -255,6 +255,10 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
   const system = contentText(record.system);
   if (system) result.system.push(system);
 
+  // tool_result 块只带 tool_use_id，工具名要从同对话上文里同 id 的 tool_use 找回；
+  // proto 的 InferenceToolResultPart.tool_name 有真实字段，留空会让上游看到匿名结果。
+  const toolNameById = new Map<string, string>();
+
   for (const raw of asArray(record.messages)) {
     const message = asRecord(raw);
     // 小写归一：`"Assistant"` 落到 user 分支的话，该消息的 tool_use 与 thinking 会被整段丢掉。
@@ -293,7 +297,10 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
         case "tool_use": {
           const id = stringOr(block.id, "");
           const name = stringOr(block.name, "");
-          if (id && name) toolCalls.push({ id, name, arguments: toolArguments(block.input) });
+          if (id && name) {
+            toolCalls.push({ id, name, arguments: toolArguments(block.input) });
+            toolNameById.set(id, name);
+          }
           break;
         }
         case "tool_result": {
@@ -301,7 +308,7 @@ function parseAnthropic(record: Record<string, unknown>): ParsedInbound {
           if (!id) break;
           toolResults.push({
             toolCallId: id,
-            toolName: "",
+            toolName: toolNameById.get(id) ?? "",
             result: parseMaybeJson(contentText(block.content)),
             isError: block.is_error === true
           });

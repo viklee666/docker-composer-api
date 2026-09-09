@@ -102,10 +102,28 @@ test("upgrading an old database keeps existing rows and backfills new columns", 
   assert.equal(logs.logs[0].id, "log-old");
   assert.equal(logs.logs[0].usage, undefined, "old rows report no usage rather than zeroes");
   assert.equal(logs.logs[0].effectiveParams, undefined, "老记录没有实测标记，后台据此把三列都按请求意图展示");
+  // 包 C：abort_reason 是后加的列，老记录读出来必须是 undefined 而不是 null / 空串。
+  assert.equal(logs.logs[0].abortReason, undefined, "老记录没有 abort 归因");
 
   // 迁移必须可重复执行：进程重启会再跑一遍。
   const reopened = new SqliteStateStore(path);
   assert.equal((await reopened.listCursorKeys()).length, 1);
+});
+
+test("abort reason round-trips through sqlite and rejects unknown values", async () => {
+  const store = new SqliteStateStore(tempDbPath());
+  for (const reason of ["client_disconnect", "idle_timeout", "upstream_canceled", "local_abort"] as const) {
+    await store.insertRequestLog(log({ id: `abort-${reason}`, status: 499, stream: true, abortReason: reason }));
+  }
+  // 未带归因的正常行落 NULL，读回来是 undefined。
+  await store.insertRequestLog(log({ id: "abort-none", status: 200, stream: true }));
+
+  const logs = (await store.listRequestLogs({ limit: 10 })).logs;
+  const byId = new Map(logs.map((entry) => [entry.id, entry]));
+  for (const reason of ["client_disconnect", "idle_timeout", "upstream_canceled", "local_abort"] as const) {
+    assert.equal(byId.get(`abort-${reason}`)?.abortReason, reason, `${reason} 必须可读回`);
+  }
+  assert.equal(byId.get("abort-none")?.abortReason, undefined, "未 abort 的请求不落归因");
 });
 
 test("cursor key model scope and weight round-trip through sqlite", async () => {

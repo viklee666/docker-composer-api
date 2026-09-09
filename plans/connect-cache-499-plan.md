@@ -1,536 +1,578 @@
-# 缓存命中与 499：单一方案计划（Connect 单发单收 + 稳定 conversation_id）
+# Debug 模式 / 499 / 轮次错位 / Bot 工具 / 运行设置隔离 / 额度分桶 —— 修复计划 v2
 
-> 目标：同时满足「上游 prompt 缓存命中率显著上升」与「不再触发 499」。
-> 本文只给**一个**方案。被否决的替代路线在 §4 说明为什么不选。
-> 版本基线：`855fc50`（v0.4.2）。部署方式：服务器 `git pull` + `sudo docker compose up -d --build`。
-
-## 1. 根因（已闭合，无需上游假设）
-
-### 1.1 上游缓存的真实口径（xAI 官方）
-
-- 缓存**自动开启、无写入费用**，命中部分按 0.25x 计费，块粒度 128 token。
-  → **`Cache Write` 恒为 0 是 Grok 家族的正常表现，不是故障信号。唯一可用信号是 `Cache Read`。**
-- 缓存条目**按服务器存储**。官方要求用 `x-grok-conv-id`（Responses API 侧是 `prompt_cache_key`）把同一段对话的请求**路由到同一台服务器**，否则即使前缀一致也读不到缓存。
-- 多轮硬约束：**绝不可编辑 / 删除 / 重排早先消息，只能追加**；推理模型必须把上一轮的 `reasoning_content` 原样回传。
-- 缓存可随时被驱逐；命中不保证。
-
-结论：命中率取决于两件事同时成立 ——「前缀逐字节稳定且只追加」+「同一段对话稳定落在同一台上游服务器」。
-
-### 1.2 观测数据的解释
-
-| 行 | Tokens | Cache Read | Input | Output | 机制 |
-|---|---|---|---|---|---|
-| A | 1.1万 | 5,248 | 5,495 | 451 | 正常完成的小请求，命中了上游共享系统前缀 |
-| B | 17.2万 | **0** | 171,965 | 385 | **整段对话被 flatten 成一条新 user，发给一个全新会话** |
-| C | 2.8万 | — | — | — | 同批次的第三条 |
-
-B 行的形状（input 17 万 / output 385）就是「模型刚吐出一个工具调用就被网关收尾」，且 `Cache Read=0` 说明这条请求在上游是**一段全新对话**。
-
-### 1.3 代码侧四条根因
-
-1. **每个 Agent 实例 = 一个新的上游 `conversation_id`。** `Agent.create()` 生成 `agent-${randomUUID()}`；local run 传 `sessionId: this.agentId`；本地 runtime 把它当 `conversationId` 写进 `AgentRunRequest.conversation_id`。这是上游唯一的会话主键，也是服务器亲和键的唯一候选。**新 agent = 新 conv id = 落到没有该前缀的服务器 = Cache Read 归零。** 同时 `Agent.create` 每次生成新的随机 32 字节 `blobEncryptionKey`（SDK 自己的类型注释写明该头用于「让服务端保持跨轮 blob 缓存存活」），只有 `Agent.resume` 才复用。
-2. **中断一次即毁掉 agent。** 客户端按 ESC / socket close → `cursor-runner.ts:797-809` 在无 pending、非 path B 时直接 `throw 499`，**跳过 `markIdle`**，state 仍是 `running` → `streamDurable` 的 finally 落到 `dropDurableSession`（`:256-262`），agent 与落库映射一起消失。**这条路径不打任何日志**，所以此前一直没被发现。
-3. **drop 之后新槽首发不含任何历史。** `formatDurableUserMessage`（`:1489-1498`）= `STABLE_DIRECTIVE + 截断到 4000 字的 SYSTEM + 最后一条 user 文本`。前面 N 轮一个字都没有。用户看到的「重复说上一轮开头」不是复读，是**在没有上下文的情况下重新开了一次头**。
-4. **主对话与同模型子代理撞同一把 Hub 锁。** Claude Code 对主 agent 与 Task 子 agent 发**同一个** `x-claude-code-session-id`；网关的 `explicitSessionIdFromHeaders`（`durable-id.ts:74-89`）认这个头但**忽略** `x-claude-code-agent-id`。于是两者算出同一个 Hub 键：谁先拿锁谁赢，另一个被 `tryAcquire` 挤成 `forceStateless` → 整段 flatten（这就是 B 行）；若子 agent 拿到锁，它不同的 `toolsFingerprint` 还会顺手 drop 掉主对话的槽。
-
-四条叠成闭环：中断或并发一次 → 丢 agent → 下一轮全新 conv id + 无历史 → Cache Read 归零 + 模型失忆。
-
-## 1.5 路线修订（2026-09-03，三份开源取证之后）
-
-**本节推翻本文档原先的首选路线。** 原方案把 Claude Code 流量切到 Connect 单发单收；新证据表明**先把 SDK 路线修对更划算**，Connect 降为备选。三条证据：
-
-### 1.5.1 决定性的一条：Connect 单发单收会**丢掉我们已有的最大优化**
-
-我们的 SDK 路线已经实现了「held execute」（path A）：HTTP1 让 `customTools.execute` 返回一个挂起的 Promise、Run 保持打开；HTTP2 带 `tool_result` 进来时 `resolvePending` 让**同一条 Run** 继续。单测已锁死这个语义（`tests/cursor-durable-runner.test.ts`：`http2.runId === http1.runId` 且 `agent.sends.length === 1`）。
-
-**工具续轮的代价因此是「几百字节」，而不是「重发整段历史」。**
-
-`wisdgod/cursor-api` 用另一套机制做同一件事（把上游双向流 park 起来，下一轮只往还开着的流里写一个 `ClientSideToolV2Result` 帧，`src/core/stream/session.rs`），并且它是那五个逆向项目里唯一做到的。这反过来证明这个优化的价值 —— 它是 flatten 问题的真正解法。
-
-而 **Connect 单发单收结构上做不到这一点**：每个 HTTP 独立，工具续轮必须把全量结构化历史再发一遍。即使前缀缓存命中 90%，170k token 仍要付 `0.25×153k + 17k ≈ 55k` 等价 token；held execute 是 **≈0**。Claude Code 是极度工具密集的客户端（每轮多次工具调用），这个差距会主导账单。
-
-### 1.5.2 §1.3 的四条根因**全部在我们自己的代码里**，不是 SDK 的硬限制
-
-| 根因 | 原判断 | 修订后 |
-|---|---|---|
-| 1 conv_id 每次变 | 「只能靠 create→resume 间接控制」 | **`AgentOptions.agentId` 是公开字段**（`options.d.ts:335`），可直接传确定性值。两个参照项目都没用（`pi-cursor-sdk` 代码注释里写明知道它存在）。这是直接控制，不是绕 |
-| 2 中断毁槽 | 需修 | 8 行（阶段 -1），与 provider 无关 |
-| 3 新槽无历史 | 需修 | 修好 1+2 后 drop 变罕见；真需要重建时按参照项目做法回落全量 flatten |
-| 4 主/子代理撞键 | 需修 | 认 `x-claude-code-agent-id` 即可 |
-
-唯一真正的 SDK 硬限制是 `RequestContext` legacy 全量内联 —— 但我们已经是 `settingSources: []` + 容器内空 `/workspace`，**内联内容是稳定的**，因此它进的是可缓存前缀，不是每轮变化的噪声。这正是 `cursor-sdk2api` 刻意采用的做法，而 `pi-cursor-sdk` 反着做（`settingSources:["all"]` + 真实 cwd）导致前缀不稳。我们的方向已经对了。
-
-### 1.5.3 SDK 路线有实测背书，Connect 一次成功响应都没有
-
-两个独立项目收敛到同一套做法（§3.5、§3.6），其中一份外部实测 **≈90% 命中**（§3.6.2）。而 Connect 路线的 `exchange_user_api_key` 从未真机跑通、`InferenceService/Stream` 从未解析过一次成功响应。
-
-### 1.5.4 修订后的路线
-
-**主线：修 SDK 路线**（阶段 -1 → 1' → 2'，见 §3）。四条根因逐条修，保留 held execute，保留已有的空 workspace 前缀稳定性。
-
-**备选：Connect**（原 §2 内容全部保留，作为 SDK 路线修完仍不达标时的下一步）。它的结构化历史 / 不截断 system / 无锁这三个优点仍然真实，只是**不足以抵偿 held execute 的损失**。
-
-**两条路线共享的工作**：包 D 可观测性（§2.2 包 D）、`conversation_id` 派生串不含上游 apiKey（§2.2 包 B 的核心教训）—— 这两项无论走哪条都要做。
+> 版本基线：当前工作区（HEAD，含 `855fc50 feat: reuse durable agents from protocol identity waterfall` + `9bd6a38 fix: keep durable agents across turns and client disconnects`）。
+> 部署：`git pull` + `sudo docker compose up -d --build`。
+> 本文档只给**一个**方案，被否决的替代路线在 §4 说明。
+>
+> **硬约束：durable / reuse（park + 复用 agent）策略不许删、不许绕过。** 它是「缓存命中 + 模型能力接近原生」的唯一来源。
+> 本计划所有改动要么不碰 park 路径，要么只在其上加**一致性护栏与回退**，绝不移除复用。
+>
+> v2 相对 v1 的改动见 §0。v1 的三包（A 设置隔离 / B 额度禁用 / C 499）保留了两包半，
+> 但 **499 那一包的根因是错的**，另外补了三件 v1 完全没有的事。
 
 ---
 
-## 2. 备选方案：Connect 单发单收（原首选，现降为备选）
+## -1. 背景（新会话先读这一节）
 
+### -1.1 这个项目是什么
 
-一句话：**不再让上游替我们维护会话状态，改为每次请求把完整结构化历史发过去，并用一个逐字节稳定的 `conversation_id` 保证服务器亲和。**
+一个 Docker 部署的 API 网关，把 Cursor Composer 包成 OpenAI / Anthropic 兼容接口。对外三套协议端点：
+`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（另有 `/v1/messages/count_tokens`、`/v1/models`）。
+带一个 `/admin` 后台：Cursor Key 池、入站网关密钥、请求日志、运行设置、Bot 凭据。
+实际使用场景以 **Claude Code 指向本网关**为主，所以 Anthropic 协议与工具循环的保真度是硬指标。
 
-### 2.1 为什么这条路同时解掉两个问题
+### -1.2 两条上游通道（本计划反复提到的 sdk / bot）
 
-| 问题 | SDK 路线（现状） | Connect 路线（本方案） |
-|---|---|---|
-| 上游会话主键 | `agent-${uuid}`，agent 实例一换就变 | `conversation_id` 由入站身份哈希导出，**同一段对话恒定** |
-| 历史 | 靠上游 checkpoint；drop 后归零 | 每次请求带**全量结构化历史**（客户端本来就发全量），上游无状态 |
-| 并发/中断 | 进程内 Hub 锁 + 状态机；抢锁失败即 flatten，中断即毁槽 | **无锁、无跨请求 agent 生命周期**，每个 HTTP 独立 → 499 的成因结构性不存在 |
-| 缓存可测性 | 只能看用量面板猜 | `extended_usage` 直接给 `cacheRead/cacheWrite`，可分桶统计 |
-| system 位置 | 拼进 user 文本，且 durable 路径截断到 4000 字 | 独立 `role=SYSTEM(4)` 消息，不截断 |
-| 工具历史 | flatten 成 `TOOL RESULT (id):` 纯文本 | 结构化 `tool_calls` / `tool_content` |
-| thinking 连续性 | 网关自造签名，历史 thinking 被丢弃 | `reasoning_parts` 带 `signature` 原样回传（xAI 明确要求） |
-
-Connect 侧的协议层已完备并有 193 条测试全绿：envelope/checksum/头/错误映射/取消/usage 四桶/图片/思考/工具编解码。缺的不是协议，是**接线**。
-
-### 2.2 必须落地的四个包
-
-#### 包 A — 结构化历史接进默认路径（核心，缺它整个方案无意义）
-
-现状缺陷：`provider.ts:133` 只发一条消息 —— `messages.push({role:"user", text: input.prompt})`，而 `input.prompt` 是 `protocol.ts` flatten 出的整串文本。**所以今天的 Connect 路线并没有发结构化历史。**
-
-`conversation.ts` 的 `toPreparedConversation` 三协议解析器（Chat / Responses / Anthropic，含 `thinking`/`redacted_thinking`/`tool_use`/`tool_result`/图片/document 拒绝）已写好，但只在 `service.ts:318` 的 `conversationFor()` 里被调用，而 `conversationFor` 只被 `streamWithTools()` 用；后者要求 `orchestratedTools(input).length > 0`，而该函数在 `sendTools === false`（默认）时直接返回 `[]`。**默认路径根本不走结构化解析。**
-
-改法：
-1. `CursorConnectProviderOptions` 增加 `conversation?: PreparedConversation`；`buildConversation` 用 `conversationMessages(conversation)` 取代 `provider.ts:133` 那一行。
-2. `service.ts` 把 `conversationFor(input, [])` 提到默认路径，两条路共用。
-3. 修 **system 双发**：`service.ts:474` 现在既把 `systemInstructions(input)` 传给 provider，又让 `input.prompt` 里带一份（Anthropic 无条件 `SYSTEM:`，`protocol.ts:206-209`）。二者只能留一个 —— 结构化路径留独立 SYSTEM 消息，`prompt` 不再参与。
-4. 宿主元工具过滤：`conversation.ts` 没有 `isHostMetaTool` 等价物，Claude Code 的 `Task` / `mcp__*` 历史块会以 `tool_use` 进 wire，而 `tools[]` 里已被过滤 → 「声明没有、历史有」。复用 `tool-compat.ts:20-45` 与 `protocol.ts:946-955`。
-5. 图片：`conversation.ts:398-404` 会产出 `source:"url"`，而 `request-builder.ts:187-193` 直接 400。改为 inline（下载转 base64）或在解析阶段就明确拒绝并给可读错误。
-6. 顺手修 `service.ts:474` 一行内两次调用 `systemInstructions(input)`（每次全量重解析 body）。
-7. **工具表序列化必须确定性。** 工具定义位于请求最开头，而 OpenAI 官方明文说路由哈希取「开头 token，**含工具定义**」——这个位置最不该有非确定性。当前两处口径不一致：`prompt-delta.ts:90-95` 算 `toolsFingerprint` 用 `stableStringify`（按 key 排序），而真正进 prompt 的 `protocol.ts:847` 是裸 `JSON.stringify(tool)`（保留入站 key 序）。后果是二者可能**反向失配**：同一组工具换个 key 序 → 指纹相同（不换槽）但 prompt 字节不同（缓存 miss），网关看不出任何异常。Connect 路线的 `buildAgentTool` → `toStruct` 走 `Struct.fromJson`，key 序同样来自入站对象。改法：结构化路径统一用一份稳定序列化，与指纹口径对齐。
-
-
-量级：约 150–250 行生产代码 + 8–12 条测试（每协议一条「wire 上 messages 数与角色序列」+ 一条「system 只出现一次」+ 一条「历史 tool_use 与 tools[] 一致」）。
-
-#### 包 B — conversation_id 的身份与租户隔离
-
-`conversationIdFor`（`provider.ts:195-202`）现在：`reuseDurableAgent===false → randomUUID()`，否则 `stableUuid(durableIdentity(...) + "\0" + model)`。而 `server.ts:888-890` 的 `canReuseDurableAgent(seed)` 已是「有 seed 即 true」，所以 Claude Code 场景下 `conversation_id` **确实稳定**，不会退化成随机 UUID。`provider.ts:185-194` 的注释描述的是 `45f6d27` 的旧行为，已过期，需改写。
-
-必须修的两个真实风险：
-1. **首条 user 相同即撞车。** 无显式头时身份落到第 3 级 CPA DeriveID（`routing.ts:44-59`：instruction 前 50 rune + 完整第一条 user + callerScope）。Claude Code 的 system 前 50 rune 恒定，区分度全靠第一条 user —— 两个都以 `hi` 开头的会话会共用同一个上游 conversation。
-2. **第 3 级不含 ownerHash 时无租户隔离**（`durable-id.ts:26-35` 显式头那一档就是头原值）：两个网关密钥传同一个 `x-session-id` 会共用上游会话。
-
-改法：`conversation_id` 的派生串固定为 `ownerHash \0 identity \0 model`。显式头那一档也要混 ownerHash —— 它是本网关唯一的多租户边界。
-
-**同时必须确认派生串里没有上游 Cursor key 指纹。** 我们现在的 Hub 键 `durable-id.ts:14-19` 混了 `input.apiKey`（上游 key）。在 `fill-first` + session affinity 下它通常稳定，但轮询换 key、或粘性绑定过期（`SESSION_AFFINITY_TTL_MS` 默认 1 小时）之后 Hub 键就会变 —— 这与参照实现 Issue #20 那个「5 账号池 293 决策 / 0 resume」的失效模式是同一个 bug，只是我们的默认配置把它掩盖住了。Connect 路线的 `conversationIdFor` 不含 apiKey，天然避开；但若将来回退到 SDK 路线，这一条要一起修。
-
-
-3. **认 `x-claude-code-agent-id`。** 官方 gateway 协议文档确认该头存在，且只在子代理请求上出现（`x-claude-code-parent-agent-id` 用于嵌套）。把它并入身份派生串，**主对话与 Task 子代理从此拿到不同的 conversation_id**，不再互相污染上游对话。这一条同时消掉 §1.3 第 4 条根因。
-
-#### 包 C — 凭据自动化（用户只有 Cursor API key 时必做）
-
-`api-key-exchange.ts:14` 已实现 `POST {api2}/auth/exchange_user_api_key`（`Authorization: Bearer <crsr_…>`，body `{}`）→ `{accessToken, refreshToken}`，`accessToken` 即 Connect 要的 session JWT，且会拒绝 web token。`service.ts:427-461` 的 `importFromCursorKey` 已把它接到 `cc_credentials`，后台一键在 `admin.ts:417-432`。
-
-缺三件：
-1. **真机从未验证过。** `docs/CURSOR-CONNECT-PROGRESS.md:544` 只到「401 unauthenticated」，本地全是 mock fetch。**这是本方案唯一的硬门槛**（见 §3 阶段 0）。
-2. `refreshToken` 兑换后被丢弃（`service.ts:439-452` 没存），`expires_at` 恒 NULL，无自动续期 → 过期后静默 401，5 次后凭据被自动停用并回落 SDK。改：存 refreshToken，从 JWT 读 `exp` 写 `expires_at`，401 时先重兑换再计失败（`service.ts:499-509`）。
-3. 没有「启动时按 Key 池自动 import」，只有 env 播种与后台按钮。补一个启动钩子。
-
-量级：约 100 行 + 4 条测试。
-
-#### 包 D — 可观测性（必做，否则下次仍然「给不了调试」）
-
-用户这次拿不出日志，是因为诊断信号只有两条通道，且都缺口：
-- `console.error` 门槛是 `status >= 500 || error`（`server.ts:696`），要排查的 401/403/404/499 大多只落库、无 stdout 行。
-- 更严重的黑洞：**`beginLog` 之前抛出的错误既不落 `request_logs`、也不打任何日志** —— `authFor()` 的 401/403、`prepare*()` 的 400、`scopedModelIdentity()` 的 403 全在此列，直接走 `setErrorHandler` → `sendProtocolError`。客户端明明收到错误码，后台一片空白。
-
-改法（全部低风险、纯读、不碰鉴权）：
-1. **`/health` 加构建溯源**：`gitCommit`（build 阶段 `ARG GIT_SHA` 注入）、`builtAt`、`sessionMode`、`provider`、`uptimeSeconds`。有了它，「服务器在跑哪份代码」从「exec 进容器 grep JS」变成一条 curl。注意 `/health` 目前无鉴权公开（`server.ts:187`），只放非敏感字段。
-2. **接上 `src/durable-telemetry.ts`**（已定义好数据结构、尚未接线），在 `/admin/api/overview` 暴露快照：按 provider 分桶的 `cacheRead/(input+cacheRead+cacheWrite)` 命中率、决策计数、`identitySource` 计数（header / body-field / derived-L3 / none）、最近 50 条决策（session id 截前 12 位）。`/health` 只留极简摘要。
-3. `finishLog` 的 console 门槛从 `status>=500` 放宽到 `status>=400`。
-4. `setErrorHandler` 里对未 finish 的请求补一条 `request_logs`（endpoint + status + error，model/key 留空）。
-5. 请求日志加 `provider` 列（`store.ts:117-147` 现无此字段），否则无法按 provider 比命中率。
-
-补充事实（供排查时对号，无需改动）：`REQUEST_LOG_KEEP` 默认 0，而 `trimRequestLogs()` 首行就是 `if (!this.requestLogKeep) return;`（`store.ts:181`）——**0 = 永久全量保留，历史为空绝不可能是自动裁剪造成的**。`docker compose down -v` 会删掉命名卷 `composer-api-data`（`/data/state.sqlite` 在其中），key 池 / 网关密钥 / 运行设置 / 请求历史全部清零；不带 `-v` 的 `down` 保留卷，安全。
-
-
-### 2.3 选路与回滚
-
-`selectProvider`（`router.ts:58-84`）四级优先级：显式头 `x-gateway-provider` > 模型名 `connect/` 前缀 > key 设置 > 全局默认；`connectAvailable===false` 时一律回落 SDK（`:64-67`），请求不会失败。
-
-上线用 `GATEWAY_PROVIDER=connect`。**回滚只需把它改回 `sdk` 并重启**，SDK 路线一行未动。
-
-需要同时处理的三处不一致：
-1. 裸模型名走 connect 时 `isConnectModelId` 为 false（`server.ts:557`），只存在于 Connect 目录的模型 `confirmed=false`；若网关密钥配了任何黑名单 → `denyRuleUnverifiable` fail-closed 403（`server.ts:571-578`）。
-2. 池里无 active Cursor key 时 `/v1/models` 退化成静态兜底表（`models.ts:86-88`）。
-3. `defaultProvider` 目前只能改 env，后台 Connect 面板是只读回显（`admin-ui.ts:964`）。
-
-### 2.4 明确不做
-
-- **不动 SDK 路线的任何代码。** 它继续作为回退路径，`CURSOR_SDK_DISABLE_SESSION_RESUME` / `CURSOR_SDK_SESSION_MODE` 语义不变。
-- **不开 `CURSOR_CONNECT_SEND_TOOLS`。** 「同 conversation_id、新 invocation_id 的第二次 Stream 能否接续」未实测（`provider.ts:40-46`、`tool-loop.ts:80-84`）。Claude Code 自己执行工具，网关只需把结构化历史发上去 —— **单发单收足够**，工具循环留到后续实测。
-- **不填 `InferenceProviderOptions.anthropic.cache_control`。** 该字段在 descriptor 里存在（`inference_pb.ts:1721`、`:1752`），但网关一处都没填，且是否生效未知。拿到一次成功响应 + 命中率基线之后再单独评估。
-- **不接子代理 / background / summary / 事件重放。** `capabilities()` 已诚实报 false。
-- **不做 429 跨凭据 failover。** 单凭据场景可延后（`service.ts:499-509` 现在只对 401/403 计数）。
-
-## 3. 执行阶段与门禁
-
-### 阶段 -1 — 断连不毁槽（**不依赖任何前提，立刻做**）
-
-这一条与 provider 选择无关，是 §1.3 第 2 条根因的直接修复，也是参照实现里唯一 8 行就能抄的东西（§3.5.2 第 1 项）。
-
-改 `cursor-runner.ts:797-809` 的 `http-abort` 分支：当本次 HTTP **已经产出过 text 或 tool_call**（即 `textParts.length || toolCalls.length`）时，走 `hub.markIdle(sessionId)` + 正常 `done` 收尾，**不抛 499、不落进 finally 的 `dropDurableSession`**；只有零语义输出时才保持现在的 499 行为。
-
-验收：新增单测「吐字中 abort → slot 仍存活且 state=idle，agent 未 dispose」；现有 `path B abort after tool_call keeps the idle agent` 保持绿。
-
-做完这一条，「中断一次就失忆 + 缓存归零」立刻消失，无论后面走哪条 provider。
-
-### 阶段 0 — 真机验证（**Connect 备选路线的门闩**；走 SDK 主线可跳过）
-
-
-这是整个方案唯一的不可推导前提。在服务器上执行，目标是拿到一次**成功的 Stream 响应**。
-
-```bash
-# 0.1 先确认容器在跑哪份代码 + durable 是否真开着
-sudo docker compose exec composer-api node -e "console.log(require('./package.json').version)"
-sudo docker compose logs composer-api 2>&1 | grep -E "listening on http|session mode|kill switch|Cursor Connect" | tail -8
-
-# 0.2 确认三条 855fc50 独有标记都在（全为 0 = 容器里是旧代码，先解决部署再谈其它）
-sudo docker compose exec composer-api node -e "const f=p=>require('fs').readFileSync(p,'utf8'),c=(s,r)=>(s.match(r)||[]).length;console.log(JSON.stringify({tryAcquire:c(f('dist/src/session-hub.js'),/tryAcquire/g),deferRunnerStream:c(f('dist/src/server.js'),/deferRunnerStream/g),codexTurnMeta:c(f('dist/src/durable-id.js'),/x-codex-turn-metadata/g)}))"
-
-# 0.3 最近 2 小时的 durable 决策：大量 `send first` 而几乎无 `drop+create` = 命中 §1.3 第 2 条静默毁槽
-sudo docker compose logs composer-api --since 2h 2>&1 | grep -E "\[durable\]|\[session-hub\]|\[request\]" | tail -100
-
-# 0.4 request_logs 最近 20 条（只读打开，不改数据）
-sudo docker compose exec composer-api node -e "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('/data/state.sqlite',{readOnly:true});console.log('total =',d.prepare('SELECT COUNT(*) n FROM request_logs').get().n);console.table(d.prepare('SELECT ts,endpoint,model,status,duration_ms ms,input_tokens inTok,cache_read_tokens cacheRead,output_tokens outTok,usage_source,substr(COALESCE(error,\"\"),1,60) err FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT 20').all());d.close()"
-
-# 0.5 后台「Connect」面板 → 从 Cursor Key 导入凭据（POST /admin/api/connect/credentials/from-key）
-#     成功后点「测试」按钮：它走 AvailableModels(Unary)，能返回模型数即 exchange + checksum + 头全对
-```
-
-上线前先留档（`--build` 会换掉容器，旧容器的 json-file 日志随之消失）：
-```bash
-sudo docker compose logs --no-log-prefix composer-api > /tmp/gateway-$(date +%Y%m%d-%H%M).log 2>&1
-```
-
-
-判定：
-- `exchange_user_api_key` 返回 `{accessToken, refreshToken}` 且 `accessToken` 是 session JWT（不是 web token）→ **通过**
-- 「测试」按钮返回模型数 → **通过**，进入阶段 1
-- 若 exchange 返回 403 `sign_in_policy_violation` 或测试按钮 503 → **停止**，把错误原文交回。此时本方案不成立，改走次优路线：**SDK 路线 + 确定性 `agentId`（§3.6.6）+ 持久 SQLite store（§3.6.3）+ 池化复用/resume/增量 send（§3.5.1、§3.6.1 的共识做法）**。该路线有两个独立项目的实测背书（其中一份外部实测约 90% 命中，§3.6.2），但仍受 `RequestContext` legacy 全量内联所限，且 system 在 durable 首发被截断到 4000 字。
-
-
-### 阶段 1' — SDK 主线：确定性 agentId + 认 agent-id + 持久 store（**主线核心**）
-
-三项一起落，都在 SDK 路线内，不碰 Connect。
-
-1. **确定性 `agentId`**（对治根因 1）：`agentId = "agent-" + stableUuid(ownerHash \0 identity \0 model)`，首次 `Agent.create({agentId, ...})`、后续 `Agent.resume(agentId, ...)`。同 id 二次 create 会抛 `Agent ${id} already exists`（SDK `createAgent`），所以必须先查 store —— 我们已有的 `ensureDurableSlot → tryResumeDurableSlot` 结构天然契合。
-   派生串**绝不能含上游 `apiKey`**：现在的 Hub 键 `durable-id.ts:14-19` 混了它，轮询换 key 或粘性绑定过期（默认 1 小时）就会变 —— 这与 `cursor-sdk2api` Issue #20「5 账号池 293 决策 / 0 resume」是同一个 bug，只是被 `fill-first` 默认配置掩盖。
-   `stableUuid` 要产出**合法 uuid 形状**（sha256 前 32 hex 按 8-4-4-4-12 格式化 + 设版本位），不要直接塞裸 hex —— `NGLSG/Cursor2API:worker/cursor.ts:1076-1079` 专门这么做，上游可能不认非 uuid 形状。我们 `cursor-connect/provider.ts:205-211` 已有现成的 `stableUuid`，直接复用。
-
-2. **认 `x-claude-code-agent-id`**（对治根因 4）：并入身份派生串，主对话与 Task 子代理从此拿到不同 agentId，不再互抢 Hub 锁、不再互相 drop。官方 gateway 协议文档确认该头只在子代理请求上出现。
-
-3. **持久 store**（让 blob key 跨重启也能复用）：现在注入的是 `createEphemeralAgentStore()`（有界**内存**），进程重启后 metadata 全失，`Agent.resume` 拿不回 `blobEncryptionKey`。改成落盘 store（参照 `pi-cursor-sdk` 的 per-session SQLite，刻意不共用 workspace 级 `index.db` 以避免并发争锁）。注意仍要保留有界回收，不能回到 SDK 默认「每 agent 一份 SQLite」的句柄泄漏。
-
-验收：
-- 单测：同一 identity 两轮 → **同一个 agentId**、`create` 只调一次、第二轮走 `resume`；不同 `x-claude-code-agent-id` → 不同 agentId；换 apiKey（模拟轮询）→ **agentId 不变**。
-- 真机：后台命中率按 §3 阶段 3' 口径观察。
-
-### 阶段 2' — 包 D 可观测性（与 1' 并行，两条路线共用）
-
-内容见 §2.2 包 D。先落 `/health` 构建溯源与 `beginLog` 之前的错误落库这两项 —— 它们是后续所有判断的地基。
-
-额外两个探针（来自参照项目，成本低、价值高）：
-- **`GetPromptDryRun` 当 token 探针**：`wisdgod/src/core/service.rs:2254-2340` 把 `/v1/messages/count_tokens` 直接打上游 `ChatService/GetPromptDryRun`，返回 `{user_message_token_count, full_conversation_token_count}`。这是排查「17 万 token 从哪来」的现成探针，比自己估算准。**注意它是 ChatService 通道的方法，SDK 路线不一定可达** —— 先确认，不可达就跳过。
-- **真实缓存用量查询**：`wisdgod/src/common/utils.rs:424-472` 请求结束后 POST `cursor.com/api/dashboard/get-filtered-usage-events`，轮询 5×1s 读 `tokenUsage.{inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens}`。这与我们已有的 `UsageReconciler` 是同一类带外补写，可作为「流内 usage 口径可疑」时的交叉校验源。
-
-### 阶段 3' — 观察与验收（SDK 主线）
-
-阶段 -1 + 1' + 2' 落完即可上线观察，**不需要改 provider**。观察窗口至少 20 轮真实对话，且必须包含：一次用户中断（ESC）、一次工具往返、一次 Task 子代理。
-
-**验收口径（唯一标准）**：
-```
-cacheRead / (input + cacheRead + cacheWrite)
-```
-- 首轮低是正常的（新对话、新上游服务器）。
-- **同一段对话第 2 轮起该比值应显著上升，且随对话变长继续走高。** 参照基准：外部实测同一 pooled agent 第二轮 ≈90%（§3.6.2）。
-- `Cache Write` 恒为 0 不算失败（Grok 家族正常表现，见 §1.1）。
-- **中断一次之后的下一轮仍应是同一个 agentId**（阶段 -1 + 1' 的直接验收点）。
-- 全程不应出现 499。
-
-**先决校验（必须在算命中率之前做）**：确认 `cacheRead` 是 `inputTokens` 的**划分**还是**加项**（§3.6.5 第 1 项）。若是划分口径，`parseSdkUsage` 的 `totalTokens` 与上面这个分母都要改，否则命中率算出来是错的。
-
-达标 → 结束，Connect 不必启动。
-不达标 → 进入 §2 的 Connect 备选路线（先跑它的阶段 0 门闩）。
-
-### 阶段 4' — README / `.env.example`
-
-写清：确定性 agentId 的语义与副作用（同一会话恒定复用一个上游 agent）、`x-claude-code-agent-id` 的作用、缓存命中率怎么看、`Cache Write=0` 是正常的、kill switch 仍可退回 stateless。
-
----
-
-### 【备选路线的阶段】以下三段仅在走 Connect 时执行
-
-#### 备选阶段 1 — 包 A（结构化历史）
-
-先落地、先跑测试，**不改默认 provider**。用 `x-gateway-provider: connect` 头对单条请求灰度。
-
-验收：
-- `npx tsc --noEmit` 干净；`npm test` 不引入新红。
-- 新增测试：三协议各一条「wire 上 messages 数与角色序列正确」+ 「system 只出现一次」+ 「历史 tool_use 与 tools[] 一致」+ 「Anthropic thinking signature 原样回传」。
-- 灰度请求返回 200 且内容正确。
-
-#### 备选阶段 2 — 包 B（身份）
-
-验收：单测锁：同一 `x-claude-code-session-id` + 不同 `x-claude-code-agent-id` → **不同** conversation_id；不同 ownerHash + 同一 `x-session-id` → 不同 conversation_id；同一会话连续两轮 → 同一 conversation_id。
-
-#### 备选阶段 3 — 包 C（凭据续期）+ 切默认 provider
-
-`GATEWAY_PROVIDER=connect` 重启。验收口径同阶段 3'，但需按 provider 分桶对比 SDK 路线的基线。
-**注意：Connect 单发单收会丢掉 held execute**（§1.5.1），所以工具密集场景下即使命中率更高，等价 token 也可能不降反升。分桶对比时必须把「工具轮次的 input token」单独看。
-
-
-## 3.5 参照实现：`Sunnyender-org/cursor-sdk2api`
-
-同架构（`@cursor/sdk` 包成 OpenAI/Anthropic API，锁 1.0.30，42 star，2026-09-01 仍在推）。它**没有**走 Connect，而是把 SDK 路线做到了上限，且实测拿到 `cache_read_input_tokens > 0`。它证明的与踩到的坑，都要吸收。
-
-### 3.5.1 它证明了「SDK 路线也能命中缓存」
-
-做法：给每个普通轮算一个**血缘指纹**（`cursor-agent-turn.ts:232-244`：tenantScope + route + channelId + model + parentAssistantAnchor + historyDigest + turnIndex + toolCatalogDigest + policyFingerprint），完成后写一个**预测式** `nextLineageKey`；下一轮反查父记录，命中则复用，三级 fallback：
-
-| 档 | 条件 | 做法 |
-|---|---|---|
-| A 进程内活体 | Session 在内存、`completed`、凭据/模型/policy 全等 | 同一个 `SDKAgent` 再 `send()`，零 SDK 调用零 store IO |
-| B 持久化 resume | 进程重启后 journal 有记录 | `Agent.resume(parent.agentId, shared)` |
-| C 冷重建 | fork / 压缩 / 模型或工具目录变 / 过期 / 首轮 | `Agent.create` + 全量 flatten |
-
-复用路径的 send 只发**最后一条 user 的纯文本**（`cursor-agent-turn.ts:310-320`），历史一个字不重发。live smoke 量化：4KB padding 首轮 `send_chars>=4096`，第二轮 `send_chars<80`。
-
-它还顺手拿到两个副产品（作者本人未必知道机制）：
-- `Agent.resume` 从 store metadata 读回原 `blobEncryptionKey` → **跨轮 blob 缓存自动保活**（对应我们 §1.3 第 1 条的后半段）。
-- `local.cwd` 指向**按凭据指纹分区的空目录** + `settingSources: []` + `disallowedTools` 关掉全部环境工具（`cursor-runtime.ts:265-279`）→ 没有 git status / notes / 可变工具表，`RequestContext` 每轮内联的那一大块**内容稳定**。这是绕过 legacy 全量内联的唯一现实办法。
-
-### 3.5.2 它的三条做法我们直接采纳（与本方案不冲突）
-
-以下四条与 provider 无关，SDK 与 Connect 两条路都受益，并入包 D 与包 A：
-
-1. **断连不 cancel 已产出内容的 run**（`run-coordinator.ts:1534-1541`，逻辑 8 行）：
-   ```ts
-   if (!session.hasSemanticOutput && (state==="running"||state==="creating"))
-     void this.cancel(session, "client_closed_before_output");
-   ```
-   只在**零语义输出**时才取消。这正面回答我们 §1.3 第 2 条 —— 我们现在是无条件 `throw 499` 然后 finally 里 drop 掉整个 agent。改法：`consumeDurablePump` 的 `http-abort` 分支在**已产出 text/tool_call** 时走 `markIdle` + 正常收尾，不抛 499、不毁槽。**这一条不依赖 Connect，应当立即修，优先级高于其它所有包。**
-
-2. **等 tool_result 的会话不占并发配额**（`session-registry.ts:59-91`）：`awaiting_tools` 状态不计入 active run 上限。我们现在 `MAX_LIVE_SESSIONS=256` 是一刀切的 LRU，挂起中的槽会和活跃槽抢位置。
-
-3. **usage 不编数字**：工具边界返回 `usage_status:"deferred"` 而不是填 0（`usage.ts:5-12`），字段缺失整个省略。我们的 `parseSdkUsage` 已经是「四个桶少一个就返回 undefined」，口径一致，保持。
-
-4. **`TOOL_BATCH_SETTLE_MS=1500`**：它实测同轮并行工具回调间隔 Sonnet 318–697ms、Fable 713–1189ms，所以 100ms 级别的窗口会把并行批次切碎。我们的 `PARALLEL_TOOL_SETTLE_MS = 25` 明显偏小 —— 但这只影响「一次 HTTP 能否收齐并行工具」，不影响缓存，作为独立小项记录，不进本方案的关键路径。
-
-### 3.5.3 它踩的坑，我们的方案天然避开或必须避开
-
-| 它的缺陷 | 证据 | 我们的处置 |
-|---|---|---|
-| **`tenantScope = 上游账号指纹`** → 多账号池 100% 失效 | Issue #20 生产数据：5 账号池 **293 条决策 / 0 次 resume**，send_chars 中位 25,397、p90 197,431、max 672,557。credential-free 复现：1 账号 → 3 次 resume；5 账号 → **0 次**。作者未回复、直接 close，main 0.4.0 仍未修 | **这正是我们 §2.2 包 B 的内容**：`conversation_id` 派生串必须是 `ownerHash（客户端身份）\0 identity \0 model`，**绝不能混入上游 Cursor key 指纹**。注意我们现在的 Hub 键 `durable-id.ts:14-19` 恰好混了 `input.apiKey`（上游 key）—— 在 `fill-first` + session affinity 下通常稳定，但一旦轮询换 key 或粘性绑定过期（默认 1 小时），Hub 键就会变，同样踩这个坑。**Connect 路线的 `conversationIdFor` 不含 apiKey，天然避开。** |
-| **anchor 用 `result.result`，而流式客户端只收到 delta 拼接** | `event-pump.ts:172` vs `writer.ts:72-76`（#20 Defect 4，未修） | 我们是流式客户端，会直接踩。本方案不用 assistant 文本做身份 —— identity 来自请求头/首条 user，与 assistant 输出无关，天然避开 |
-| **anchor 含 `thinking` 且 block 顺序敏感** | `cursor-agent-turn.ts:82-127` | 同上，我们不拿 assistant 内容做身份 |
-| **`turnIndex` 靠 `role==="user"` 计数** | `cursor-agent-turn.ts:276`，被 tool_result / 角色改写 / 客户端压缩各踩一次 | 我们不用轮次序号 |
-| **`traceOrdinary` 裸 `catch {}`** | `run-coordinator.ts:500-508`，#20 提交者因此误判「请求没到网关」 | 直接对应我们包 D：诊断路径绝不能静默失败。这也是用户「后台没 log」的同类症状 |
-| **patch `node_modules` 把 `x-cursor-client-type` 从 sdk 改成 sand** | `sand-patch-contract.ts:22-41`，改 SDK bundle 并锁 sha256 | 我们已有正规的 `sand-client.ts` loader hook，不改 node_modules。ToS 风险自负那部分不采纳 |
-
-### 3.5.4 它没有回答的问题（所以不能替代本方案的阶段 0）
-
-- **上游是否真把 agentId 当 xAI 服务器亲和键**：该仓库零讨论，无法交叉验证。
-- **缓存命中率的绝对数字**：live smoke 只把 `cache_read` 放进 `counts` 不进 `ok` 判定，**全仓没有任何「命中率 X%」或「省了多少 token」的公开数字**。所以「SDK 路线做对了能到多高」仍是未知，只知道「> 0」。
-- 它对 `conversation_id` / `cache_control` / `requestContextBlobTransportMode` **零认知**（三个标识符全仓零命中）—— 它是靠复用 agent 间接稳定 conv id，没有主动控制这一层。
-
-结论：它把 SDK 路线的**会话复用**做到了上限，值得抄的具体做法见 §3.5.2；但它并未触达「主动控制上游会话身份」与「结构化历史」这两层，因此不改变本方案的选择。**它最大的贡献是那 8 行断连处理和 Issue #20 那份生产数据** —— 前者我们立刻采纳，后者证明「把上游账号指纹混进会话身份」是一个已被生产验证的错误。
-
-## 3.6 参照实现二：`fitchmultz/pi-cursor-sdk`
-
-不是网关（是 pi 编码代理的 provider extension，README 明文拒绝做协议翻译，把「OpenAI 兼容 Cursor 代理」这类需求推给别的项目），但它同样 pin `@cursor/sdk@1.0.27`、同样面对「无状态调用 vs 有状态 Agent」，且**独立地走到了和 `cursor-sdk2api` 几乎一样的架构**。315 star / 55 fork / 34 open issues，最后 push 2026-08-18（约两周半无新提交，此前节奏很密）。
-
-### 3.6.1 两个项目独立收敛到同一套做法 —— 这是本方案 §3.5.2 的交叉验证
-
-| 维度 | `cursor-sdk2api` | `pi-cursor-sdk` |
-|---|---|---|
-| 进程内复用同一 `SDKAgent` | 血缘指纹命中即 `{type:"existing"}` | `sessionAgentsByScope` 池，`status==="ready"` 即复用（`cursor-session-agent.ts:139,567-569`）|
-| 跨进程 | `Agent.resume(parent.agentId)` | `Agent.resume(resumeHandle.agentId)`（`:496-509`），**默认开启** |
-| 复用键 | lineageKey（含 historyDigest / toolCatalogDigest）| poolKey = `scopeKey \0 cwd \0 model \0 settingSources \0 localSafety \0 http1 \0 sha256(apiKey)[:16] \0 工具面签名`（`:214-229`）|
-| 只发增量 | 复用路径只发最后一条 user | bootstrap / incremental 双模（`context.ts:377-402` vs `:404-443`）|
-| 前缀分歧检测 | historyDigest 不匹配即冷重建 | `{systemHash, messageHashes[]}` 指纹：systemHash 变 / 消息变少 / 前缀被改写 → re-bootstrap（`context.ts:338-367`）|
-| 是否传 `agentId` | 否 | 否（知道能传，`cursor-session-agent-resume.ts:16` 有注释，但从未用）|
-| `conversation_id` / `cache_control` / `blobEncryptionKey` | 全仓零命中 | 全仓零命中 |
-
-两个互不相关的项目、不同产品形态，都收敛到「池化复用 + resume + 增量 send + 前缀指纹」这四件事上。这把 §3.5.2 从「一个项目的经验」升级为**这条路径的共识做法**。
-
-### 3.6.2 它提供了我们最缺的一件东西：外部实测的命中率数字
-
-`cursor-sdk2api` 全仓没有命中率数字。`pi-cursor-sdk` 的 issue #196 报告者顺手测了一组，现在固化成 fixture（`test/fixtures/cursor-sdk-turn-ended-usage-1.0.23.json`）：
-
-> 同一个 pooled agent：turn-001 `cacheRead: 0 / cacheWrite: 46944`；turn-002 `cacheRead: 42036 / inputTokens: 46965` → **约 90% 命中**
-
-这是「复用同一 agent 就能拿到高命中」的第一份可核对的外部证据。注意它同时**推翻了我们的一个记账假设**：那份 fixture 里 `inputTokens` 是**整个 prompt**，`cacheRead/cacheWrite` 是它的**划分**而非**加项**。而我们的 `parseSdkUsage`（`cursor-runner.ts:1617`）算的是 `totalTokens = input + output + cacheRead + cacheWrite` —— 若上游确实是「划分」口径，我们的 total 会把缓存部分重复计一遍。SDK 自己的 `toTokenUsage` 也是相加口径，两者矛盾。**这条必须实测确认**（见 §3.6.5），它直接影响后台命中率分母对不对。
-
-### 3.6.3 blobEncryptionKey 的自动复用得到第二份独立确认
-
-两个项目都零处理 `blobEncryptionKey`，但都通过 `Agent.resume` 白拿了它。`pi-cursor-sdk` 的调查从 SDK dist 读出更完整的链路：create 时 `metadata[pt] = blobEncryptionKey`，resume 时 `{blobEncryptionKey: ft(s.metadata)}` —— `ft` 从 store metadata 读回，**合法就复用，缺失才新生成**；`SqliteLocalAgentStore` 双向映射 `sdkMetadata ↔ record.metadata` 落盘。
-
-**这一条对我们有一个直接后果**：我们 `index.ts:138` 注入的是 `createEphemeralAgentStore()`（有界**内存** store，进程重启即失）。也就是说即使我们将来走 resume，**跨重启也拿不回 blob key** —— 内存 store 里没有 metadata 可读。`pi-cursor-sdk` 用的是**持久 per-session SQLite store**（`cursor-session-store.ts:44-47`，且刻意不共用 workspace 级 `index.db`，避免并发争锁）。若走 SDK 回退路线，这是必须一起改的。
-
-### 3.6.4 它踩的坑与我们的处置
-
-| 缺陷 | 证据 | 处置 |
-|---|---|---|
-| **每 20 次增量强制重建** | `cursor-session-send-policy.ts:12,28` `MAX_COMPLETED_INCREMENTAL_SENDS_BEFORE_REBOOTSTRAP = 20`，注释理由是「tool-call behavior drift」，**与缓存无关** | 不抄。代价是每 20 轮缓存归零 + 新 blob key。若真需要防漂移，阈值应远大于 20 且可配 |
-| **`settingSources: ["all"]` + 真实 cwd + 不用 `disallowedTools`** | README:337；`cursor-session-agent.ts:161`；`buildAgentOptions()` 无 disallowedTools | **与 `cursor-sdk2api` 完全相反**，前缀不稳定（git status / 项目规则每轮都活）。它是刻意的产品取向（"let Cursor remain Cursor"）。我们已经是 `settingSources: []` + 容器内 `/workspace`（`docker-compose.yml:17`）＝ 空目录，方向正确，**保持不变** |
-| **不传 `agentId`** | `cursor-session-agent.ts:481-492` 的 `buildAgentOptions()` 无 `agentId` | 两个参照项目都没传。但 SDK **公开支持**（`options.d.ts:335`）。见 §3.6.6 —— 这是它们都漏掉的杠杆 |
-| **usage 三道 gate 丢掉真实数据** | issue #219：1036 条消息只 1.4% 带非零 cacheRead，根因是 `contextWindow` guard 拿累积多步值比单请求容量。#219/#245/#246 至今 open、作者 0 回复 | 不抄。我们原样记 `turn-ended.usage`，不加二次校验 |
-| **monkey-patch `globalThis.setTimeout`** 绕 SDK 的 MCP 60s 硬超时 | `cursor-mcp-timeout-override.ts:32-51`，按栈匹配 `@cursor/sdk` + `_setupTimeout` + `callTool` | 不抄（进程级全局副作用）。但**这个 60s 超时对我们同样存在**：SDK bundle `318.js` 里 `const g = n?.timeout ?? 6e4` 就是 MCP 请求默认超时。见 §3.6.5 第 2 项 |
-| **loopback MCP 靠不可猜路径当凭据** | `cursor-pi-tool-bridge-run.ts:93` `http://127.0.0.1:<随机端口>/<uuid>/mcp`，防护只有回环地址校验，**无 Authorization** | 我们用 `local.customTools`（进程内回调，不开端口），无此风险。保持 |
-| **按栈帧形状白名单抑制 uncaughtException** | `cursor-sdk-process-error-guard.ts`；issue #174→#194→#182→#195 一路追着 SDK 形状变 | 不抄。我们已有 `index.ts:49` 的 `unhandledRejection` 兜底 + 截断日志，方向对 |
-
-### 3.6.5 它暴露的两个我们需要自己验证的点
-
-1. **usage 口径：`cacheRead` 是 `inputTokens` 的划分还是加项？** 见 §3.6.2。做法：真机跑一轮有缓存命中的请求，把 `turn-ended` 原始 payload 打进日志（包 D 的 telemetry 顺带记），核对 `inputTokens` 是否已含 `cacheReadTokens`。**若是划分口径，`parseSdkUsage:1617` 的 `totalTokens` 与后台命中率分母都要改。**
-
-2. **SDK 的 MCP 调用默认 60s 超时会不会掐断我们的 held execute。** 我们的 path A 让 `customTools.execute` 返回一个挂起的 Promise，等下一条 HTTP 来 resolve，`CURSOR_SDK_TOOL_HOLD_TTL_MS` 默认 15 分钟。但 SDK bundle `318.js` 的 MCP 请求默认 `timeout ?? 6e4`（60 秒）。`pi-cursor-sdk` 正是因为撞上这个才去 monkey-patch。
-   我们的 `customTools` 走的是 `extraMcpTools` 通道（`357.js` 把它并进 `custom-user-tools` server，服务名常量在 `:116287`），**是否同样经过那个 60s 计时器尚未确认**。若经过，则「客户端执行工具超过 60 秒」会让 execute 被 RequestTimeout 打断 —— 这在 Claude Code 跑长 bash 时很常见。
-   **验证方式**：单测里让 execute 挂起 70 秒，看是否收到 `RequestTimeout`。这条与本方案的 provider 选择无关，但影响工具路径的正确性，列为独立小项。
-
-### 3.6.6 两个参照项目都漏掉的杠杆：直接传 `agentId`
-
-它们都靠「先 create、再赌 resume 命中」来间接稳定上游 conversation_id。但 `AgentOptions.agentId` 是**公开字段**（`node_modules/@cursor/sdk/dist/esm/options.d.ts:335`），可以直接传一个由会话身份派生的确定性值：
-
-```
-agentId = `agent-${stableUuid(ownerHash \0 identity \0 model)}`
-```
-
-这样上游 conversation_id 从「赌复用命中」变成「确定性可控」。约束：同 id 二次 `create` 会抛 `Agent ${id} already exists`（SDK bundle `index.js` 的 `createAgent`），所以正确用法是**首次 create、后续 resume**，与我们已有的 `ensureDurableSlot → tryResumeDurableSlot` 结构天然契合。
-
-**这是 SDK 回退路线（§4 表格第一行）的关键改进**，把它从「上限被钉死」提升到「能主动控制上游会话身份」。若阶段 0 的 Connect 门闩不通过，这条 + §3.6.3 的持久 store 就是次优方案的核心。
-
-## 3.7 参照实现三：逆向 Connect RPC 家族（五个项目）
-
-不走 `@cursor/sdk`，直接手搓 `aiserver.v1.ChatService/StreamUnifiedChatWithTools`。调查了 5 个：`wisdgod/cursor-api`（694★，已归档）、`7836246/cursor2api`（1887★）、`NGLSG/Cursor2API`（65★）、`egoist/cursor-openai-api`（37★）、`zhx47/cursor-api`（268★）。
-
-### 3.7.1 最重要的发现：`wisdgod` 用另一套机制实现了我们已有的 held execute
-
-`src/core/stream/session.rs` + `service.rs:376-409,896-918`：流结束时若有 pending tool_call，**把上游双向流 park 起来**（不 drop，塞进 stash —— `stream/droppable.rs`），下一轮只往还开着的流里写一个 `ClientSideToolV2Result` 帧。键是 pending tool_call_id **排序后**拼接再 `xxh3_64`（`session.rs:41-50`，排序保证顺序无关），TTL 300s。
-
-它是五个逆向项目里**唯一**做到这件事的。而我们的 SDK 路线**已经有等价能力**（held execute / path A，单测锁死 `http2.runId === http1.runId` 且只 send 一次）。
-
-**这条直接决定了路线选择** —— 见 §1.5.1：Connect 单发单收结构上做不到，工具续轮必须重发全量历史。这是本次修订的核心依据。
-
-### 3.7.2 会话标识：逆向路线的主流做法和我们一样错
-
-| 项目 | 字段 | 生成 | 稳定？ |
+| 通道 | 标识 | 实现 | 说明 |
 |---|---|---|---|
-| `wisdgod` | `StreamUnifiedChatRequest.conversation_id`（field 23）| `traits.rs:169` ← `service.rs:368` `Uuid::new_v4()` | ❌ 每请求随机 |
-| `egoist` | `AgentRunRequest.conversation_id`（field 5）| `proxy.ts:544` `crypto.randomUUID()` | ❌ |
-| `zhx47` | `ChatMessage.conversationId`（field 15）| `utils.js:26` `uuidv4()` | ❌ |
-| `7836246` | JSON `id` | `converter.ts:1383` `sha256(system前500 + 首条user前1000)` | ✅ **内容派生** |
-| `NGLSG` | field 23 | `cursor.ts:60-62`，`x-session-affinity` 等头驱动 | ✅ 条件稳定 |
+| **SDK** | `provider = "sdk"` | `src/cursor-runner.ts` + `@cursor/sdk@1.0.27` | 主通道，durable / reuse 就长在这条上 |
+| **Bot** | `provider = "bot"`，模型 id 前缀 `bot/` | `src/cursor-bot/*` | 直连 Cursor Connect 协议，不经过 SDK |
 
-**7836246 的动机值得注意**：它做内容派生是为了修 issue #56「`/clear` 后上下文残留」—— 即 conversation_id 确实影响**服务端会话状态**。但**没有任何项目证明它影响 prompt 缓存**，这两件事在 Cursor 上游可能独立。所以稳定 conv id 是「有理由做」而非「已证明有效」。
+Bot 通道的协议要点（逐条实测得出，缺一不可）：
 
-两个可抄的细节：
-- `NGLSG:worker/cursor.ts:1076-1079` 的 `stableUuid` 把 sha256 前 32 hex 格式化成**合法 uuid 形状**，不直接塞裸 hex（上游可能不认）。我们 `cursor-connect/provider.ts:205-211` 已有同款实现。
-- 内容派生只取 system 前 500 + 首条 user 前 1000 字符 —— 比我们 L3 的「instruction 前 50 rune + **完整**首条 user」更抗长首条消息，但区分度更低。两者各有取舍，不必改。
+- 路由 `POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream`（旧路由 `/agent.v1.AgentService/Run` 已废弃）
+- Connect JSON 流，请求体要加 **5 字节信封头**（`0x00` + uint32be 长度），裸 JSON 会报 `protocol error: incomplete envelope`
+- `Authorization: Bearer <session 型 JWT>`。浏览器 cookie 的 web 型 token 只能过 AuthService，敲 Stream 必 16
+- `x-cursor-checksum` 必带，缺失会被当旧客户端报 `ERROR_OUTDATED_CLIENT`
+- 参考资料：`docs/sand_patch.txt`、`docs/cursor_proxy.txt`、`docs/reference/*`
+- 命名沿革：`d33b96f` 引入时叫 Connect，`a7abfcc` 改名 Bot；`8bb3304` 删除了 Sand 通道。
+  **老文档与老账本里的 `cursor-connect` / `connect/` / `sand` 字样指的就是今天的 bot。**
 
-### 3.7.3 `should_cache` 存在，但不在我们能用的通道上
+### -1.3 durable / reuse：本仓最重要的既有资产
 
-`wisdgod/lite.proto:601` 有 `optional bool should_cache = 13`，它硬编码 `Some(true)`（`traits.rs:155`）。我在本地 SDK bundle 里核对：该字段属于 `StreamChatRequest` / `GetPromptRequest` 这类 **ChatService 消息**，而 `agent.v1.AgentRunRequest`（SDK 实际发的）**没有任何缓存开关字段**。
+同一段对话复用同一个上游 Agent，**每轮只发增量而不是全量 transcript**，从而拿到 prompt cache 命中，
+模型表现接近原生。构件：
 
-所以「显式要求缓存」这个杠杆在 SDK 路线上不可达。但也没证据表明它有效（零项目做过 A/B，README/issues 零讨论，可能已废弃）。**不作为路线选择依据。**
+- `src/durable-id.ts` —— 会话身份瀑布（显式会话头 / Responses 继承 / CPA DeriveID），Hub 键 === `agent-`+uuid
+- `src/session-hub.ts` —— 会话槽、互斥锁、held execute、TTL / LRU 回收
+- `src/prompt-delta.ts` —— `extractDurableTurn`，把入站 transcript 算成本轮增量
+- `src/agent-store.ts` —— `agents.sqlite` 持久化（含 `blobEncryptionKey`，丢了缓存就失效）
+- `src/cursor-runner.ts` —— `streamDurable` / `runDurableLocked` / `consumeDurablePump` / `parkKeepAlive` / `parkPathB`
 
-### 3.7.4 `PrewarmRequest`：一个零项目用过的低成本验证路径
+实测收益记在 `plans/connect-cache-499-ledger.md`（第二轮缓存命中 ~46%，同一 agent 不再 drop+create）。
 
-我在本地 SDK bundle 核对确认：`agent.v1.AgentClientMessage` 的 field 8 就是 `prewarm_request`，`PrewarmRequest` 含 `{model_details, requested_model, conversation_id, conversation_state, mcp_tools, custom_system_prompt, ...}` 共 26 个字段 —— **与 `AgentRunRequest` 高度同构**。五个逆向项目零调用，SDK 也不发。
+> **硬约束：不得删除、关闭或变相削弱 reuse。** 若某个修复看上去需要关掉它，那就是方案错了，不是约束错了。
 
-它的存在本身是一条证据：**上游会为「一个 conversation_id + conversation_state」做预热，说明 conversation_id 是服务端状态/亲和键，不只是日志标签。** 这间接支持阶段 1' 的确定性 agentId。
+### -1.4 这份计划从哪来
 
-但它在 SDK 公开 API 上不可达（`AgentClientMessage` 是内部 wire 类型），所以只是**佐证**，不是可执行项。
+用户对网关提了五组问题：Bot/SDK 运行设置不隔离、额度耗尽不立即禁用且不分额度桶、
+Bot 代理出来的 API 工具调用不可用、全局性的 499、没有 debug 模式。
+上一版计划（v1）写了三包，经评审发现 499 根因定错、额度分桶与需求相互矛盾、debug 与 Bot 工具两件事完全缺失。
+本文件是 v2，六包；§0 是逐条差异，§1 是带 `file:line` 证据的根因，§7 是未证实清单。
 
-### 3.7.5 `bubble_id`：一个我们看不见但可能重要的维度
+### -1.5 关键文件地图
 
-`lite.proto:624-625,651-652` 有 `bubble_id` / `server_bubble_id`，还有 `full_conversation_headers_only`（field 30，只含 bubble_id + type 的轻量头列表）。`wisdgod` **每轮把所有历史消息的 bubble_id 全部重新生成**（`adapter.rs:277-291`）—— 如果上游按 bubble 粒度做增量识别，这等于每轮宣布「这是全新历史」。**明确的反面教材。**
-
-本地核对：SDK bundle 里 `bubble_id` 只出现在 `ReportAgentMessageFeedbackRequest` / `StreamChatResponse` / `ConversationSummary` 这些 **ChatService / 反馈类**消息上，`agent.v1` 的 turn 结构不含它。**所以这个维度对 SDK 路线不适用**，记录备查。
-
-### 3.7.6 其余可抄 / 不该抄
-
-**可抄**：
-- `GetPromptDryRun` 当 token 探针（`wisdgod/service.rs:2254-2340`）—— 已并入阶段 2'，但需先确认 SDK 路线可达性。
-- 真实缓存用量查询（`wisdgod/utils.rs:424-472`，POST `cursor.com/api/dashboard/get-filtered-usage-events`）—— 与我们 `UsageReconciler` 同类，可作交叉校验源。已并入阶段 2'。
-- tool id 打包（`utils/tool_id.rs:5-25`，用分隔符把 tool_call_id + model_call_id 打包成单个对外 id，无状态还原）—— 我们已有 `callAliases` 机制，等价。
-- `egoist` 的 system prompt 内容寻址（`proxy.ts:502-509`，sha256 当 blob id，上游 KV 握手才索要内容）—— 天然去重，但那是 `agent.v1` blob 通道，SDK 已自动处理。
-
-**不该抄**：
-- `bubble_id` 每轮重生成（§3.7.5）。
-- `NGLSG` 全量 flatten 成一条字符串 + 塞假的 agent 模式 few-shot。
-- `7836246` 那套 prompt 工程补丁：伪造工具协议、few-shot、拒绝话术正则清洗、**虚增 input_tokens 骗客户端提前压缩**。它的上游是 cursor.com 文档问答口，不是真 agent，一条都不适用。
-- `wisdgod` 的 OpenAI 流式路径**丢 thinking**（`service.rs:595-760` 只处理 Content/ToolCall/StreamEnd；非流式 `:1019` 收进 `thinking_text` 后从未使用），只有 Anthropic 路径完整。
-- 断连处理：`wisdgod` 完全没有断连监听，`7836246` 只有 idle timeout，`egoist` 的 ReadableStream 不实现 `cancel()` 且 bridge 子进程与 heartbeat 都泄漏。**五个逆向项目里没有一个做对**，唯一做对的是 `cursor-sdk2api`（§3.5.2 第 1 项，即我们的阶段 -1）。
-
-### 3.7.7 若真要走 ChatService（第三条路，本次不选）
-
-`wisdgod` 证明了 `ChatService/StreamUnifiedChatWithTools` 能发**完全结构化历史**（`repeated ConversationMessage`，`MESSAGE_TYPE_HUMAN`/`AI` 分开，thinking 带 `signature` + `redacted_thinking` 原样回传，`messages.rs:100-390`），且有 `should_cache`。这在协议能力上强于 Connect 的 `InferenceService/Stream` 和 SDK。
-
-但它需要：`WorkosCursorSessionToken` + 17 个 header + `x-cursor-checksum`（`common/utils/checksum.rs:1-60` 的滚动异或算法，`NGLSG:worker/cursor.ts:1057-1074` 独立逆向出同一结果）。且**同样丢掉 held execute**，除非把 `wisdgod` 的 park-stream 机制一起实现。
-
-**结论：协议能力最强，但工程量最大且要自建凭据体系。只在 SDK 主线与 Connect 备选都不达标时才考虑。**
-
-## 4. 为什么不选其它路线
-
-
-| 备选 | 否决理由 |
+| 文件 | 职责 |
 |---|---|
-| 继续修 SDK durable Hub（补 `markIdle`、认 agent-id、首发带历史） | 能缓解，但**上限被 SDK 钉死**：`conversation_id` 只能通过 agentId 间接控制且必须先 create 后 resume；`x-blob-encryption-key` 无公开 options 可达；`requestContextBlobTransportMode` 恒为 legacy 导致整个 `RequestContext`（env / git status / notes 路径）**每轮全量内联进前缀**，而 `git status` 每次 execute 重算 —— agent 自己改一个文件就打断下一轮缓存。这条路修完仍是「靠上游状态 + 进程内锁」，499 只能靠补丁绕。<br>**参照实现 `cursor-sdk2api` 就是这条路的上限**（§3.5）：它做到了活体复用 + resume + 空 workspace + 只发增量，实测 `cache_read > 0`，但全仓没有任何命中率数字，且多账号池下因把上游账号指纹混进会话身份而**完全失效**（293 决策 / 0 resume）。它的会话复用值得抄，路线选择不改。 |
+| `src/server.ts` | 三套协议端点、SSE 生成器、请求日志、`streamAbort`、选路接线 |
+| `src/cursor-runner.ts` | SDK 通道 runner，durable 主逻辑 |
+| `src/session-hub.ts` | durable 会话槽与锁 |
+| `src/key-pool.ts` | Cursor Key 池、失败分类、自动禁用 |
+| `src/key-rotating-runner.ts` | 换 key 重试 |
+| `src/cursor-bot/*` | Bot 通道（transport / envelope / checksum / tool-loop / response-normalizer / service / store） |
+| `src/admin.ts` / `src/admin-ui.ts` | 后台 API 与单文件前端 |
+| `src/store.ts` | SQLite（请求日志、key、设置）与列迁移 |
+| `src/types.ts` | `GatewayConfig` / `CursorRunRequest` / `RequestLogRecord` 等共用类型 |
 
-| 只修 499（保持 flatten） | 那正是现在的状态：为消 499 把并发请求改成 stateless flatten，把并发问题换成了每轮全量重发的计费问题（B 行 17 万 token）。 |
-| 开 `CURSOR_CONNECT_SEND_TOOLS` 走工具循环 | 「同 conv_id 第二次 Stream 能否接续」未实测，声明工具会让模型发起一轮网关接不住的调用。Claude Code 自己执行工具，不需要它。 |
-| 填 `cache_control` | descriptor 里有字段，但是否生效无任何证据，且它是 Anthropic 语义 —— 当前模型是 Grok。先拿到命中率基线再谈。 |
-| 加 `x-grok-conv-id` 头 | 我们打的是 Cursor（api2.cursor.sh），不是 xAI。该头是 xAI 侧的，网关无法越过 Cursor 直接设置。稳定 `conversation_id` 是我们能触达的等价杠杆。 |
+### -1.6 环境、命令与基线
 
-### 4.1 一条被否决的假设，记录在此以免重复调查
+- 主目录 `E:\docker-composer-api`，Windows + Git Bash；Node 锁 `>=22.13`，镜像 `node:22-bookworm-slim`
+- 部署：`git pull` + `sudo docker compose up -d --build`
+- 测试：`npm test`（= `npm run build && node --test dist/tests/*.test.js`）
+- 类型：`npx tsc --noEmit -p tsconfig.json`
+- **测试基线**：754 tests / 751 pass / **fail 1** / 2 skip。那 1 条红是 `tests/proxy.test.ts:237` 的 SOCKS
+  `getaddrinfo ENOTFOUND example.test`，环境问题，**不算本任务的锅**。只认增量红。
+- 当前 HEAD `de188c9`，`main` 领先 `origin/main` 1 个提交；工作区有未跟踪的 `grok-500k-context/` 等，与本任务无关
 
-**H1「被取消的 run 不写入缓存」——不成立。** 曾怀疑：网关在 stateless 路径上一见工具调用就 `run.cancel()`，若上游只在 run 正常结束时才写缓存，则每轮大请求都写不进去、下一轮也读不到。四条独立证据否掉它：
+### -1.7 干活约束
 
-- Anthropic 官方推荐的预热做法就是发 `max_tokens: 0` 的请求——「API 跑 prefill，**在 cache_control 断点写入缓存**，然后立刻返回 `content: []` 与 `stop_reason: "max_tokens"`」。一个什么都没生成、根本没正常完成的请求照样完整写入缓存。
-- 可读时点是「**首个响应开始流式输出之后**」，门槛是「开始流」不是「结束」。观测行 B 有 385 output token，说明 prefill 早已完成、decode 已开始流，写入窗口在 `cancel()` 之前就打开了。
-- 生命周期从「写入或读取该条目的**请求开始**」算起，不是从完成算起。
-- 引擎层（vLLM 设计文档）：块在分配时即入缓存，请求结束也不删缓存，且释放是逆序入队——**前缀块最后才被逐出**。
+1. **不得删除或削弱 durable / reuse**（见 -1.3）。
+2. 改文件前先读文件。
+3. 中文回复。
+4. 不擅自 `commit` / `push`，除非用户明说。
+5. 改完跑 `npx tsc --noEmit` 与 `npm test`，并与上面的基线对比。
+6. 本文 §7 里的假设未经包 D 关闭前，相关包不得宣布「已修复」。
 
-所以「cancel 导致缓存写不进去」这条路不必修。真正成立的是它的变体：cancel → dispose → 下一轮 `Agent.create` 开新 agent/新 conversation，换掉了上游亲和键 —— 那就是 §1.3 第 1 条，本方案正面解决它。
+---
 
+## -1. 背景（新会话先读这一节）
 
-## 5. 风险与未知
+### -1.1 这个项目是什么
 
-| 项 | 状态 |
+一个 Docker 部署的 API 网关，把 Cursor Composer 包成 OpenAI / Anthropic 兼容接口。对外三套协议端点：
+`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（另有 `/v1/messages/count_tokens`、`/v1/models`）。
+带一个 `/admin` 后台：Cursor Key 池、入站网关密钥、请求日志、运行设置、Bot 凭据。
+实际使用场景以 **Claude Code 指向本网关**为主，所以 Anthropic 协议与工具循环的保真度是硬指标。
+
+### -1.2 两条上游通道（本计划反复提到的 sdk / bot）
+
+| 通道 | 标识 | 实现 | 说明 |
+|---|---|---|---|
+| **SDK** | `provider = "sdk"` | `src/cursor-runner.ts` + `@cursor/sdk@1.0.27` | 主通道，durable / reuse 就长在这条上 |
+| **Bot** | `provider = "bot"`，模型 id 前缀 `bot/` | `src/cursor-bot/*` | 直连 Cursor Connect 协议，不经过 SDK |
+
+Bot 通道的协议要点（逐条实测得出，缺一不可）：
+
+- 路由 `POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream`（旧路由 `/agent.v1.AgentService/Run` 已废弃）
+- Connect JSON 流，请求体要加 **5 字节信封头**（`0x00` + uint32be 长度），裸 JSON 会报 `protocol error: incomplete envelope`
+- `Authorization: Bearer <session 型 JWT>`。浏览器 cookie 的 web 型 token 只能过 AuthService，敲 Stream 必 16
+- `x-cursor-checksum` 必带，缺失会被当旧客户端报 `ERROR_OUTDATED_CLIENT`
+- 参考资料：`docs/sand_patch.txt`、`docs/cursor_proxy.txt`、`docs/reference/*`
+- 命名沿革：`d33b96f` 引入时叫 Connect，`a7abfcc` 改名 Bot；`8bb3304` 删除了 Sand 通道。
+  **老文档与老账本里的 `cursor-connect` / `connect/` / `sand` 字样指的就是今天的 bot。**
+
+### -1.3 durable / reuse：本仓最重要的既有资产
+
+同一段对话复用同一个上游 Agent，**每轮只发增量而不是全量 transcript**，从而拿到 prompt cache 命中，
+模型表现接近原生。构件：
+
+- `src/durable-id.ts` —— 会话身份瀑布（显式会话头 / Responses 继承 / CPA DeriveID），Hub 键 === `agent-`+uuid
+- `src/session-hub.ts` —— 会话槽、互斥锁、held execute、TTL / LRU 回收
+- `src/prompt-delta.ts` —— `extractDurableTurn`，把入站 transcript 算成本轮增量
+- `src/agent-store.ts` —— `agents.sqlite` 持久化（含 `blobEncryptionKey`，丢了缓存就失效）
+- `src/cursor-runner.ts` —— `streamDurable` / `runDurableLocked` / `consumeDurablePump` / `parkKeepAlive` / `parkPathB`
+
+实测收益记在 `plans/connect-cache-499-ledger.md`（第二轮缓存命中 ~46%，同一 agent 不再 drop+create）。
+
+> **硬约束：不得删除、关闭或变相削弱 reuse。** 若某个修复看上去需要关掉它，那就是方案错了，不是约束错了。
+
+### -1.4 这份计划从哪来
+
+用户对网关提了五组问题：Bot/SDK 运行设置不隔离、额度耗尽不立即禁用且不分额度桶、
+Bot 代理出来的 API 工具调用不可用、全局性的 499、没有 debug 模式。
+上一版计划（v1）写了三包，经评审发现 499 根因定错、额度分桶与需求相互矛盾、debug 与 Bot 工具两件事完全缺失。
+本文件是 v2，六包；§0 是逐条差异，§1 是带 `file:line` 证据的根因，§7 是未证实清单。
+
+### -1.5 关键文件地图
+
+| 文件 | 职责 |
 |---|---|
-| `exchange_user_api_key` 真机可用性 | **未验证**，阶段 0 门闩 |
-| Cursor 是否把自己的 `conversation_id` 映射成 xAI 的服务器亲和键 | 无公开证据。这是本方案效果的主要不确定性 —— 但即使不映射，「结构化历史 + 只追加 + 不截断 system」这三条本身就直接满足 xAI 的前缀缓存要求 |
-| descriptor 与线上 schema 对齐 | `cursor-connect-proto.test.ts` 用独立解析器逐条比对 54 messages / 4 enums，可信；但「descriptor == 线上」只在 3.18.9 成立，真机只验到「不是 415」+「401」 |
-| `cursor-connect-proto.test.ts` 在干净 clone 上会红 | fixture 在 `docs/reference/`，被 `.gitignore` 排除。修法：把 descriptor 挪进 `tests/fixtures/` 或让该测试在缺 fixture 时 skip |
-| Connect 侧 cost 补写永远为空 | `server.ts:921-947` 依赖 `telemetryRef.agentId`，Connect 从不写。只影响金额列，token 用量不受影响 |
-| URL 图片 | `request-builder.ts:187` 直接 400；带图 URL 的请求会失败。包 A 第 5 点处理 |
-| 两条路线并存的代价 | key 池两套独立（`cc_credentials` vs `cursor_keys`），粘性两套机制，`usage_source` 硬编码 `"sdk"`（实义是「上游上报」）。请求日志加 provider 列后即可分桶 |
-| 并发同前缀互相读不到对方正在写的条目 | Anthropic 官方明文「N 个并发请求带相同前缀会全部付全价，谁都读不到别人还在写的东西」。你现在每轮三条请求、30~60 秒一批，若近似并发就会命中这条。包 B 让主/子代理拿到不同 conv id 之后，它们本就该是不同前缀，此风险随之下降；若观测期仍见批量 0 命中，再考虑同一 conv id 内串行化（先发一条、等首字节再发其余）|
-| Cursor Grok 4.6 不是 xAI 原生 grok-4.6 | Cursor 员工明确说是「a different configuration」（256k vs 500k 窗口）。所以 xAI 文档只能作强参考，不是字面契约。128 分块这条有强提示（观测到的 5,248 = 41×128，社区多条 Cursor cache read 也都是 128 整数倍）但未被 Cursor 官方确认 |
-| `fast` 与非 `fast` 是否共享缓存池 | 未知。Cursor 有先例：Composer 2 缓存恒 0 而 Composer 2 Fast 正常，员工确认是「a backend caching issue specific to Composer 2」。当前用的是 `-fast` 变体；若观测期命中率仍不动，把「切非 fast 变体」作为一次对照实验 |
-| 换模型必丢缓存 | Cursor 员工原话：前缀缓存绑定具体模型，换模型即重置。所以 `model` 必须进 conv id 派生串（现已如此），且同一段对话内不要切模型 |
+| `src/server.ts` | 三套协议端点、SSE 生成器、请求日志、`streamAbort`、选路接线 |
+| `src/cursor-runner.ts` | SDK 通道 runner，durable 主逻辑 |
+| `src/session-hub.ts` | durable 会话槽与锁 |
+| `src/key-pool.ts` | Cursor Key 池、失败分类、自动禁用 |
+| `src/key-rotating-runner.ts` | 换 key 重试 |
+| `src/cursor-bot/*` | Bot 通道（transport / envelope / checksum / tool-loop / response-normalizer / service / store） |
+| `src/admin.ts` / `src/admin-ui.ts` | 后台 API 与单文件前端 |
+| `src/store.ts` | SQLite（请求日志、key、设置）与列迁移 |
+| `src/types.ts` | `GatewayConfig` / `CursorRunRequest` / `RequestLogRecord` 等共用类型 |
 
-### 5.1 观测数据的另一种解读（不影响方案，但影响预期）
+### -1.6 环境、命令与基线
 
-Cursor 官方对「cache read 巨大而 input 小」的口径是：**面板一行 = 一次用户轮次内所有 LLM 调用的聚合**。支持工程师原话：「你看到的数字是**每一次 LLM 调用**的合计，不是单次调用……假设第一条消息发 20k 上下文，整轮需要 10 次 LLM 请求，你会看到 20k input 和大约 180k cached」。这解释了为什么单行总量能超过模型上下文窗口。
+- 主目录 `E:\docker-composer-api`，Windows + Git Bash；Node 锁 `>=22.13`，镜像 `node:22-bookworm-slim`
+- 部署：`git pull` + `sudo docker compose up -d --build`
+- 测试：`npm test`（= `npm run build && node --test dist/tests/*.test.js`）
+- 类型：`npx tsc --noEmit -p tsconfig.json`
+- **测试基线**：754 tests / 751 pass / **fail 1** / 2 skip。那 1 条红是 `tests/proxy.test.ts:237` 的 SOCKS
+  `getaddrinfo ENOTFOUND example.test`，环境问题，**不算本任务的锅**。只认增量红。
+- 当前 HEAD `de188c9`，`main` 领先 `origin/main` 1 个提交；工作区有未跟踪的 `grok-500k-context/` 等，与本任务无关
 
-对我们的意义：那三条记录（1.1万 / 17.2万 / 2.8万）**可能不是三个独立请求，而是三个用户轮次的聚合**。17.2 万那条 Cache Read 彻底为 0 仍然异常——按聚合口径，它至少该命中与 1.1 万那条同量级的公共头部。所以 §1.3 的四条根因不受影响，但「修好之后单行数字会变多大」不好预测，验收只能看**比值**而不是绝对值。
+### -1.7 干活约束
 
+1. **不得删除或削弱 durable / reuse**（见 -1.3）。
+2. 改文件前先读文件。
+3. 中文回复。
+4. 不擅自 `commit` / `push`，除非用户明说。
+5. 改完跑 `npx tsc --noEmit` 与 `npm test`，并与上面的基线对比。
+6. 本文 §7 里的假设未经包 D 关闭前，相关包不得宣布「已修复」。
 
-## 6. 一句话
+---
 
-**先把 SDK 路线修对，而不是换路线。** 四条根因（conv_id 每轮变、中断毁槽、新槽无历史、主/子代理撞键）全部在我们自己的代码里：`AgentOptions.agentId` 是公开字段可直接传确定性值、断连不毁槽只要 8 行、认 `x-claude-code-agent-id` 即可分开子代理。两个独立开源项目收敛到同一套复用做法且有 ≈90% 命中的外部实测背书。而 Connect 单发单收会**丢掉我们已有的 held execute**（工具续轮从「几百字节」变回「重发全量历史」），对 Claude Code 这种工具密集客户端是净损失 —— 所以它降为备选，在 SDK 主线修完仍不达标时才启动。
+## 0. v2 相对 v1 的差异
 
+| v1 的结论 | 核对结果 | v2 的处置 |
+|---|---|---|
+| 499 来自 `withStreamLog()` 的兜底 `client disconnected before the stream completed`（`src/server.ts:1092`） | **错**。线上日志文案是 `Request was aborted.`，只可能来自 `reportStreamError`（`src/server.ts:1275-1283`）。两条路径被 `finishLog` 幂等 + `!log.finished` 守卫互斥 | 包 C 重写，改判据而不是改日志 |
+| 499 是「成对日志 / 双记」 | **错**。499 与 200 是两条独立 HTTP 请求（499 那条 tokens「未记录」，200 那条有完整用量），时间升序是「先 499 后 200」 | 删掉「双记」说法；§5 的双记断言作废 |
+| 「客户端断连后不再单独记 499，只要有 semantic output 就走 `pathBDone()`」 | **已经做过了**（`cursor-runner.ts:891-895`、`967-971`、`1020-1030` 的 `parkKeepAlive`） | 从计划中删除，避免重复劳动 |
+| §2/§3.3 要改 abort 行为，§6 又说「只在日志里打 reason，park 路径保持原样」 | **自相矛盾** | v2 明确：**不改 park 行为**，只改 abort 的**触发判据** |
+| 额度耗尽「立即 `disable(id, "quota")`」 | 与用户「按打进来的模型禁用对应额度桶、不要盲目禁 key」的要求**冲突**；`getCursorModelQuotaType` 在 v1 里只用于打日志，分桶逻辑白写 | 包 B 重写，补数据模型 / 选 key / 恢复路径 |
+| 「从目录里看 `cursorModel` / `vendorId` / `included` / `usageBased`」 | **字段不存在**。`AvailableModelsResponse.AvailableModel`（`src/cursor-bot/proto/available_models_pb.ts:349-489`）只有 `price` / `vendor` / `vendorName` / `degradation_status` 等 | 改为「人工维护表 + `vendor`/`price` 兜底推断」 |
+| 包 A「最简单、无副作用」 | 偏乐观。要动 `config.ts` env、`gateway-settings.ts` 的 DB 设置行、admin-ui 现有表单 | 补迁移方案，落地顺序后移 |
+| §5「`tests/server.test.ts` 增加 499 断言」 | **测不出来**。全套网关测试走 `app.inject()`（`tests/` 里除 `proxy.test.ts` 自建 net server 外无任何真实 `listen`），模拟 socket 的 `destroyed` 语义与真实 Node HTTP server 不同 | §5 重写测试策略 |
+| debug 模式 | v1 **完全没提**，而 `src/**/*.ts` 里 `debug` 命中 0 次 | 新增包 D，且排在最前 |
+| Bot 工具调用不可用 | v1 只在测试章节提了一句，无任何修复项 | 新增包 F |
+| 轮次错位 / 空轮次送到上游 | v1 完全没提 | 新增包 E（**严重度仅次于 debug**，见 §1.2） |
 
+---
+
+## 1. 根因
+
+> 每条给 `file:line` 证据。**未证实的一律标注「假设（待包 D 验证）」**，不做「已核实、无遗漏」这类断言。
+
+### 1.1 499：请求进网关 5-10ms 内被本地 abort，从未打到上游
+
+**已确认的事实链：**
+
+1. 日志文案 `Request was aborted.` 来自 `reportStreamError`（`src/server.ts:1275-1283`）：
+   `aborted = statusCode===499 && signal.aborted`，纯断连无 `signal.reason`，于是原样落 499。
+   返回 `undefined` ⇒ 不写流内错误事件；`finishLog` 幂等 ⇒ `withStreamLog` 的兜底（`src/server.ts:1092`）不会再记一条。
+2. 0.0s + 无 agentId + 用量「未记录」⇒ runner 第一次被拉取时 `signal` 已 aborted，
+   直接命中 `src/cursor-runner.ts:120`（或 durable 的 `:1049`）抛 499。**上游没被调用过。**
+3. 全网关唯一能在 0ms 置 aborted 的只有 `streamAbort` 的早退分支：
+
+   ```ts
+   // src/server.ts:1136-1144
+   const socket = request.raw.socket;
+   const onClose = () => { clearTimeout(timer); socket?.removeListener?.("close", onClose); controller.abort(); };
+   socket?.once?.("close", onClose);
+   if (request.raw.destroyed || socket?.destroyed) onClose();
+   ```
+4. 旁证：`plans/connect-cache-499-ledger.md:221` 已记过「额外流式 abort 脚本在 3ms 就 499（零语义输出，走旧路径）」。
+5. 该分支**零测试覆盖**：现有 499 用例（`tests/server.test.ts:1654 / 3274 / 3456`）全是直接构造已 abort 的 signal 注入，不经过 `streamAbort`。
+
+**完整会话取样（2026-09-08 22:20:33 → 22:23:25，单一用户请求的全部网关行）把两件事定死了：**
+
+- **不是偶发，是确定性的 1:1**。该窗口内 9 个成功 200 对应 9 条 0.0s 的 499，一个不少。
+  每条 499 都落在「上一次 200 结束 / 下一次 200 开始」的同一秒；早先 19:56 那组采样里两者相隔 7s，
+  499 落在**下一次 200 开始前 1s**，所以 499 归属于**下一个请求的头**，不是上一个的尾。
+- **499 行不是日志伪影，是真实的独立入站请求**。`persistHandlerError`（`src/server.ts:699-715`）在已有 log 时
+  直接 return，而它造的 stub **不写 `model` 字段**；观测到的 499 行却带着 `claude-opus-5`、网关 key 与流式标记，
+  说明它们都走过 `beginLog`（`:770-786`）。同时它们的 agent id 列为空、用量未记录，
+  印证了「进了 handler、没进 runner」。
+
+**由此得出的完整形态（首选假设）：每一个客户端请求都会先被网关在 0ms 误杀一次，客户端 SDK 自动重试，重试才成功。**
+重试之所以能成功，最可能是它开了**新连接**，而被误杀的那一发复用的是上一轮的 keep-alive 连接——
+这也解释了为什么是 100% 而不是偶发。对用户的直接代价：**每一轮都白搭一个往返 + 一次 SDK 重试退避**。
+
+**被误杀的那一发，客户端实际收到的是一段截断的 SSE（已读代码确认，非推测）：**
+
+`anthropicStream` 先 `yield message_start`（`src/server.ts:1486-1498`），**之后**才进 `for await (const event of input.events)`
+（`:1517`）去拉 runner。而 0ms abort 恰好在第一次拉取时抛出。于是：
+
+1. `sendSse` 已提交响应 → 客户端收到 **HTTP 200 + 完整的 SSE 头**；
+2. 客户端收到一条 `message_start`；
+3. 然后连接直接 EOF：**没有 `message_delta`、没有 `message_stop`、也没有 `error` 事件**
+   （`reportStreamError` 对 abort 返回 `undefined`，`:1281-1282` 有意不写流内错误）。
+
+即：**网关内部记的是 499，但对客户端呈现的是一个 200 开头、半途断掉的流**。
+Anthropic SDK 把它当连接错误 → 重试 → 重试成功。这就是 1:1 重试的机制。
+
+**推论（待包 D 坐实，但直接影响优先级）：§1.2 那个「多余的尾部请求」很可能也是它的下游。**
+客户端在截断流上可能已经落下一个空的 / 未完成的 assistant 消息，重试成功后 transcript 多了一截，
+于是它再发一发去「接着写」—— 而那一发没有新的用户消息，就撞上了 400 / 空轮次。
+**若成立，修好包 C 会连带消掉 400 与幻影空轮次，包 E 则从「修复」降为「兵库式护栏」。**
+
+### 1.1.1 提交考古（`git log -S`，已核）
+
+| 东西 | 引入提交 |
+|---|---|
+| `request.raw.destroyed \|\| socket?.destroyed` 这个误判 | `2a26ed7 fix(api): align outbound wire format with OpenAI and Anthropic specs` |
+| `const abort = streamAbort(...)` 调用点 | `0bbf31b feat: upgrade @cursor/sdk to 1.0.27…` |
+| `scopedModelIdentity`（streamAbort 前的 await） | `da57217 优化` |
+| `noteDurableIdentity`（streamAbort 前又一道处理） | `9bd6a38` |
+| `deferRunnerStream` | `855fc50` |
+
+**结论：错误的判据本身早就存在（`2a26ed7`，远早于 durable），但 `855fc50` 改变了它的发作形态。**
+
+`855fc50` 之前是 `openRunnerStream`：**先预取 runner 的首个事件，成功了才提交 SSE**。
+预取阶段报错走 `catch` → `finishLog` → `throw resolved` → Fastify 错误处理器 → 客户端收到**一个真正的 HTTP 错误响应**。
+`855fc50` 换成 `deferRunnerStream`：runner 到第一次 `next()` 才启动，而那时 `message_start` 早已出门、SSE 已提交。
+于是同一个 0ms abort 从「干净的 HTTP 错误」变成了「200 + 半截流」，而半截流正好是 SDK 重试的触发条件。
+
+**所以用户的直觉是对的，但不能回滚 `855fc50`。** 它本身修的是另一个真问题：
+旧注释写得很清楚——「等首个上游事件太久才提交 SSE 时，Claude Code / CLIProxyAPI 会按 TTFB 断连，网关日志就是 499」。
+回滚等于把 TTFB 499 换回来。正确做法是**保留早提交 SSE，同时修掉误判**（包 C），并补上下一条防御：
+
+**包 C 追加一条**：`reportStreamError`（`src/server.ts:1275-1283`）现在把「signal.aborted」等同于「客户端已走」，
+因此不写流内 error 事件。误判场景下客户端**还连着**，这一假设不成立。
+改为按真实 socket 状态判断：客户端仍在线就必须发一个规范的 `error` 事件再收尾，绝不能裸 EOF。
+
+**假设（待包 D 验证）：** `request.raw.destroyed` 是误判源。`request.raw` 是 `IncomingMessage`，
+Node ≥16 起它在**请求体被读完之后**即为 `true`，并不代表连接断开；项目锁 Node ≥22.13（`package.json:27`、`Dockerfile:2`）。
+POST body 被 Fastify 解析完，到 handler 调 `streamAbort` 之间隔着 `await scopedModelIdentity(...)`（`src/server.ts:391`），
+这段时序竞争能同时解释：偶发、0ms、SDK 与 Bot 都有（这行在共用的 `server.ts`）、durable 两个 commit 之后变明显（它们在 `streamAbort` 之前加了 await）。
+
+正确判据应为 `socket.destroyed`，或 `request.raw.destroyed && !request.raw.complete`。
+
+**与 durable 无关。** 这条路径在 `streamAbort` 里，早于任何 Hub / park 逻辑。修它不需要碰 reuse。
+
+### 1.2 轮次错位：网关会把「空的 / 不对应本次请求的」轮次送给上游（新增，严重）
+
+**一手证据（已复现两次）：** 2026-09-08 的评审会话中，上游模型两度收到**内容为空的用户轮次**（~14:14、~14:17 UTC），
+而用户两次都确认未发送任何消息。即：网关侧凭空产生了上游调用。这不是日志问题，是**正确性问题**。
+
+**循环形态（用户确认）：** `对话结束 → 空用户轮次 → 再次结束 → 400`。
+
+**三次复现的计数与时序规律（~14:14 / ~14:17 / ~14:22 UTC，新增，比「含工具调用」更锐利）：**
+
+- **与真实用户消息 1:1**。每一条真实用户消息之后恰好跟一个幻影轮次；
+  而幻影轮次之后的助手轮次**不会**再产生下一个幻影。即：不是无限循环，是**每次真实请求被复制成两份**。
+  （这条反例排除了「含工具调用就触发」：幻影后的那两个助手轮次同样调了工具，却没有幻影。）
+- **落地时点不是固定延迟，而是「前一个助手轮次刚好结束那一刻」**（两分钟的长轮就等两分钟）。
+  这指向「第二份请求被串行阻塞在第一份后面，锁释放才被服务」，而不是客户端独立发起的定时重试。
+  候选阻塞点：`hub.acquire(durableId, signal)`（`src/cursor-runner.ts:253-255`、`src/session-hub.ts:363`）。
+  **判别器**：该分支只对 `tool_results` 类型的轮次阻塞等锁，`new_user` 走的是非阻塞 `tryAcquire`。
+  所以包 D 快照里这两份请求各自被归为哪种 `durableTurn.kind`，直接决定阻塞假设成不成立。
+
+尾巴那条 400 已抓到：
+
+```
+09/08 22:19:06  /v1/messages  claude-opus-5  gateway  env-sk-***  400  0.0s  …  Empty durable turn: the last user message is unchanged.
+```
+
+**这条 400 是决定性证据，它证明：**
+
+1. 确实存在一次**真实的额外入站 HTTP 请求**（它进了 `request_logs`），不是网关内部凭空多驱动一次 Run。
+2. 报错来自 `runDurableLocked` 的两个 400 分支之一（`src/cursor-runner.ts:294-296` 的 `kind==="empty"`，
+   或 `:300-307` 的 `new_user` 且 `turn.userText === slot.lastUserText`）。
+   **两个分支抛的是完全相同的字符串**，目前无法从日志区分—— 这本身是个得先修的可诊断性缺陷。
+
+**因果链（已根据 22:23 那组采样修正）。** 早前版本把 400 归因于「499 污染了 `lastUserText`」，那是错的：
+采样显示 499 请求**从未进入 runner**（agent id 为空、用量未记录），它根本谈不上调用
+`touchSlotHistory`（`src/cursor-runner.ts:398`），也就污染不了任何东西。真正的链是：
+
+1. 本轮请求正常成功（200），`sendRecoverable` 之后 `touchSlotHistory(slot, userText)` 把
+   `slot.lastUserText` 写成本轮文本。**这是正常行为。**
+2. 助手轮次结束后，客户端**又多发了一发**，而这一发没有新的用户消息。
+3. 这一发照例先被 0ms 误杀成 499（§1.1），SDK 重试。
+4. 重试进入 `runDurableLocked`，`userText === slot.lastUserText` → 命中 `:300-307` → **400**。
+
+所以 499 与 400 不是因果关系，而是**同一个「多余的尾部请求」先后经历的两道关卡**。
+根因分两层，必须分别修：
+
+- **为什么每一发都先 499** → §1.1，包 C。
+- **为什么助手轮次结束后还会多出一发** → 尚未定位；它才是「空轮次」与 400 的源头。
+  当前最可能：客户端认为上一条 SSE 流没有正常收尾（`message_stop` 缺失，或被 0ms abort 干扰）而补发一次。
+  **包 D 必须把这一发的完整入站 body 落盘**，看它到底带没带新的用户消息。
+
+**仍未解释的缺口：** 上游到底怎么收到一个**真空轮次**而不是被 400 拦住的。
+`kind:"empty"` 在 `:294` 就抛 400，按理说到不了上游。候选：slot 被重建导致 `lastUserText === undefined`
+后落入 `formatDurableUserMessage({ userText: turn?.userText ?? "" })`（`:385-396`），或 held execute 续跑多驱动了一次
+（`:347-367`）。见 §7 第 3 / 3b。
+
+**机理（部分确认 + 部分假设）：**
+
+- durable 路径对上游只发**增量**，不发完整 transcript：`extractDurableTurn`（`src/prompt-delta.ts:48-88`）
+  只取最后一条用户消息，历史全靠 park 住的 agent 自己记。
+- 送出的文本是 `formatDurableUserMessage({ firstSend, userText: turn?.userText ?? "", systemText })`
+  （`src/cursor-runner.ts:385-396`）。**`turn` 缺失或 `userText` 为空时，送出的就是一条空用户消息。**
+- 唯一的「历史是否还对得上」护栏是 `inboundHistoryIncompatible`（`src/session-hub.ts:241-255`），
+  但它 `if (!issued.length) return false` —— **纯文本对话（从未发生工具调用）完全不做一致性检查**。
+- `kind:"empty"` 的 400 守卫（`src/cursor-runner.ts:294-307`）只覆盖「最后一条用户消息与上轮完全相同」，
+  不覆盖「slot 的上游历史已与客户端 transcript 分叉」。
+- 与 1.1 的联系（假设，待验证）：0ms 499 之后客户端会重试；重试打到一个**已 park、仍持有上一轮 Run** 的 slot 时，
+  `consumeDurablePump`（`src/cursor-runner.ts:874-1030`）可能把**上一轮**残留的事件当作本轮输出排空 ——
+  这正好解释线上那些「0.0s、有 token 估算、却不可能真生成完」的 200 行。
+
+**结论：一个会静默送出空轮次的 reuse 路径，比缓存未命中更糟。** 但**解决办法不是关掉 reuse**，
+而是加「证明不了一致就退回 stateless 全量」的护栏（包 E）。
+
+### 1.3 Bot 代理下工具调用不可用
+
+现象（用户提供）：在 Claude Code 里走 bot 路，模型把 `<invoke name="Bash">…` 当**正文**吐出来，随后会话终止。
+
+根因（已确认代码，效果待包 F 实测）：
+
+- `botSendTools` 默认 **false**：`src/config.ts:72` `booleanValue(env.CURSOR_BOT_SEND_TOOLS, false)`。
+- ⇒ `src/cursor-bot/provider.ts:137` 不给上游带 `tools`。
+- ⇒ `src/cursor-bot/service.ts:166` `orchestratedTools()` 直接 `return []`。
+
+模型没被告知有工具可用 → 自己编 XML → 网关没有 `tool_use` 可回 → Claude Code 收到纯文本就停。
+
+### 1.4 运行设置 SDK / Bot 不隔离
+
+- `requestModelControls()`（`src/server.ts:1606-1615`）只读 `config.cursorFastPolicy` / `cursorMaxModePolicy` /
+  `cursorReasoningEffort` / `cursorAgentMode` / `cursorModelParams`，**不区分 provider**。
+- 调用点 `src/server.ts:945` 与 `selectProvider(...)`（`:931`）在同一个函数里，**`selection.provider` 当场就能拿到** ——
+  改造只需把它传进去。（v1 写的 `prepared.provider` 这个字段不存在。）
+- Bot 自己的 `sendTools` / `botCodec` 在后台只读回显（`src/admin-ui.ts:1084`），无独立可写表单。
+- 自动禁用阈值 `autoDisableThreshold`（`src/types.ts:56`）全局一份。
+
+### 1.5 额度耗尽不会立即禁用，且没有额度分桶
+
+- SDK：`classifyKeyFailure()`（`src/key-pool.ts:525-538`）能把 402 / unpaid invoice 判成 `quota`，
+  但 `reportFailure()`（`:397-408`）仍要 `failures >= policy.threshold` 才 `disable`。
+- Bot：`noteFailure()`（`src/cursor-bot/service.ts:499-509`）**只认 401/403**，且 `CREDENTIAL_FAILURE_LIMIT = 5`（`:64`）；
+  `resource_exhausted` 映射成 429（`src/cursor-bot/errors.ts:35`），既不计数也不禁用。
+- 没有 cursor models / other models 的额度桶概念，key 记录里也没有承载它的字段。
+- **注意**：402 `unpaid invoice` 是**账号级欠费**（整把 key 该禁），与**某个额度桶耗尽**（只该禁那个桶）是两回事，不能用同一条规则。
+
+---
+
+## 2. 方案总览（六包，按依赖排序）
+
+| 包 | 内容 | 依赖 | 碰 park 吗 |
+|---|---|---|---|
+| **D** | Debug 模式：全链路请求/响应/网关决策落盘 | 无 | 否 |
+| **C** | 499：收紧 `streamAbort` 的断连判据 | D（取证） | 否 |
+| **E** | 轮次一致性护栏 + 不一致时退回 stateless | D | **加护栏，不删复用** |
+| **F** | Bot 工具链打通 | D | 否 |
+| **A** | SDK / Bot 运行设置隔离 | 无（可并行） | 否 |
+| **B** | 额度分桶 + 立即禁用 | A（共用设置面） | 否 |
+
+---
+
+## 3. 详细实施
+
+### 3.1 包 D：Debug 模式（**先做，其余包的取证基础**）
+
+**为什么排第一**：`src/**/*.ts` 里 `debug` 命中 0 次；1.1 的根因假设、1.2 的机理、1.3 的修复效果，
+全都只能靠它确认。v1 把最需要证据的 499 排在最后，却没安排任何取证手段。
+
+1. 开关：`GATEWAY_DEBUG`（env）+ 后台可切换的运行时开关（存 `gateway-settings.ts`，与 `autoDisableThreshold` 同机制）。
+   默认关。开启后按 owner / endpoint / 模型可过滤，避免全量刷盘。
+2. 落盘内容（每请求一条 JSON，带 `logId` 与 `request_logs` 关联）：
+   - 入站：完整 headers（`authorization` / `x-api-key` 掩码）、完整 body。
+   - 选路：`selectProvider` 结果、选中的 key（掩码）、`durableSessionId`、`reuseDurableAgent`、`durableTurn.kind`。
+   - **上游实际发出的轮次全文**（`formatDurableUserMessage` 的产物 / Bot 的 Connect 请求体）—— 这是 1.2 的关键证据，不能只记摘要。
+   - abort 归因：触发 `onClose` 的分支、`request.raw.destroyed` / `request.raw.complete` / `socket.destroyed` 三个值、`signal.reason`。
+   - 出站：SSE 逐事件 / 非流式响应体、`finishLog` 的 status 与 error。
+3. 存放：`dirname(SQLITE_PATH)/debug/<date>/<logId>.json`，带条数与总体积上限 + LRU 清理（复用包 M3 的有界回收思路）。
+4. 后台：请求日志「详情」里加「Debug 快照」页签，直接读这条 JSON。
+
+**安全**：session token / API key / `sessionToken` 一律掩码，与 `maskKey`（`src/key-pool.ts:540`）同一套。
+debug 文件不进 git，`.gitignore` 补一条。
+
+**验收**：开关打开后，能对一条 499 请求答出「是哪个分支 abort 的、三个 destroyed 值分别是什么」。
+
+### 3.2 包 C：499
+
+1. 用包 D 的 abort 归因确认 1.1 的假设。
+2. 确认后，把 `src/server.ts:1144` 的判据从 `request.raw.destroyed || socket?.destroyed`
+   收紧为 `socket?.destroyed === true || (request.raw.destroyed && !request.raw.complete)`。
+   保留原注释想解决的问题（监听注册前就真断连），只是不再把「body 读完」当成断连。
+3. `request_logs` 增加 `abortReason` 列（`client_disconnect` / `idle_timeout` / `upstream_canceled` / `local_abort`），
+   后台在 499 行展示。迁移与 `provider TEXT` 同一套 `migrateRequestLogColumns`。
+4. **不动** `parkKeepAlive` / `parkPathB` / `pathBDone` 的任何行为。
+
+**验收**：正常流式请求（客户端不断连）不再出现 0ms 499；真断连仍记 499 且 `abortReason=client_disconnect`；
+空闲超时仍记 504。
+
+### 3.3 包 E：轮次一致性护栏（**不删 reuse**）
+
+1. **禁止发空轮次**：`src/cursor-runner.ts:385-396`，`userText` 为空且无 images 且非 `tool_results` 时，
+   不得 `send`。此时按「不一致」处理（走第 3 步），并在包 D 快照里标红。
+2. **补齐一致性检查**：`inboundHistoryIncompatible`（`src/session-hub.ts:241-255`）当前在 `!issued.length` 时直接放行，
+   纯文本会话完全没有护栏。改为额外比对「入站 transcript 里上一条 assistant 文本」与 slot 记录的上一轮输出摘要
+   （哈希即可，不存原文）；对不上 ⇒ `history` 不兼容。
+3. **不一致时的行为**：退回 `streamLocked({ ...input, forceStateless: true })`（这条路径已存在，见 `src/cursor-runner.ts:264`），
+   即本轮发全量 transcript。**只牺牲这一轮的缓存命中，不销毁 agent、不关闭 reuse。**
+   同时 `recordDurableDecision({ decision:"fallback", reason:"history_mismatch" })`，让 `/health` 与后台能看到发生频率。
+4. **park 住的 Run 与新请求的绑定**：`consumeDurablePump` 排空 pump 前，校验 pump 里的事件属于当前 `runId`；
+   属于上一轮的残留事件必须丢弃而不是当作本轮输出。（这条直接对应线上那些 0.0s 的 200。）
+5. **「没有新用户消息」不是错误，是「本轮不适用增量」**—— 本包最关键的一条。
+   `src/cursor-runner.ts:294-296` 与 `:300-307` 现在都直接抛 400，把客户端的正常重试打成硬失败。改为：
+   - **先让两个分支抛不同的 message / code**，否则日志里分不清是哪条（一行改动，最先做）。
+   - `kind==="empty"`（入站请求真的没给新内容）→ 维持 400，但文案要说清是请求体本身无可发送内容。
+   - `new_user` 且 `userText === slot.lastUserText`（**重试**）→ **不得 400**。这一轮的消息上游其实已经收到，
+     正确动作是继续消费该 slot 的输出（park 住的 Run / pump）；拿不到就退回 stateless 全量重跑，绝不报错。
+6. **`slot.lastUserText` 的写入时机**：`touchSlotHistory(slot, userText)`（`:398`）在 send 之后立即写，
+   于是「已发给上游但客户端一个字没拿到」的中断会留下污染记录（§1.2 因果链第 1-2 步）。
+   改为分开记「已发送」与「已向客户端交付过语义输出」两个状态，重试时据此决定是续播还是重发。
+7. **held execute 续跑只能被驱动一次**：`resolvePending` 成功后走 `markRunning` + `consumeDurablePump`
+   （`:347-367`）继续同一个 Run。加幂等标记（键：`runId` + 已解决的 execute id 集合），
+   避免上游多收到一个无输入的轮次（§1.2 未解释缺口的候选之一）。
+
+**验收**：包 D 快照里，每一次上游调用都能对上一条客户端请求，且没有空 `userText` 的 send；
+`hitRatio` 不得因本包显著下降（下降说明护栏过严，需要调哈希口径而不是撤护栏）。
+
+### 3.4 包 F：Bot 工具链
+
+1. 先做最小验证：`CURSOR_BOT_SEND_TOOLS=true` 跑一遍 Claude Code 的工具循环，用包 D 快照看
+   （a）上游请求里有没有 `tools`；（b）上游回的是结构化 tool call 还是正文 XML。
+2. 若上游回结构化 → 只需把默认值改掉 + 在包 A 的 Bot 表单里暴露开关。
+3. 若上游仍回正文 XML → 走 `parseToolMarkers` / `keepDeclaredOnly` 那条已有的 marker 解析链
+   （SDK 侧同款逻辑在 `src/cursor-runner.ts:979-991`），在 `src/cursor-bot/response-normalizer.ts` 里补等价还原，
+   把正文里的调用还原成 `tool_use` 块。
+4. `src/cursor-bot/tool-loop.ts` 的多轮工具循环要能在 Anthropic 协议下把 `tool_result` 正确回灌。
+
+**验收**：Claude Code 走 `bot/*` 模型，能完成「列目录 → 读文件 → 回答」的至少三轮工具循环，不出现正文 XML。
+
+### 3.5 包 A：SDK / Bot 运行设置隔离
+
+1. `GatewayConfig`（`src/types.ts`）下拆 `sdkConfig` / `botConfig`，各自持有
+   `cursorFastPolicy` / `cursorMaxModePolicy` / `cursorReasoningEffort` / `cursorAgentMode` / `cursorModelParams` /
+   `autoDisableKeys` / `autoDisableThreshold` / `requestTimeoutMs`；`botConfig` 另含 `botSendTools` / `botCodec`。
+2. `requestModelControls(request, config, model)` 增加 `provider: GatewayProvider` 参数，
+   调用点 `src/server.ts:945` 直接传 `selection.provider`（`:931` 已算好）。
+3. **迁移**：`config.ts` 的旧 env 名保留为两侧的共同默认值（不破坏现有部署）；
+   `gateway-settings.ts` 里已存的旧 setting key 读取时映射到 `sdkConfig`，写入时按新 key 双写一个版本，
+   一个版本后再删旧 key。**升级不得让线上现有设置回默认值。**
+4. `admin.ts` / `admin-ui.ts` 拆成「SDK 运行设置」「Bot 运行设置」两块，Bot 的 `sendTools` / `botCodec` 改为可写。
+
+### 3.6 包 B：额度分桶 + 立即禁用
+
+1. **先分类，再决定禁什么**：
+   - **账号级**（402 unpaid invoice / payment required）⇒ 立即整把 `disable(id, "quota")`，不看阈值。
+   - **桶级**（某类模型额度耗尽）⇒ 只把该 key 的**该桶**标记为耗尽，key 保持 active。
+   - auth 类 ⇒ 维持现有阈值累计逻辑（`autoDisableThreshold` 字段只留给它）。
+2. **数据模型**（v1 缺失）：`cursor_keys` 增列 `exhaustedBuckets TEXT`（JSON：`{"other":"2026-10-01T00:00:00Z"}`，值为过期时间）。
+   写 `migrateCursorKeyColumns`，`MemoryStateStore` 同步。
+3. **选 key**：`effectiveScope()`（`src/key-pool.ts:456`）之外增加一层过滤 ——
+   本次请求模型所属桶已耗尽且未到期的 key 不参与候选。全池都耗尽时按原顺序照常尝试（不能因为分桶把请求打成无 key 可用）。
+4. **恢复路径**：到期自动清除；后台每把 key 提供「清除额度标记」按钮；一次成功即清掉该桶标记（与 `recordSuccess` 同处）。
+5. **桶归属来源**：
+   - 主：`data/model-quota-buckets.json` 人工维护表（用户已同意人工更新），后台可编辑。
+   - 兜底：`vendor` / `vendorName` / `price`（`src/cursor-bot/proto/available_models_pb.ts:467-471, 368-369`）推断，
+     推断不出按 `other` 处理（更保守）。
+   - **不要**写「从目录里读 `usageBased` / `included`」—— 这些字段不存在。
+6. **与现有优先级的关系**：`classifyKeyFailure` 里 `upstream_run_failed` ⇒ `transient` 优先于 quota（`src/key-pool.ts:528`）。
+   新的「立即禁用」必须明确插在这条**之后**（即仍先排除 transient），否则会把上游临时故障当成欠费。
+7. **Bot 侧**：`noteFailure`（`src/cursor-bot/service.ts:499-509`）接受 429 `resource_exhausted`，但**必须先排除非额度来源**：
+   本地 `EnvelopeTooLargeError` 也要求映射成 `resource_exhausted`（`src/cursor-bot/envelope.ts:35`）。
+   判据写死：**只有上游 EndStream 帧带回来的 `resource_exhausted` 才算额度**，本地抛的一律不算。
+8. **双向联动**：bot 凭据因额度停用时，通过 `sourceCursorKeyId`（`src/cursor-bot/store.ts:292`）同步标记对应 key 的桶；
+   反之 SDK 侧标记桶时，同步标记由该 key 兑换出来的 bot 凭据。
+
+---
+
+## 4. 被否决的替代路线
+
+- **关闭 / 弱化 durable reuse 来消灭 499 与轮次错位**：reuse 是缓存命中与「接近原生能力」的唯一来源，代价不可接受。
+  且 499 的根因在 `streamAbort`，与 reuse 无关 —— 关掉它 499 照旧。
+- **只把 499 从日志里隐藏**（v1 包 C 第 3 步）：499 是真实失败的请求，隐藏后失去唯一证据，问题变成不可观测。
+- **所有失败都立即禁用 key**：会误杀协议非法（多 system / 同角色 / 超长）与本地 envelope 超限触发的 `resource_exhausted`。
+- **额度耗尽一律整把禁 key**：与「按模型禁对应额度桶」的要求冲突；一把 key 的 cursor models 额度往往还能用。
+- **先做包 A/B 再做 debug**：A/B 不需要证据也能做，但 C/E/F 三包没有 debug 就只能靠猜 —— v1 的顺序问题正在于此。
+- **靠 `app.inject()` 覆盖 499**：模拟 socket 的 `destroyed` 语义与真实 server 不同，永远测不出真问题（见 §5）。
+
+---
+
+## 5. 测试策略
+
+**v1 的 §5 不成立**：全套网关测试走 `app.inject()`（`tests/` 里除 `proxy.test.ts` 自建 net server 外无任何真实 `.listen`），
+light-my-request 的模拟 socket 与真实 Node HTTP server 在 `request.raw.destroyed` / `socket.destroyed` 上行为不同，
+现有 499 用例（`tests/server.test.ts:1654 / 3274 / 3456`）全是注入已 abort 的 signal，**绕过了出问题的那段代码**。
+
+| 包 | 单测 | 集成 / live |
+|---|---|---|
+| D | 掩码不泄漏 token；体积上限与 LRU 清理 | 手动开关一次，检查快照字段齐全 |
+| C | 新增 `tests/server-http.test.ts`：**真实 `app.listen(0)`**，发正常流式 POST（客户端不断连），断言不出 499；再发一条中途 `req.destroy()` 的，断言记 499 且 `abortReason=client_disconnect` | `scripts/live-durable-smoke.mjs` 跑一遍，`request_logs` 里 0 条 0ms 499 |
+| E | 历史分叉 ⇒ 走 stateless 回退且 slot 存活；空 `userText` ⇒ 不 send；上一轮残留事件不计入本轮 | Claude Code ≥20 轮真实对话，包 D 快照逐条核对「上游轮次 ↔ 客户端请求」一一对应 |
+| F | `response-normalizer` 把正文 XML 还原成 `tool_use` | Claude Code 走 `bot/*` 完成三轮工具循环 |
+| A | provider 不同 ⇒ 解析出不同 `ModelIntent`；旧 setting key 迁移后值不变 | 后台两张表单互不影响 |
+| B | 402 ⇒ 整把禁；桶耗尽 ⇒ key 仍 active 但该桶不被选中；到期自动恢复；本地 `EnvelopeTooLargeError` **不**触发禁用 | 后台手动清除标记 |
+
+**基线**：`npm test` 当前 754 tests / 751 pass / **fail 1**（`tests/proxy.test.ts:237` SOCKS `ENOTFOUND example.test`，环境红项）/ 2 skip。
+只认**增量**红。
+
+---
+
+## 6. 落地顺序与风险
+
+1. **包 D**（debug）—— 无行为改动，纯增量，风险最低，且是后面三包的前提。
+2. **包 C**（499）—— 单行判据 + 一列日志，不碰 park，但**性价比最高**。
+   它不只是消掉日志里的红字：按 §1.1 的量化，现在**每一个客户端请求都白搭一个往返加一次 SDK 重试退避**；
+   若 §1.1 末尾那个推论成立，它还会连带消掉 400 与幻影空轮次。
+   风险：判据收得过松会让真断连变成 504 空转，由 `abortReason` 统计兜底观察。
+3. **包 E**（轮次一致性）—— **本计划风险最高的一包**。护栏过严会拉低 `hitRatio`，
+   缓解：护栏只触发「本轮退回 stateless」，不销毁 agent、不关 reuse；`recordDurableDecision` 全量打点，
+   上线后先看 `fallback/history_mismatch` 的占比再调哈希口径。**任何情况下不得以「简化」为由删除 park。**
+4. **包 F**（Bot 工具）—— 独立，可与 E 并行。
+5. **包 A**（设置隔离）—— 破坏性在配置迁移，不在逻辑；必须验证升级后线上既有设置不回默认值。
+6. **包 B**（额度分桶）—— 依赖 A 的设置面；需要 DB 迁移，要先在测试库验证 `migrateCursorKeyColumns`。
+
+---
+
+## 7. 未证实清单（上线前必须由包 D 关闭）
+
+| # | 假设 | 关闭方式 |
+|---|---|---|
+| 1 | 0ms 499 的直接原因是 `request.raw.destroyed` 在 body 读完后为 true | 包 D 打出 abort 分支与三个 destroyed 值 |
+| 2 | 线上 0.0s 却有 token 估算的 200 行，是 park 住的上一轮 Run 残留事件被当作本轮输出 | 包 D 比对 `runId` 与响应内容 |
+| 3 | **499 → 400 因果链**：abort 发生在 send 之后，`slot.lastUserText` 已被污染，客户端重试即撞 `:300-307` | 包 D 核对 400 请求的 transcript 与上一条 499 是否同一份；证据已很强，仍需快照坐实 |
+| 3b | 真空轮次抵达上游的路径：slot 重建后 `userText` 为空仍 send（`:385-396`），或 held execute 续跑多驱动一次（`:347-367`） | 同一份快照；两条互斥，看落在哪一边 |
+| 4 | Bot 工具失效只是 `botSendTools=false`，上游本身支持结构化工具 | 包 F 第 1 步实测 |
+
+> 以上四条在关闭之前，相关包**不得**进入「已修复」状态。

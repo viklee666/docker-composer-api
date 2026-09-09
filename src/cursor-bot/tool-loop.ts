@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
+import type { DebugUpstreamSink } from "../debug-recorder.js";
 import type { CursorStreamEvent, GatewayToolCall, RequestUsage } from "../types.js";
 import type { CursorBotClient } from "./client.js";
 import { conversationMessages, type PreparedConversation } from "./conversation.js";
@@ -12,6 +13,7 @@ import {
   type BotToolResult
 } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
+import { InferenceStreamRequest } from "./proto/inference_pb.js";
 import type { CursorBotStore } from "./store.js";
 
 /** 一次工具执行的结果。`isError` 会原样进 `InferenceToolResultPart.is_error`。 */
@@ -47,6 +49,11 @@ export interface ToolLoopOptions {
   maxIterations?: number;
   newInvocationId?: () => string;
   signal?: AbortSignal;
+  /**
+   * Debug 快照引出通道（包 D）：每一轮 Stream 请求发出前把 Connect 请求体全文写回。
+   * 可选；不传时零开销。与 provider.ts 单发路径的记录口径一致（同为请求体 JSON 全文）。
+   */
+  debugRef?: DebugUpstreamSink;
 }
 
 export type ToolLoopStop = "completed" | "awaiting_caller" | "max_iterations";
@@ -116,15 +123,30 @@ export async function* runToolLoop(
       requestedModel: options.requestedModel,
       ...(options.modelConfig ? { modelConfig: options.modelConfig } : {})
     });
+    // 包 D：工具循环里每一轮的 Connect 请求体全文（iteration 标注轮次），在发之前记。
+    try {
+      options.debugRef?.noteUpstreamTurn("bot", { iteration, request: safeRequestJson(request) });
+    } catch {
+      // 观测路径不得影响请求。
+    }
 
-    const normalizer = new ResponseNormalizer();
+    const normalizer = new ResponseNormalizer({
+      // 本轮声明了 tools 才解析正文标记（包 F）：上游可能不回结构化 tool_call 帧而把
+      // 调用写进正文，这里把它们还原成 tool_call 事件喂给循环；声明表一并交给
+      // normalizer 做未声明过滤与别名归一（与 SDK 侧同口径）。
+      parseToolMarkers: (options.conversation.tools?.length ?? 0) > 0,
+      tools: options.conversation.tools
+    });
     for await (const frame of deps.client.stream(request, options.signal)) {
       deps.onEvents?.(draftEventsFromFrame(frame), iteration);
       yield* normalizer.accept(frame);
     }
     yield* normalizer.flush();
 
-    aggregate.text += normalizer.state.text;
+    // 聚合文本读 result()：flush 的尾部残文（held / 未闭合 marker）只有 result() 的
+    // 聚合口径收全了，直接读 state.text 会漏掉最后一段正文。
+    const turn = normalizer.result();
+    aggregate.text += turn.text;
     aggregate.reasoningText += normalizer.state.reasoningText;
     if (normalizer.state.usage) usage = mergeUsage(usage, normalizer.state.usage);
     if (normalizer.state.resolvedModel) resolvedModel = normalizer.state.resolvedModel;
@@ -170,7 +192,7 @@ export async function* runToolLoop(
 
     messages.push({
       role: "assistant",
-      ...(normalizer.state.text ? { text: normalizer.state.text } : {}),
+      ...(turn.text ? { text: turn.text } : {}),
       toolCalls: calls.filter((call) => executed.handled.has(call.id))
     });
     messages.push({ role: "tool", toolResults: executed.results });
@@ -274,4 +296,21 @@ function mergeUsage(current: RequestUsage | undefined, next: RequestUsage): Requ
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 200) : "tool execution failed";
+}
+
+/**
+ * `InferenceStreamRequest` → 可落盘的 JSON（包 D）。toJsonString 失败时退回最小摘要并如实标注，
+ * 与 provider.ts 的 safeRequestJson 同口径；不共用一个文件只是为了避免 tool-loop 反向依赖 provider。
+ */
+function safeRequestJson(request: InferenceStreamRequest): unknown {
+  try {
+    return JSON.parse(request.toJsonString()) as unknown;
+  } catch (error) {
+    return {
+      parseFailed: true,
+      error: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      conversationId: request.conversationId,
+      messageCount: request.messages.length
+    };
+  }
 }

@@ -10,6 +10,7 @@ import {
 } from "./protocol.js";
 import { systemSeedText } from "./routing.js";
 import { resolveSystemText } from "./system-prompt.js";
+import { assistantTextDigest } from "./session-hub.js";
 import { isHostMetaTool } from "./tool-compat.js";
 import type { DurableTurn, GatewayImage, GatewayTool, ProtocolKind, SystemPromptSettings } from "./types.js";
 
@@ -33,6 +34,8 @@ interface TurnBits {
   userText?: string;
   images?: GatewayImage[];
   toolResults?: DurableTurn["toolResults"];
+  /** 入站 transcript 上一条 assistant 消息的正文（包 E 一致性护栏用；空文本返回 undefined）。 */
+  lastAssistantText?: string;
 }
 
 /**
@@ -72,19 +75,25 @@ export function extractDurableTurn(
         : extractResponses(record, previous);
 
   const toolResults = bits.toolResults?.length ? bits.toolResults : undefined;
+  // 包 E：上一条 assistant 文本的摘要进 turn（叠加 systemText 包装），runner 侧与 slot 记录的上一轮输出比对。
+  const withDigest = (turn: DurableTurn): DurableTurn => {
+    const wrapped = withSystem(turn);
+    const digest = bits.lastAssistantText ? assistantTextDigest(bits.lastAssistantText) : undefined;
+    return digest ? { ...wrapped, assistantDigest: digest } : wrapped;
+  };
   if (toolResults) {
-    return withSystem({ kind: "tool_results", systemFingerprint, toolsFingerprint, toolResults });
+    return withDigest({ kind: "tool_results", systemFingerprint, toolsFingerprint, toolResults });
   }
 
   const userText = bits.userText ?? "";
   const images = bits.images?.length ? bits.images : undefined;
   if (slotHints?.lastUserText !== undefined && slotHints.lastUserText === userText) {
-    return withSystem({ kind: "empty", systemFingerprint, toolsFingerprint });
+    return withDigest({ kind: "empty", systemFingerprint, toolsFingerprint });
   }
   if (!userText && !images) {
-    return withSystem({ kind: "empty", systemFingerprint, toolsFingerprint });
+    return withDigest({ kind: "empty", systemFingerprint, toolsFingerprint });
   }
-  return withSystem({ kind: "new_user", systemFingerprint, toolsFingerprint, userText, images });
+  return withDigest({ kind: "new_user", systemFingerprint, toolsFingerprint, userText, images });
 }
 
 export function fingerprintTools(tools: GatewayTool[]): string {
@@ -114,13 +123,22 @@ function extractChat(record: Record<string, unknown>): TurnBits {
   }
   const trailing = messages.slice(i + 1);
   const toolResults = chatToolResults(trailing, metaIds);
-  if (toolResults.length) return { toolResults };
+  if (toolResults.length) return { toolResults, lastAssistantText: chatLastAssistantText(messages.slice(0, i + 1)) };
 
   const lastUser = lastRoleMessage(messages.slice(0, i + 1), "user");
   if (!lastUser) return {};
   const images: GatewayImage[] = [];
   const userText = stripImagePlaceholders(contentToTextAndImages(lastUser.content, images, false));
-  return { userText, images };
+  return { userText, images, lastAssistantText: chatLastAssistantText(messages.slice(0, i + 1)) };
+}
+
+/** 包 E：入站 chat transcript 上一条 assistant 消息的正文（无正文/无 assistant 轮返回 undefined）。 */
+function chatLastAssistantText(messages: unknown[]): string | undefined {
+  const last = lastRoleMessage(messages, "assistant");
+  if (!last) return undefined;
+  const images: GatewayImage[] = [];
+  const text = contentToTextAndImages(last.content, images, false).trim();
+  return text || undefined;
 }
 
 function chatToolResults(trailing: unknown[], metaIds: ReadonlySet<string>): NonNullable<DurableTurn["toolResults"]> {
@@ -149,12 +167,20 @@ function extractAnthropic(record: Record<string, unknown>): TurnBits {
   if (!last) return {};
 
   const toolResults = anthropicToolResults(last.content, metaIds);
-  if (toolResults.length) return { toolResults };
+  if (toolResults.length) return { toolResults, lastAssistantText: anthropicLastAssistantText(messages) };
 
   const images: GatewayImage[] = [];
   collectAnthropicImages(last.content, images);
   const userText = anthropicUserText(last.content);
-  return { userText, images };
+  return { userText, images, lastAssistantText: anthropicLastAssistantText(messages) };
+}
+
+/** 包 E：入站 anthropic transcript 上一条 assistant 消息的正文（无正文返回 undefined）。 */
+function anthropicLastAssistantText(messages: unknown[]): string | undefined {
+  const last = lastRoleMessage(messages, "assistant");
+  if (!last) return undefined;
+  const text = anthropicUserText(last.content).trim();
+  return text || undefined;
 }
 
 function anthropicToolResults(content: unknown, metaIds: ReadonlySet<string>): NonNullable<DurableTurn["toolResults"]> {
@@ -226,6 +252,8 @@ function extractResponses(record: Record<string, unknown>, previous?: DurablePre
 
   const lastUser = lastResponseUserItem(items.slice(0, i + 1));
   if (!lastUser) return {};
+  // Responses 的历史 assistant 轮走 previous_response_id，不在本次 input 里；
+  // 没有可提取的 assistant 文本时一致性护栏对不上号也不会误触发（digest 缺省）。
   return responseUserBits(lastUser);
 }
 

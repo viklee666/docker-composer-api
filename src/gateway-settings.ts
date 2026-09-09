@@ -1,10 +1,13 @@
 import { isModelParamPolicyMode } from "./model-param-policy.js";
-import { parseModelParamsSpec } from "./model-params.js";
+import { formatModelParamsSpec, parseModelParamsSpec } from "./model-params.js";
+import type { DebugFilters } from "./debug-recorder.js";
 import type {
   AgentMode,
   CursorSdkSessionMode,
+  GatewayProvider,
   ModelParamPolicy,
   ModelParameterValue,
+  ProviderRunOverrides,
   RoutingStrategy,
   StateStore,
   SystemPromptMode,
@@ -38,6 +41,10 @@ const MAX_TRANSIENT_ATTEMPTS_SETTING = "maxTransientKeyAttempts";
 const REASONING_EFFORT_SETTING = "cursorReasoningEffort";
 const AGENT_MODE_SETTING = "cursorAgentMode";
 const MODEL_PARAMS_SETTING = "cursorModelParams";
+const DEBUG_ENABLED_SETTING = "debugEnabled";
+const DEBUG_FILTERS_SETTING = "debugFilters";
+const DEBUG_MAX_ENTRIES_SETTING = "debugMaxEntries";
+const DEBUG_MAX_TOTAL_BYTES_SETTING = "debugMaxTotalBytes";
 
 /** 后台可改整数项的合法区间。保存与加载共用，避免一边放行一边读回来被丢掉。 */
 export const RUNTIME_SETTING_BOUNDS = {
@@ -335,6 +342,212 @@ export async function loadCursorModelParams(
 
 export function saveCursorModelParams(store: StateStore, spec: string): Promise<void> {
   return store.setSetting(MODEL_PARAMS_SETTING, spec);
+}
+
+/* ---------------------- per-provider 运行设置（包 A，计划 §3.5） */
+
+/** per-provider 覆盖层的 setting key 字段名（实际 key = provider 前缀 + 字段名，如 sdkReasoningEffort）。 */
+const PROVIDER_OVERRIDE_KEYS = {
+  requestTimeoutMs: "RequestTimeoutMs",
+  autoDisableKeys: "AutoDisableKeys",
+  autoDisableThreshold: "AutoDisableThreshold",
+  reasoningEffort: "ReasoningEffort",
+  maxModePolicy: "MaxModePolicy",
+  maxModeModels: "MaxModeModels",
+  fastPolicy: "FastPolicy",
+  fastModels: "FastModels",
+  modelParams: "ModelParams",
+  agentMode: "AgentMode",
+  sendTools: "SendTools",
+  codec: "Codec"
+} as const;
+
+function providerSettingKey(
+  provider: GatewayProvider,
+  field: keyof typeof PROVIDER_OVERRIDE_KEYS
+): string {
+  return provider + PROVIDER_OVERRIDE_KEYS[field];
+}
+
+/**
+ * per-provider 运行设置的启动加载（包 A，计划 §3.5）。
+ *
+ * 迁移与兼容（升级生命线）：旧全局 key（cursorReasoningEffort 等）继续由上面各自的
+ * loadXxx 恢复进 GatewayConfig 顶层字段，作为两条路线的共同默认值——不迁移、不删除；
+ * 这里的 `sdk*` / `bot*` key 只承载「某条路线显式改过」的覆盖值。字段独立判定：
+ * key 缺失 / 空串（= 恢复跟随全局）/ 非法值一律不进结果，消费侧按「覆盖 ?? 顶层」取值。
+ * 于是老库升级后这里返回 undefined，行为与改造前完全一致，线上设置绝不回默认值。
+ */
+export async function loadProviderRunOverrides(
+  store: StateStore,
+  provider: GatewayProvider
+): Promise<ProviderRunOverrides | undefined> {
+  const overrides: ProviderRunOverrides = {};
+
+  const timeout = Number.parseInt((await store.getSetting(providerSettingKey(provider, "requestTimeoutMs"))) ?? "", 10);
+  const timeoutBounds = RUNTIME_SETTING_BOUNDS.requestTimeoutMs;
+  if (Number.isInteger(timeout) && timeout >= timeoutBounds.min && timeout <= timeoutBounds.max) {
+    overrides.requestTimeoutMs = timeout;
+  }
+
+  overrides.autoDisableKeys = await loadOverrideFlag(store, providerSettingKey(provider, "autoDisableKeys"));
+
+  const threshold = Number.parseInt((await store.getSetting(providerSettingKey(provider, "autoDisableThreshold"))) ?? "", 10);
+  if (Number.isInteger(threshold) && threshold >= 1) overrides.autoDisableThreshold = threshold;
+
+  const effort = parseReasoningEffort(await store.getSetting(providerSettingKey(provider, "reasoningEffort")));
+  if (effort) overrides.reasoningEffort = effort;
+
+  overrides.maxModePolicy = await loadOverridePolicy(
+    store,
+    providerSettingKey(provider, "maxModePolicy"),
+    providerSettingKey(provider, "maxModeModels")
+  );
+  overrides.fastPolicy = await loadOverridePolicy(
+    store,
+    providerSettingKey(provider, "fastPolicy"),
+    providerSettingKey(provider, "fastModels")
+  );
+
+  const params = parseModelParamsSpec(await store.getSetting(providerSettingKey(provider, "modelParams")));
+  if (params) overrides.modelParams = params;
+
+  const agentMode = await store.getSetting(providerSettingKey(provider, "agentMode"));
+  if (agentMode === "agent" || agentMode === "plan") overrides.agentMode = agentMode;
+
+  if (provider === "bot") {
+    // sendTools / codec 只属于 Bot 路线；SDK 侧没有对应的同名 key。
+    overrides.sendTools = await loadOverrideFlag(store, providerSettingKey("bot", "sendTools"));
+    const codec = await store.getSetting(providerSettingKey("bot", "codec"));
+    if (codec === "proto" || codec === "json") overrides.codec = codec;
+  }
+
+  return Object.values(overrides).some((value) => value !== undefined) ? overrides : undefined;
+}
+
+/**
+ * per-provider 运行设置的后台保存（包 A）。整包覆盖，与表单「保存」按钮的语义一致：
+ * 未覆盖的字段写空串（读侧遇空串即视为跟随全局），因此「恢复默认」能真正清掉旧值。
+ */
+export async function saveProviderRunOverrides(
+  store: StateStore,
+  provider: GatewayProvider,
+  overrides: ProviderRunOverrides
+): Promise<void> {
+  await store.setSetting(
+    providerSettingKey(provider, "requestTimeoutMs"),
+    overrides.requestTimeoutMs === undefined ? "" : String(overrides.requestTimeoutMs)
+  );
+  await saveOverrideFlag(store, providerSettingKey(provider, "autoDisableKeys"), overrides.autoDisableKeys);
+  await store.setSetting(
+    providerSettingKey(provider, "autoDisableThreshold"),
+    overrides.autoDisableThreshold === undefined ? "" : String(overrides.autoDisableThreshold)
+  );
+  await store.setSetting(providerSettingKey(provider, "reasoningEffort"), overrides.reasoningEffort ?? "");
+  await store.setSetting(providerSettingKey(provider, "maxModePolicy"), overrides.maxModePolicy?.mode ?? "");
+  await store.setSetting(
+    providerSettingKey(provider, "maxModeModels"),
+    JSON.stringify(overrides.maxModePolicy?.models ?? [])
+  );
+  await store.setSetting(providerSettingKey(provider, "fastPolicy"), overrides.fastPolicy?.mode ?? "");
+  await store.setSetting(
+    providerSettingKey(provider, "fastModels"),
+    JSON.stringify(overrides.fastPolicy?.models ?? [])
+  );
+  await store.setSetting(
+    providerSettingKey(provider, "modelParams"),
+    formatModelParamsSpec(overrides.modelParams)
+  );
+  await store.setSetting(providerSettingKey(provider, "agentMode"), overrides.agentMode ?? "");
+  if (provider === "bot") {
+    await saveOverrideFlag(store, providerSettingKey("bot", "sendTools"), overrides.sendTools);
+    await store.setSetting(providerSettingKey("bot", "codec"), overrides.codec ?? "");
+  }
+}
+
+/** 布尔覆盖只认显式 on/off；缺失或空串（= 恢复跟随全局）一律视为未覆盖。 */
+async function loadOverrideFlag(store: StateStore, key: string): Promise<boolean | undefined> {
+  const stored = await store.getSetting(key);
+  if (stored === "on") return true;
+  if (stored === "off") return false;
+  return undefined;
+}
+
+/** 三态策略覆盖：policy key 是合法档位才覆盖（models 名单跟随 policy 一起读）。 */
+async function loadOverridePolicy(
+  store: StateStore,
+  policyKey: string,
+  modelsKey: string
+): Promise<ModelParamPolicy | undefined> {
+  const stored = await store.getSetting(policyKey);
+  if (!isModelParamPolicyMode(stored)) return undefined;
+  return { mode: stored, models: await loadPolicyModels(store, modelsKey) };
+}
+
+/** 三态落库：undefined = 跟随全局（空串），true/false = on/off。 */
+async function saveOverrideFlag(store: StateStore, key: string, value: boolean | undefined): Promise<void> {
+  await store.setSetting(key, value === undefined ? "" : value ? "on" : "off");
+}
+
+/* ---------------------------------- Debug 快照（包 D，计划 §3.1） */
+
+/**
+ * Debug 总开关：库里存过就覆盖 env（与 autoDisableKeys 同机制）。
+ * off 是明确的「关」，不是「交回默认」。
+ */
+export async function loadDebugEnabled(store: StateStore, fallback: boolean): Promise<boolean> {
+  const stored = await store.getSetting(DEBUG_ENABLED_SETTING);
+  if (stored === undefined) return fallback;
+  return stored === "on";
+}
+
+export function saveDebugEnabled(store: StateStore, enabled: boolean): Promise<void> {
+  return saveDefault(store, DEBUG_ENABLED_SETTING, enabled);
+}
+
+/**
+ * Debug 过滤条件（owner / endpoint / model）。单独一个 JSON 键：
+ * 三个子字段都允许单独更新，存整体 JSON 比三个键更容易保持一致（保存时整包覆盖）。
+ * 非法 JSON / 非对象 / 非字符串子字段一律按空过滤处理，不让一条坏数据把请求路径打挂。
+ */
+export async function loadDebugFilters(store: StateStore): Promise<DebugFilters> {
+  const stored = await store.getSetting(DEBUG_FILTERS_SETTING);
+  if (stored === undefined) return {};
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const record = parsed as Record<string, unknown>;
+    const trimmed = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim() ? value.trim() : undefined;
+    const owner = trimmed(record.owner);
+    const endpoint = trimmed(record.endpoint);
+    const model = trimmed(record.model);
+    return { ...(owner ? { owner } : {}), ...(endpoint ? { endpoint } : {}), ...(model ? { model } : {}) };
+  } catch {
+    return {};
+  }
+}
+
+export function saveDebugFilters(store: StateStore, filters: DebugFilters): Promise<void> {
+  return store.setSetting(DEBUG_FILTERS_SETTING, JSON.stringify(filters));
+}
+
+/** 单日条数上限。0 合法（= 不限制），与 requestLogKeep 同语义。 */
+export async function loadDebugMaxEntries(store: StateStore, fallback: number): Promise<number> {
+  return loadIntSetting(store, DEBUG_MAX_ENTRIES_SETTING, fallback, { min: 0, max: 1_000_000 });
+}
+
+export function saveDebugMaxEntries(store: StateStore, value: number): Promise<void> {
+  return store.setSetting(DEBUG_MAX_ENTRIES_SETTING, String(value));
+}
+
+/** 快照总体积上限（字节）。0 合法（= 不限制）。 */
+export async function loadDebugMaxTotalBytes(store: StateStore, fallback: number): Promise<number> {
+  return loadIntSetting(store, DEBUG_MAX_TOTAL_BYTES_SETTING, fallback, { min: 0, max: 100 * 1024 * 1024 * 1024 });
+}
+
+export function saveDebugMaxTotalBytes(store: StateStore, value: number): Promise<void> {
+  return store.setSetting(DEBUG_MAX_TOTAL_BYTES_SETTING, String(value));
 }
 
 export function parseReasoningEffort(value: string | undefined): string | undefined {

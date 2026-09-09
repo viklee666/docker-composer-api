@@ -624,7 +624,7 @@ test("gateway rotates and disables a key on auth failure", async () => {
   assert.equal(keyB?.status, "active");
 });
 
-test("a single quota error only rotates; the key is disabled once the streak reaches the threshold", async () => {
+test("a quota error disables the key immediately regardless of the threshold", async () => {
   const runner = new FakeRunner({ text: "served by key-b" });
   runner.failFor.set("key-a", "You have hit your usage limit.");
   const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 2 } });
@@ -635,16 +635,20 @@ test("a single quota error only rotates; the key is disabled once the streak rea
     payload: { model: "composer-2.5", messages: [{ role: "user", content: "Hello" }] }
   });
 
+  // 包 B：账号级额度失败（quota）一次即整把禁用，不再等阈值累计——
+  // 能走到 quota 的都已先排除 transient（upstream_run_failed 优先级在 quota 之前）。
   assert.equal((await chat()).statusCode, 200);
   const afterFirst = (await keyPool.list()).find((key) => key.apiKey === "key-a");
-  assert.equal(afterFirst?.status, "active", "一次失败不该废掉 key");
-  assert.equal(afterFirst?.failureCount, 1);
+  assert.equal(afterFirst?.status, "disabled", "quota 失败不该等阈值");
+  assert.equal(afterFirst?.disabledReason, "额度不足");
   assert.match(afterFirst?.lastError ?? "", /usage limit/i);
-
-  assert.equal((await chat()).statusCode, 200);
-  const afterSecond = (await keyPool.list()).find((key) => key.apiKey === "key-a");
-  assert.equal(afterSecond?.status, "disabled");
-  assert.equal(afterSecond?.disabledReason, "额度不足");
+  // auth 仍走阈值：一次 auth 失败只轮换不禁用（阈值语义只留给 auth）。
+  runner.failFor.set("key-b", "Invalid API key provided");
+  runner.failFor.delete("key-a");
+  assert.equal((await chat()).statusCode, 500);
+  const afterAuth = (await keyPool.list()).find((key) => key.apiKey === "key-b");
+  assert.equal(afterAuth?.status, "active", "auth 失败仍按阈值累计");
+  assert.equal(afterAuth?.failureCount, 1);
 });
 
 test("a success between failures clears the streak so a flaky key is never disabled", async () => {
@@ -701,7 +705,9 @@ test("auto disable can be turned off so keys are only skipped, never disabled", 
 
 test("manual enable clears the failure streak so the key is not re-disabled by the next error", async () => {
   const runner = new FakeRunner({ text: "served by key-b" });
-  runner.failFor.set("key-a", "You have hit your usage limit.");
+  // 包 B 起 quota 失败一次即禁（不看阈值），这条测试锁的是「启用清 streak」的语义，
+  // 用 auth 失败 + 阈值 2 保持原口径。
+  runner.failFor.set("key-a", "Invalid API key provided.");
   const { app, keyPool } = await createTestApp({ runner, keys: ["key-a", "key-b"], autoDisable: { threshold: 2 } });
   const chat = () => app.inject({
     method: "POST",

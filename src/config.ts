@@ -75,7 +75,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     botBackground: booleanValue(env.CURSOR_BOT_BACKGROUND, false),
     botSessionToken: optionalString(env.CURSOR_BOT_TOKEN),
     botMachineId: optionalString(env.CURSOR_BOT_MACHINE_ID),
-    botClientVersion: stringValue(env.CURSOR_BOT_CLIENT_VERSION, DEFAULT_BOT_CLIENT_VERSION)
+    botClientVersion: stringValue(env.CURSOR_BOT_CLIENT_VERSION, DEFAULT_BOT_CLIENT_VERSION),
+
+    // Debug 快照（包 D）：env 只做总开关与上限默认值，过滤条件与运行期开关走 gateway-settings。
+    // 默认关：全量落盘会把请求原文（含 prompt）写进磁盘，必须显式开启。
+    debugEnabled: booleanValue(env.GATEWAY_DEBUG, false),
+    debugMaxEntries: nonNegativeIntegerValue(env.GATEWAY_DEBUG_MAX_ENTRIES, 2_000),
+    debugMaxTotalBytes: nonNegativeIntegerValue(env.GATEWAY_DEBUG_MAX_TOTAL_BYTES, 200 * 1024 * 1024)
   };
 }
 

@@ -22,6 +22,10 @@ data/
 *.db-wal
 *.db-shm
 
+# Debug 快照（包 D）：dirname(SQLITE_PATH)/debug/，默认在 data/ 下，
+# 但 SQLITE_PATH 可指向别处，快照里含请求原文（密钥已掩码），绝不能进版本库。
+debug/
+
 # 常见本地私钥/证书
 *.pem
 *.key

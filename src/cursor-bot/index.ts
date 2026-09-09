@@ -94,6 +94,14 @@ export {
 export { ResponseNormalizer, type BotRunState } from "./response-normalizer.js";
 
 export {
+  ToolMarkerFilter,
+  markerEventsFromText,
+  markerFlushEvents,
+  parseToolCallJson,
+  parseToolMarkers
+} from "./tool-markers.js";
+
+export {
   DEFAULT_CATALOG_FAILURE_TTL_MS,
   DEFAULT_CATALOG_MAX_ENTRIES,
   DEFAULT_CATALOG_TTL_MS,

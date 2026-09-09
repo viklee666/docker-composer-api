@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { AGENT_STORE_FILENAME, createSqliteAgentStore } from "./agent-store.js";
 import { loadConfig, shouldUseDurableHub } from "./config.js";
+import { createDebugRecorder, DEFAULT_DEBUG_MAX_ENTRIES, DEFAULT_DEBUG_MAX_TOTAL_BYTES, type DebugRecorderSettings } from "./debug-recorder.js";
 import { CursorSdkRunner } from "./cursor-runner.js";
 import { DEFAULT_MODEL_PARAM_POLICY } from "./model-param-policy.js";
 import { SessionHub } from "./session-hub.js";
@@ -19,8 +20,13 @@ import {
   loadCursorSdkSessionIdleTtlMs,
   loadCursorSdkSessionMode,
   loadCursorSdkToolHoldTtlMs,
+  loadDebugEnabled,
+  loadDebugFilters,
+  loadDebugMaxEntries,
+  loadDebugMaxTotalBytes,
   loadMaxKeyAttempts,
   loadMaxTransientAttempts,
+  loadProviderRunOverrides,
   loadRequestLogKeep,
   loadRequestTimeoutMs,
   loadRoutingStrategy,
@@ -33,6 +39,8 @@ import { CursorKeyPool } from "./key-pool.js";
 import { KeyRotatingRunner } from "./key-rotating-runner.js";
 import { getModelCatalogEntry } from "./models.js";
 import { applyProxyConfig } from "./proxy.js";
+import { ModelQuotaBucketStore } from "./quota-buckets.js";
+import { QuotaBucketSync } from "./quota-bucket-sync.js";
 import { closeAppThenDrainUsage, UsageReconciler } from "./usage-reconciler.js";
 import {
   applyCursorSdkNetworkConfig,
@@ -125,9 +133,57 @@ config.maxTransientAttempts = await loadMaxTransientAttempts(store, config.maxTr
 config.cursorReasoningEffort = await loadCursorReasoningEffort(store, config.cursorReasoningEffort);
 config.cursorAgentMode = await loadCursorAgentMode(store, config.cursorAgentMode);
 config.cursorModelParams = await loadCursorModelParams(store, config.cursorModelParams);
+// 包 A（计划 §3.5）：两条路线的运行设置覆盖。上面那些 loadXxx 已经把旧全局 key / env
+// 恢复进顶层字段（两侧共同默认值），这里只加载后台为某一条路线单独保存过的 `sdk*` / `bot*`
+// 覆盖——老库没有这些 key，结果为 undefined，行为与改造前完全一致（升级零迁移）。
+config.sdkOverrides = await loadProviderRunOverrides(store, "sdk");
+config.botOverrides = await loadProviderRunOverrides(store, "bot");
+
+/*
+ * Debug 快照（包 D）。设置读取器每次 open 都现查 config + 内存里的过滤条件副本，
+ * 后台保存后立即作用于后续请求，无需重启。目录在 dirname(SQLITE_PATH)/debug/，
+ * 与状态库同盘——运维备份状态目录时快照一起走。
+ */
+const debugState: { filters: Awaited<ReturnType<typeof loadDebugFilters>> } = {
+  filters: await loadDebugFilters(store)
+};
+config.debugEnabled = await loadDebugEnabled(store, config.debugEnabled ?? false);
+config.debugMaxEntries = await loadDebugMaxEntries(store, config.debugMaxEntries ?? DEFAULT_DEBUG_MAX_ENTRIES);
+config.debugMaxTotalBytes = await loadDebugMaxTotalBytes(store, config.debugMaxTotalBytes ?? DEFAULT_DEBUG_MAX_TOTAL_BYTES);
+const debugSettings = (): DebugRecorderSettings => ({
+  enabled: config.debugEnabled === true,
+  filters: debugState.filters,
+  maxEntries: config.debugMaxEntries ?? DEFAULT_DEBUG_MAX_ENTRIES,
+  maxTotalBytes: config.debugMaxTotalBytes ?? DEFAULT_DEBUG_MAX_TOTAL_BYTES
+});
+const debugRecorder = createDebugRecorder({
+  rootDir: join(dirname(config.sqlitePath), "debug"),
+  resolveSettings: debugSettings
+});
+const debugRuntime = {
+  /** 后台保存开关 / 上限后写回 config（读取器每次现查，立即生效）。 */
+  setDebugEnabled: (enabled: boolean): void => {
+    config.debugEnabled = enabled;
+  },
+  setDebugMaxEntries: (value: number): void => {
+    config.debugMaxEntries = value;
+  },
+  setDebugMaxTotalBytes: (value: number): void => {
+    config.debugMaxTotalBytes = value;
+  },
+  /** 过滤条件是快照值不是 config 字段（env 不参与），保存后整体替换内存副本。 */
+  setDebugFilters: (filters: Awaited<ReturnType<typeof loadDebugFilters>>): void => {
+    debugState.filters = filters;
+  },
+  readDebugSnapshot: (logId: string): string | undefined => debugRecorder.read(logId),
+  getDebugFilters: (): Awaited<ReturnType<typeof loadDebugFilters>> => debugState.filters
+};
+
 const keyPool = new CursorKeyPool(store, {
-  enabled: config.autoDisableKeys,
-  threshold: config.autoDisableThreshold
+  // 包 A：key 池只服务 SDK 路线，取「SDK 侧覆盖 ?? 顶层值」（顶层值也是 SDK 的公共默认）。
+  // Bot 凭据的禁用策略在 cursor-bot/service.ts 里独立读取，互不影响。
+  enabled: config.sdkOverrides?.autoDisableKeys ?? config.autoDisableKeys,
+  threshold: config.sdkOverrides?.autoDisableThreshold ?? config.autoDisableThreshold
 }, {
   strategy: config.routingStrategy,
   sessionAffinity: config.sessionAffinity,
@@ -185,9 +241,21 @@ const sdkRunner = new CursorSdkRunner(store, {
   getModelCatalog: getModelCatalogEntry,
   sessionHub
 });
+/*
+ * 包 B：模型 → 额度桶主表。与状态库同目录（运维备份 state 目录时一起走）。
+ * 双向联动的协调器（QuotaBucketSync）在 bot 段构造——它要同时握住 key 池与 bot 凭据表；
+ * 这里只闭包引用，请求到来时模块早已初始化完。
+ */
+const quotaBucketTable = new ModelQuotaBucketStore(
+  join(dirname(config.sqlitePath), "model-quota-buckets.json")
+);
+
 const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
   resolveMaxKeyAttempts: () => config.maxKeyAttempts,
-  resolveMaxTransientAttempts: () => config.maxTransientAttempts
+  resolveMaxTransientAttempts: () => config.maxTransientAttempts,
+  resolveQuotaBucket: (model) => quotaBucketSync.resolveBucket(model),
+  // 包 B（§3.6 第 8 条）：SDK 侧 quota 失败标桶时经协调器联动标到同账号的 bot 凭据。
+  markKeyBucket: (keyId, bucket, expiresAt) => quotaBucketSync.markKeyBucket(keyId, bucket, expiresAt)
 });
 
 /*
@@ -201,7 +269,10 @@ const sdkRoute = new KeyRotatingRunner(sdkRunner, keyPool, {
  */
 const botStore = CursorBotStore.open(config.sqlitePath);
 seedBotCredential(botStore, config);
-const bot = new CursorBotService({ store: botStore, config });
+// 包 B：额度桶双向联动协调器。key 池与 bot 凭据表背后是同一个 Cursor 账号，
+// 任一侧撞上 resource_exhausted 都把另一侧的同一个桶一起标上，清除时也一起清。
+const quotaBucketSync = new QuotaBucketSync({ keyPool, botStore, table: quotaBucketTable });
+const bot = new CursorBotService({ store: botStore, config, quotaBuckets: quotaBucketSync });
 if (bot.status().available) {
   console.log(`Cursor Bot: ${bot.status().activeCredentials} credential(s) ready, base=${botSettings(config).baseUrl}`);
 } else {
@@ -246,6 +317,11 @@ const app = createApp({
   usageReconciler,
   bot,
   startedAt: Date.now(),
+  debugRecorder,
+  debugRuntime,
+  quotaBuckets: quotaBucketTable,
+  // 包 B：后台「清除额度标记」经协调器把 key 与由它兑换出的 bot 凭据一起清。
+  quotaBucketSync,
   runtime: {
     setRequestLogKeep: (value) => store.setRequestLogKeep(value),
     configureSessionHub: (patch) => sessionHub.configure(patch)

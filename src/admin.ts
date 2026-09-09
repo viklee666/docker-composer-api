@@ -10,8 +10,9 @@ import type { BotCredential } from "./cursor-bot/store.js";
 import { ApiError, normalizeError, raceWithAbort } from "./errors.js";
 import { GatewayKeyPool } from "./gateway-key-pool.js";
 import { shouldUseDurableHub } from "./config.js";
-import { isModelParamPolicyMode, policyIntent } from "./model-param-policy.js";
+import { isModelParamPolicyMode } from "./model-param-policy.js";
 import { parseModelParamsSpec, formatModelParamsSpec } from "./model-params.js";
+import { providerModelDefaults, providerRequestTimeoutMs } from "./provider-settings.js";
 import {
   parseReasoningEffort,
   REASONING_EFFORT_VALUES,
@@ -29,8 +30,13 @@ import {
   saveCursorSdkSessionIdleTtlMs,
   saveCursorSdkSessionMode,
   saveCursorSdkToolHoldTtlMs,
+  saveDebugEnabled,
+  saveDebugFilters,
+  saveDebugMaxEntries,
+  saveDebugMaxTotalBytes,
   saveMaxKeyAttempts,
   saveMaxTransientAttempts,
+  saveProviderRunOverrides,
   saveRequestLogKeep,
   saveRequestTimeoutMs,
   saveRoutingStrategy,
@@ -40,6 +46,7 @@ import {
 } from "./gateway-settings.js";
 import { errorMessage, maskKey } from "./key-pool.js";
 import { listAvailableModels, normalizeModel, type ModelListResult, type ModelLister } from "./models.js";
+import { parseQuotaBucketTable, type ModelQuotaBucketStore } from "./quota-buckets.js";
 import { applyProxyConfig, parseProxyUrl, proxyStatus, testProxy } from "./proxy.js";
 import { NO_KEY_SENTINEL, normalizeModelList } from "./routing.js";
 import {
@@ -51,6 +58,7 @@ import {
   saveProxyUrl
 } from "./sdk-network.js";
 import { durableTelemetrySnapshot } from "./durable-telemetry.js";
+import type { DebugFilters } from "./debug-recorder.js";
 import type { AppDeps } from "./server.js";
 import type {
   AgentMode,
@@ -60,9 +68,11 @@ import type {
   CursorSdkSessionMode,
   GatewayKeyPatch,
   GatewayKeyRecord,
+  GatewayProvider,
   KeyUsageRef,
   ModelParamPolicy,
   ModelParameterDefinition,
+  ProviderRunOverrides,
   RequestLogQuery,
   RoutingStrategy,
   SystemPromptMode
@@ -126,6 +136,14 @@ function publicRuntimeConfig(
     cursorMaxModeModels: deps.config.cursorMaxModePolicy?.models ?? [],
     autoDisableKeys: deps.keyPool.autoDisablePolicy.enabled,
     autoDisableThreshold: deps.keyPool.autoDisablePolicy.threshold,
+    // 包 A：SDK / Bot 侧运行设置覆盖回显。null / 空串 = 未覆盖（该侧跟随下面的全局值）。
+    sdkOverrides: providerOverridesEcho("sdk", deps.config.sdkOverrides),
+    botOverrides: providerOverridesEcho("bot", deps.config.botOverrides),
+    // Debug 快照回显：开关与上限走 config（后台保存时已写回），过滤条件走运行期内存副本。
+    debugEnabled: deps.config.debugEnabled === true,
+    debugFilters: deps.debugRuntime?.getDebugFilters() ?? {},
+    debugMaxEntries: deps.config.debugMaxEntries ?? 2000,
+    debugMaxTotalBytes: deps.config.debugMaxTotalBytes ?? 200 * 1024 * 1024,
     gatewayKeyConfigured: Boolean(deps.config.gatewayApiKey),
     routingStrategy: routing.strategy,
     sessionAffinity: routing.sessionAffinity,
@@ -296,6 +314,73 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       deps.config.autoDisableThreshold = threshold;
       deps.keyPool.setAutoDisablePolicy({ threshold });
       await saveAutoDisableThreshold(deps.store, threshold);
+      touched = true;
+    }
+
+    // Debug 快照（包 D）：开关 / 过滤 / 上限。运行期落 config（读取器每次现查），
+    // 同时落库以便重启后保留。deps.debugRuntime 不在（测试装配）时跳过运行期写入、只落库。
+    if (body.debugEnabled !== undefined) {
+      if (typeof body.debugEnabled !== "boolean") {
+        throw new ApiError("debugEnabled must be a boolean.", 400, "invalid_request_error", "debugEnabled");
+      }
+      deps.config.debugEnabled = body.debugEnabled;
+      deps.debugRuntime?.setDebugEnabled(body.debugEnabled);
+      await saveDebugEnabled(deps.store, body.debugEnabled);
+      touched = true;
+    }
+
+    if (body.debugMaxEntries !== undefined) {
+      const value = typeof body.debugMaxEntries === "number" ? body.debugMaxEntries : Number.NaN;
+      if (!Number.isInteger(value) || value < 0 || value > 1_000_000) {
+        throw new ApiError(
+          "debugMaxEntries must be an integer between 0 and 1000000 (0 = unlimited).",
+          400,
+          "invalid_request_error",
+          "debugMaxEntries"
+        );
+      }
+      deps.config.debugMaxEntries = value;
+      deps.debugRuntime?.setDebugMaxEntries(value);
+      await saveDebugMaxEntries(deps.store, value);
+      touched = true;
+    }
+
+    if (body.debugMaxTotalBytes !== undefined) {
+      const value = typeof body.debugMaxTotalBytes === "number" ? body.debugMaxTotalBytes : Number.NaN;
+      if (!Number.isInteger(value) || value < 0 || value > 100 * 1024 * 1024 * 1024) {
+        throw new ApiError(
+          "debugMaxTotalBytes must be an integer between 0 and 107374182400 (0 = unlimited).",
+          400,
+          "invalid_request_error",
+          "debugMaxTotalBytes"
+        );
+      }
+      deps.config.debugMaxTotalBytes = value;
+      deps.debugRuntime?.setDebugMaxTotalBytes(value);
+      await saveDebugMaxTotalBytes(deps.store, value);
+      touched = true;
+    }
+
+    // 过滤条件整体替换（三个子字段都可选，空串 = 清除该项过滤）。
+    if (body.debugFilters !== undefined) {
+      const raw = objectBody(body.debugFilters);
+      const trimmed = (value: unknown, field: string): string | undefined => {
+        if (value === undefined || value === null) return undefined;
+        if (typeof value !== "string") {
+          throw new ApiError(`debugFilters.${field} must be a string.`, 400, "invalid_request_error", `debugFilters.${field}`);
+        }
+        return value.trim() || undefined;
+      };
+      const owner = trimmed(raw.owner, "owner");
+      const endpoint = trimmed(raw.endpoint, "endpoint");
+      const model = trimmed(raw.model, "model");
+      const filters: DebugFilters = {
+        ...(owner ? { owner } : {}),
+        ...(endpoint ? { endpoint } : {}),
+        ...(model ? { model } : {})
+      };
+      deps.debugRuntime?.setDebugFilters(filters);
+      await saveDebugFilters(deps.store, filters);
       touched = true;
     }
 
@@ -499,6 +584,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       }
       touched = true;
     }
+
+    // 包 A（计划 §3.5）：SDK / Bot 两侧的运行设置覆盖。字段语义与顶层同名设置一致，
+    // null / 空串 = 恢复跟随全局（该侧回落公共默认值）。两侧整包互不影响：
+    // body 里没有的那一侧的 config 与落库值都不动。SDK 侧自动禁用要联动 key 池。
+    if (await applyProviderOverrides(deps, body, "sdk")) touched = true;
+    if (await applyProviderOverrides(deps, body, "bot")) touched = true;
 
     if (!touched) throw new ApiError("No settings provided.", 400, "invalid_request_error");
 
@@ -807,6 +898,44 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   /**
+   * 包 B：清除一把 key 的额度桶耗尽标记（连它兑换出的 bot 凭据一起清）。
+   * 刻意与 enable 分开：人工 enable 的语义是「清失败计数、恢复这把 key」，
+   * 这里只动额度标记——key 本来就是 active，只是某个桶被避开。
+   */
+  app.post("/admin/api/keys/:id/clear-quota", async (request) => {
+    requireAdmin(request, deps);
+    // 复用协调器的 clearKeyBuckets：key 与由它兑换出的 bot 凭据一起清，
+    // 不在端点里手写第二遍联动逻辑——两边口径会漂。未装配协调器时只清 key 侧。
+    const ok = deps.quotaBucketSync
+      ? await deps.quotaBucketSync.clearKeyBuckets(keyId(request))
+      : await deps.keyPool.clearQuotaBuckets(keyId(request));
+    if (!ok) throw new ApiError("Key not found.", 404, "not_found");
+    return { ok: true };
+  });
+
+  /**
+   * 包 B：模型 → 额度桶主表（data/model-quota-buckets.json）。人工维护，
+   * 后台设置页的编辑框从这里读；未装配（quotaBuckets 缺省）时 503。
+   */
+  app.get("/admin/api/quota-buckets", async (request) => {
+    requireAdmin(request, deps);
+    const store = requireQuotaBuckets(deps);
+    return { table: store.load() };
+  });
+
+  /** 保存前先过 parseQuotaBucketTable：非法整张拒掉（400），单条非法由解析丢弃并回落 default。 */
+  app.put("/admin/api/quota-buckets", async (request) => {
+    requireAdmin(request, deps);
+    const store = requireQuotaBuckets(deps);
+    const body = objectBody(request.body);
+    const parsed = parseQuotaBucketTable(body.table);
+    if (!parsed) {
+      throw new ApiError("Invalid quota bucket table: expected { models: { [model]: \"cursor\" | \"other\" }, default }.", 400, "invalid_request_error");
+    }
+    return { ok: true, table: store.save(parsed) };
+  });
+
+  /**
    * 按 key 收窄模型：一把号只跑便宜模型、另一把专跑 opus，避免选 key 时把范围外的请求打上去再报错。
    */
   app.post("/admin/api/keys/:id/models", async (request) => {
@@ -992,6 +1121,29 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { ok: true, removed };
   });
 
+  /**
+   * Debug 快照（包 D）：请求日志行内详情展开块的数据源。
+   * 有快照文件就返回 {found: true, snapshot}，没有返回 {found: false}——
+   * 「没开 Debug / 不在过滤范围内 / 超预算未落盘」都归为无快照，前端统一显示「无快照」。
+   */
+  app.get("/admin/api/logs/:id/debug", async (request) => {
+    requireAdmin(request, deps);
+    const params = request.params as Record<string, unknown> | undefined;
+    const logId = typeof params?.id === "string" ? params.id : "";
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(logId)) {
+      throw new ApiError("Invalid log id.", 400, "invalid_request_error", "id");
+    }
+    if (!deps.debugRuntime) return { found: false };
+    const raw = deps.debugRuntime.readDebugSnapshot(logId);
+    if (raw === undefined) return { found: false };
+    try {
+      return { found: true, snapshot: JSON.parse(raw) };
+    } catch {
+      // 快照是 recorder 自己 JSON.stringify 写的，正常不会解不开；防的是磁盘被人动过。
+      return { found: true, snapshot: null, parseError: true };
+    }
+  });
+
   app.post("/admin/api/test", async (request) => {
     requireAdmin(request, deps);
     const body = objectBody(request.body);
@@ -1013,8 +1165,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     // 联通性测试也带上按测试模型解析出的策略意图（fast/Max Mode 等），
     // 否则仪表盘里这些测试请求永远显示非 fast，误导排查。
-    const testMaxMode = policyIntent(deps.config.cursorMaxModePolicy, route.model);
-    const testFast = policyIntent(deps.config.cursorFastPolicy, route.model);
+    // 包 A：意图按测试路线的 per-provider 设置解析，与真实请求（requestModelControls）同一口径。
+    const testIntent = providerModelDefaults(deps.config, route.provider, route.model);
     // 每次测试用唯一 sessionKey，并强制本请求 stateless：不得进 Hub / 旧 resume，避免粘到用户会话或坏 agent。
     const run: CursorRunRequest = {
       protocol: "openai-chat",
@@ -1028,11 +1180,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       workingDirectory: deps.config.cursorWorkingDirectory,
       images: [],
       tools: [],
-      reasoningEffort: deps.config.cursorReasoningEffort,
-      maxMode: testMaxMode,
-      fast: testFast,
-      modelParams: deps.config.cursorModelParams,
-      mode: deps.config.cursorAgentMode,
+      reasoningEffort: testIntent.reasoningEffort,
+      maxMode: testIntent.maxMode,
+      fast: testIntent.fast,
+      modelParams: testIntent.params,
+      mode: testIntent.mode,
       provider: route.provider
     };
     if (route.provider === "bot") {
@@ -1059,7 +1211,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       keyUsageRef.keyLabel = target.label;
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), deps.config.requestTimeoutMs);
+    // 包 A：按测试路线取该侧超时（Bot 路线可用 botRequestTimeoutMs 单独放宽）。
+    const timer = setTimeout(() => controller.abort(), providerRequestTimeoutMs(deps.config, route.provider));
     const runner = route.provider === "bot" && deps.bot ? deps.bot : deps.runner;
     const logClientType = route.provider === "bot" ? SAND_CLIENT_TYPE : undefined;
     try {
@@ -1135,6 +1288,14 @@ function requireBot(deps: AppDeps): CursorBotService {
   return deps.bot;
 }
 
+/** 包 B：额度桶主表未装配时 GET/PUT 直接 503，避免 UI 把兜底表误当成已保存的内容回写。 */
+function requireQuotaBuckets(deps: AppDeps): ModelQuotaBucketStore {
+  if (!deps.quotaBuckets) {
+    throw new ApiError("Quota bucket table is not configured on this gateway.", 503, "provider_unavailable");
+  }
+  return deps.quotaBuckets;
+}
+
 /**
  * 凭据的对外形状。**绝不回传 token**：后台只需要认出是哪一把，
  * 而一个能读回明文的接口等于把库里的凭据搬到了浏览器里。
@@ -1154,6 +1315,8 @@ function publicCredential(record: BotCredential): Record<string, unknown> {
     allowed: record.allowedModels ?? [],
     excluded: record.excludedModels ?? [],
     failureCount: record.failureCount,
+    // 包 B：额度桶耗尽标记（桶名 → 截止时间），UI 展示 badge 用。
+    exhaustedBuckets: record.exhaustedBuckets ?? {},
     lastUsedAt: record.lastUsedAt ?? null,
     lastError: record.lastError ?? null,
     createdAt: record.createdAt,
@@ -1268,6 +1431,8 @@ function publicKey(record: CursorKeyRecord): Record<string, unknown> {
     failureCount: record.failureCount,
     modelScope: record.modelScope,
     weight: record.weight,
+    // 包 B：额度桶耗尽标记（桶名 → 截止时间）。UI 据此展示 badge 与「清除额度标记」按钮。
+    exhaustedBuckets: record.exhaustedBuckets ?? {},
     createdAt: record.createdAt
   };
 }
@@ -1461,6 +1626,182 @@ function parseModelParamPolicySetting(
     return { mode: body[legacyField] ? "force-all" : "passthrough", models: current?.models ?? [] };
   }
   return undefined;
+}
+
+/**
+ * per-provider 运行设置覆盖的保存（包 A，计划 §3.5）。
+ * body.sdkOverrides / body.botOverrides 是整包对象：字段缺省 = 保持不动，
+ * null / 空串 = 恢复跟随全局。校验口径与顶层同名字段的分支一致，只是字段名换侧。
+ * 两侧互不影响：body 里没有的那一侧不会被触碰（返回 false，不写 touched）。
+ * SDK 侧的自动禁用改完后联动 key 池（与顶层 autoDisableKeys / Threshold 分支同模式）。
+ */
+async function applyProviderOverrides(
+  deps: AppDeps,
+  body: Record<string, unknown>,
+  provider: GatewayProvider
+): Promise<boolean> {
+  const field = provider === "sdk" ? "sdkOverrides" : "botOverrides";
+  if (body[field] === undefined) return false;
+  const raw = body[field];
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ApiError(`${field} must be an object.`, 400, "invalid_request_error", field);
+  }
+  const patch = raw as Record<string, unknown>;
+  const label = provider === "sdk" ? "sdk" : "bot";
+  const overrides: ProviderRunOverrides = {
+    ...(provider === "sdk" ? deps.config.sdkOverrides : deps.config.botOverrides)
+  };
+  let touched = false;
+
+  if (patch.requestTimeoutMs !== undefined) {
+    overrides.requestTimeoutMs = patch.requestTimeoutMs === null
+      ? undefined
+      : parseBoundedInt(patch.requestTimeoutMs, `${label}RequestTimeoutMs`, RUNTIME_SETTING_BOUNDS.requestTimeoutMs);
+    touched = true;
+  }
+  if (patch.autoDisableKeys !== undefined) {
+    if (patch.autoDisableKeys !== null && typeof patch.autoDisableKeys !== "boolean") {
+      throw new ApiError(`${label}AutoDisableKeys must be a boolean or null.`, 400, "invalid_request_error", `${label}AutoDisableKeys`);
+    }
+    overrides.autoDisableKeys = patch.autoDisableKeys ?? undefined;
+    touched = true;
+  }
+  if (patch.autoDisableThreshold !== undefined) {
+    const value = patch.autoDisableThreshold === null ? Number.NaN : patch.autoDisableThreshold;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 50) {
+      if (patch.autoDisableThreshold !== null) {
+        throw new ApiError(
+          `${label}AutoDisableThreshold must be an integer between 1 and 50.`,
+          400,
+          "invalid_request_error",
+          `${label}AutoDisableThreshold`
+        );
+      }
+    }
+    overrides.autoDisableThreshold = patch.autoDisableThreshold === null ? undefined : (patch.autoDisableThreshold as number);
+    touched = true;
+  }
+  if (patch.reasoningEffort !== undefined) {
+    if (patch.reasoningEffort === null || patch.reasoningEffort === "") {
+      overrides.reasoningEffort = undefined;
+    } else if (typeof patch.reasoningEffort === "string") {
+      const effort = parseReasoningEffort(patch.reasoningEffort);
+      if (!effort) {
+        throw new ApiError(
+          `${label}ReasoningEffort must be one of: ${REASONING_EFFORT_VALUES.join(", ")}.`,
+          400,
+          "invalid_request_error",
+          `${label}ReasoningEffort`
+        );
+      }
+      overrides.reasoningEffort = effort;
+    } else {
+      throw new ApiError(`${label}ReasoningEffort must be a string.`, 400, "invalid_request_error", `${label}ReasoningEffort`);
+    }
+    touched = true;
+  }
+  // null = 清除该侧策略覆盖（恢复跟随全局）；给了档位 / 名单则与顶层同一解析规则。
+  if (patch.maxModePolicy === null) {
+    overrides.maxModePolicy = undefined;
+    touched = true;
+  } else if (patch.maxModePolicy !== undefined || patch.maxModeModels !== undefined) {
+    overrides.maxModePolicy = parseModelParamPolicySetting(patch, "maxModePolicy", "maxModeModels", "", overrides.maxModePolicy);
+    touched = true;
+  }
+  if (patch.fastPolicy === null) {
+    overrides.fastPolicy = undefined;
+    touched = true;
+  } else if (patch.fastPolicy !== undefined || patch.fastModels !== undefined) {
+    overrides.fastPolicy = parseModelParamPolicySetting(patch, "fastPolicy", "fastModels", "", overrides.fastPolicy);
+    touched = true;
+  }
+  if (patch.modelParams !== undefined) {
+    if (patch.modelParams === null || patch.modelParams === "") {
+      overrides.modelParams = undefined;
+    } else if (typeof patch.modelParams === "string") {
+      const parsed = parseModelParamsSpec(patch.modelParams);
+      if (!parsed) {
+        throw new ApiError(
+          `${label}ModelParams must be id=value pairs or a JSON array.`,
+          400,
+          "invalid_request_error",
+          `${label}ModelParams`
+        );
+      }
+      overrides.modelParams = parsed;
+    } else {
+      throw new ApiError(`${label}ModelParams must be a string.`, 400, "invalid_request_error", `${label}ModelParams`);
+    }
+    touched = true;
+  }
+  if (patch.agentMode !== undefined) {
+    if (patch.agentMode === null || patch.agentMode === "") {
+      overrides.agentMode = undefined;
+    } else if (typeof patch.agentMode === "string") {
+      const trimmed = patch.agentMode.trim().toLowerCase();
+      if (trimmed !== "agent" && trimmed !== "plan") {
+        throw new ApiError(
+          `${label}AgentMode must be agent, plan, or empty.`,
+          400,
+          "invalid_request_error",
+          `${label}AgentMode`
+        );
+      }
+      overrides.agentMode = trimmed;
+    } else {
+      throw new ApiError(`${label}AgentMode must be a string.`, 400, "invalid_request_error", `${label}AgentMode`);
+    }
+    touched = true;
+  }
+  if (provider === "bot") {
+    // sendTools / codec 只属于 Bot 路线；改完立即生效（botSettings 每次现查，不固化启动快照）。
+    if (patch.sendTools !== undefined) {
+      if (patch.sendTools !== null && typeof patch.sendTools !== "boolean") {
+        throw new ApiError("botSendTools must be a boolean or null.", 400, "invalid_request_error", "botSendTools");
+      }
+      overrides.sendTools = patch.sendTools ?? undefined;
+      touched = true;
+    }
+    if (patch.codec !== undefined) {
+      if (patch.codec !== null && patch.codec !== "" && patch.codec !== "proto" && patch.codec !== "json") {
+        throw new ApiError("botCodec must be proto, json, or null.", 400, "invalid_request_error", "botCodec");
+      }
+      overrides.codec = patch.codec === "proto" || patch.codec === "json" ? patch.codec : undefined;
+      touched = true;
+    }
+  }
+
+  if (!touched) return false;
+  if (provider === "sdk") deps.config.sdkOverrides = overrides;
+  else deps.config.botOverrides = overrides;
+  await saveProviderRunOverrides(deps.store, provider, overrides);
+  // key 池只服务 SDK 路线：SDK 侧覆盖改了自动禁用时，池内副本要跟着换（运行期即时生效）。
+  if (provider === "sdk") {
+    deps.keyPool.setAutoDisablePolicy({
+      enabled: overrides.autoDisableKeys ?? deps.config.autoDisableKeys,
+      threshold: overrides.autoDisableThreshold ?? deps.config.autoDisableThreshold
+    });
+  }
+  return true;
+}
+
+/** per-provider 覆盖层的后台回显。null / 空串 = 未覆盖，前端据此区分「跟随全局」与「显式覆盖」。 */
+function providerOverridesEcho(provider: GatewayProvider, overrides: ProviderRunOverrides | undefined) {
+  return {
+    requestTimeoutMs: overrides?.requestTimeoutMs ?? null,
+    autoDisableKeys: overrides?.autoDisableKeys ?? null,
+    autoDisableThreshold: overrides?.autoDisableThreshold ?? null,
+    reasoningEffort: overrides?.reasoningEffort ?? "",
+    maxModePolicy: overrides?.maxModePolicy?.mode ?? "",
+    maxModeModels: overrides?.maxModePolicy?.models ?? [],
+    fastPolicy: overrides?.fastPolicy?.mode ?? "",
+    fastModels: overrides?.fastPolicy?.models ?? [],
+    modelParams: formatModelParamsSpec(overrides?.modelParams),
+    agentMode: overrides?.agentMode ?? "",
+    ...(provider === "bot"
+      ? { sendTools: overrides?.sendTools ?? null, codec: overrides?.codec ?? "" }
+      : {})
+  };
 }
 
 function parseSystemPromptMode(value: unknown): SystemPromptMode {

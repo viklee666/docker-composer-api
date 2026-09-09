@@ -40,18 +40,29 @@ export interface PendingExecute {
   reject: (reason?: unknown) => void;
 }
 
-export type HubPumpItem =
+/**
+ * pump 项的 run 印章：EventPump.push 时盖上（见 EventPump），消费方比对 slot.runId 判定归属，
+ * 不匹配的项属于上一轮 run 的残留，丢弃。无印章 = 本次 send 早于 run 句柄就绪的窗口，按本 run 处理。
+ */
+export type HubPumpItem = (
   | { kind: "event"; event: unknown }
   | { kind: "captured"; id: string; name: string; args?: Record<string, unknown> }
-  | { kind: "end"; error?: unknown };
+  | { kind: "end"; error?: unknown }
+) & { runId?: string };
 
 /**
  * onDelta + stream 合流队列，可被第二条 HTTP 继续消费。
+ *
+ * 包 E：pump 项归属校验。`runId` 是本次 send 绑定的 run 印章——push 进来且尚未盖章的项
+ * 视为属于当前 run（onDelta 早于 run 句柄就绪的窗口）；消费方按 `slot.runId` 比对印章，
+ * 不匹配的项属于上一轮残留，丢弃（计划第 4 条，防止 park 住的旧 Run 事件被当作本轮输出）。
  */
 export class EventPump {
-  private readonly queue = new AsyncQueue<HubPumpItem>();
+  /** 本次 send 的 run id；新 attach 时由调用方设置。 */
+  runId?: string;
 
   push(item: HubPumpItem): void {
+    if (this.runId !== undefined) item.runId = this.runId;
     this.queue.push(item);
   }
 
@@ -63,6 +74,13 @@ export class EventPump {
   poll(): HubPumpItem | undefined {
     return this.queue.poll();
   }
+
+  /** 包 E：pump 里是否还有未消费项（重试续播可行性判定用）。 */
+  hasQueued(): boolean {
+    return this.queue.size > 0;
+  }
+
+  private readonly queue = new AsyncQueue<HubPumpItem>();
 }
 
 export interface SessionSlot {
@@ -79,6 +97,14 @@ export interface SessionSlot {
   pump: EventPump;
   waitPromise?: Promise<unknown>;
   lastUserText?: string;
+  /**
+   * 包 E：已向客户端交付过语义输出（done 或 tool_call 已发出）的那轮的用户文本。
+   * 与 lastUserText（send 后立即写，只表示「已发给上游」）分开：重试同一轮时
+   * 已交付 ⇒ stateless 全量重跑，未交付 ⇒ 优先续播或退 stateless（计划第 6 条）。
+   */
+  deliveredUserText?: string;
+  /** 包 E：上一轮 assistant 输出文本的摘要（normalize 后 sha256，不存原文）。 */
+  lastAssistantDigest?: string;
   lastUsedAt: number;
   holdDeadline?: number;
   /** Tool call ids already served to the client (history rewrite detection). */
@@ -121,6 +147,13 @@ export interface CreateSessionSlotInput {
   runId?: string;
   state?: SessionSlotState;
   lastUserText?: string;
+  /**
+   * 包 E 审阅修复（应修 1）：恢复槽（Agent.resume）的上一轮 assistant 输出摘要基线。
+   * live 槽由 consumeDurablePump 收尾时记录自己交付的输出；resumed 槽没有这段内存，
+   * 由调用方用入站 transcript 的上一条 assistant 摘要（turn.assistantDigest）播种，
+   * 让恢复后的下一轮与 live 槽共用同一套分叉比对口径。
+   */
+  lastAssistantDigest?: string;
   waitPromise?: Promise<unknown>;
   issuedToolCallIds?: string[];
   historyChecksum?: string;
@@ -128,7 +161,6 @@ export interface CreateSessionSlotInput {
 }
 
 type RecycleReason = "idle" | "hold" | "lru" | "explicit";
-
 export function createSessionSlot(input: CreateSessionSlotInput): SessionSlot {
   const issuedToolCallIds = input.issuedToolCallIds ? [...input.issuedToolCallIds] : [];
   return {
@@ -145,6 +177,7 @@ export function createSessionSlot(input: CreateSessionSlotInput): SessionSlot {
     pump: new EventPump(),
     waitPromise: input.waitPromise,
     lastUserText: input.lastUserText,
+    lastAssistantDigest: input.lastAssistantDigest,
     lastUsedAt: 0,
     issuedToolCallIds,
     callAliases: new Map(),
@@ -201,6 +234,39 @@ export function touchSlotHistory(slot: SessionSlot, lastUserText?: string): void
   slot.historyChecksum = historyChecksum(slot.issuedToolCallIds ?? [], slot.lastUserText);
 }
 
+/** 包 E：assistant 文本一致性摘要口径——去全部空白后 sha256；入站（prompt-delta）与出站（slot）两侧共用。 */
+export function assistantTextDigest(text: string): string {
+  return createHash("sha256").update(text.replace(/\s+/g, "")).digest("hex");
+}
+
+/** 包 E：记录上一轮 assistant 输出摘要（交付后调用；只存哈希不存原文）。空文本不记录（保持 undefined，护栏不触发）。 */
+export function recordAssistantDigest(slot: SessionSlot, text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  slot.lastAssistantDigest = assistantTextDigest(trimmed);
+}
+
+/**
+ * 包 E：标记「已向客户端交付语义输出」的轮次（done/tool_call 已发出之后调用）。
+ * 与 lastUserText 的「已发送」分开（计划第 6 条）：重试判定据此选续播还是 stateless 重跑。
+ */
+export function markTurnDelivered(slot: SessionSlot): void {
+  if (slot.lastUserText !== undefined) slot.deliveredUserText = slot.lastUserText;
+}
+
+/**
+ * 包 E：入站 transcript 上一条 assistant 文本摘要与 slot 记录的上一轮输出摘要是否对不上。
+ * 两侧都有值才比对（一侧缺号 = 无法证明分叉，放行，避免误伤 hitRatio）。
+ */
+export function inboundAssistantTextMismatch(
+  slot: SessionSlot,
+  assistantDigest: string | undefined
+): boolean {
+  return assistantDigest !== undefined
+    && slot.lastAssistantDigest !== undefined
+    && assistantDigest !== slot.lastAssistantDigest;
+}
+
 export type DurableReplaceReason =
   | "incompatible"
   | "model"
@@ -222,6 +288,7 @@ export function durableSlotReplaceReason(
     toolsFingerprint?: string;
     toolResults?: Array<{ id: string }>;
     prompt?: string;
+    assistantDigest?: string;
   }
 ): DurableReplaceReason | undefined {
   if (input.kind === "incompatible") return "incompatible";
@@ -240,10 +307,15 @@ export function durableSlotReplaceReason(
  */
 export function inboundHistoryIncompatible(
   slot: SessionSlot,
-  input: { kind?: string; toolResults?: Array<{ id: string }>; prompt?: string }
+  input: { kind?: string; toolResults?: Array<{ id: string }>; prompt?: string; assistantDigest?: string }
 ): boolean {
   const issued = slot.issuedToolCallIds ?? [];
-  if (!issued.length) return false;
+  if (!issued.length) {
+    // 包 E：纯文本会话原先在这里直接放行，等于完全没有一致性护栏。
+    // 现在比对入站上一条 assistant 文本摘要与 slot 记录的上一轮输出摘要（计划第 2 条）。
+    // 对不上由调用方退 stateless（不 drop 槽）；本函数返回 true 只表达「历史对不上」。
+    return inboundAssistantTextMismatch(slot, input.assistantDigest);
+  }
   if (input.kind === "tool_results") {
     // Unmatched ids while execute is hung are abort+path B in the runner, not a history rewrite.
     return false;
@@ -289,6 +361,8 @@ export class SessionHub {
   private readonly lockTails = new Map<string, Promise<void>>();
   private readonly holdTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly inflight = new Set<Promise<void>>();
+  /** 槽被回收时同步清理注册方按 session 记的边车状态（runner 的 ordinals / consumedExecutes / capturedPumps）。 */
+  private readonly dropListeners: Array<(sessionId: string) => void> = [];
 
   constructor(options: SessionHubOptions = {}) {
     this.holdTtlMs = positiveBound(options.holdTtlMs, DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS);
@@ -463,7 +537,25 @@ export class SessionHub {
     this.clearHoldTimer(sessionId);
     slot.state = "dead";
     if (reason === "hold") console.error(TOOL_HOLD_EXPIRED_LOG);
+    // 包 E 审阅修复（应修 2）：Hub 内部回收（idle/hold/LRU）不走 runner 的 dropDurableSession，
+    // 注册方按 session 记的边车 Map（runOrdinals / consumedExecutes / capturedPumps）会一直漏清。
+    // 回收时同步通知，清理失败不影响回收主流程。
+    for (const listener of this.dropListeners) {
+      try {
+        listener(sessionId);
+      } catch {
+        // best-effort cleanup only
+      }
+    }
     await this.recycle(sessionId, slot, reason);
+  }
+
+  /**
+   * 包 E 审阅修复（应修 2）：注册「槽被回收」监听。drop（显式或 idle/hold/LRU 内部回收）
+   * 都会触发，供 runner 清理按 session 记的边车状态，防止 Map 随会话数无界增长。
+   */
+  onDrop(listener: (sessionId: string) => void): void {
+    this.dropListeners.push(listener);
   }
 
   async dropAll(): Promise<void> {
@@ -607,6 +699,11 @@ export class SessionHub {
 class AsyncQueue<T> {
   private readonly items: T[] = [];
   private readonly resolvers: Array<(item: T) => void> = [];
+
+  /** 包 E：仍在队列里的项数（不含已交给 resolver 的）；供 hasQueued 判定。 */
+  get size(): number {
+    return this.items.length;
+  }
 
   push(item: T): void {
     const resolve = this.resolvers.shift();

@@ -20,8 +20,16 @@ import { toPreparedConversation, type PreparedConversation } from "./conversatio
 import type { CursorBotCredential } from "./credentials.js";
 import { SAND_CLIENT_TYPE } from "./credentials.js";
 import { DEFAULT_READ_MAX_BYTES } from "./envelope.js";
+import { isUpstreamResourceExhausted } from "./errors.js";
 import type { UnifiedEvent } from "./events.js";
 import { LocalToolRegistry } from "./local-tools.js";
+import {
+  bucketExhausted,
+  DEFAULT_QUOTA_BUCKET_RESET_MS,
+  pruneExhaustedBuckets,
+  type QuotaBucket,
+  type QuotaBucketHooks
+} from "../quota-buckets.js";
 import { CursorBotProvider, conversationIdFor } from "./provider.js";
 import { buildInferenceStreamRequest } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
@@ -45,12 +53,14 @@ export interface BotSettings {
 }
 
 export function botSettings(config: GatewayConfig): BotSettings {
+  // 包 A：Bot 侧覆盖优先，未覆盖回落顶层 env 默认值（botOverrides 由后台保存 / 启动恢复）。
+  const overrides = config.botOverrides;
   return {
     defaultProvider: config.defaultProvider ?? "sdk",
     baseUrl: config.botBaseUrl?.trim() || DEFAULT_BOT_BASE_URL,
-    codec: config.botCodec ?? "proto",
+    codec: overrides?.codec ?? config.botCodec ?? "proto",
     readMaxBytes: config.botReadMaxBytes ?? DEFAULT_READ_MAX_BYTES,
-    sendTools: config.botSendTools ?? false,
+    sendTools: overrides?.sendTools ?? config.botSendTools ?? false,
     localTools: config.botLocalTools ?? [],
     subagents: config.botSubagents ?? false,
     background: config.botBackground ?? false,
@@ -60,14 +70,31 @@ export function botSettings(config: GatewayConfig): BotSettings {
 
 /** 目录缓存的存活时长。按凭据分片，不同账号可见的模型不同。 */
 const CATALOG_TTL_MS = 5 * 60 * 1000;
-/** 连续失败到这个数就自动停用凭据，避免一把废 token 把每个请求都拖到超时。 */
+/** 连续失败到这个数就自动停用凭据，避免一把废 token 把每个请求都拖到超时。也是 Bot 侧禁用阈值的默认值。 */
 const CREDENTIAL_FAILURE_LIMIT = 5;
+
+/**
+ * Bot 凭据的自动禁用策略（包 A）：读 Bot 侧覆盖，回落 Bot 路线自己的默认（开、阈值 5）。
+ * 刻意不回落顶层 autoDisableKeys / autoDisableThreshold——那两个 key 管的是 SDK 的 key 池；
+ * 挂上 Bot 会让「为 SDK 关掉自动禁用」顺手把 Bot 凭据的护栏也拆了（反之亦然），升级后行为反而变了。
+ */
+export function botAutoDisablePolicy(config: GatewayConfig): { enabled: boolean; threshold: number } {
+  return {
+    enabled: config.botOverrides?.autoDisableKeys ?? true,
+    threshold: config.botOverrides?.autoDisableThreshold ?? CREDENTIAL_FAILURE_LIMIT
+  };
+}
 
 export interface CursorBotServiceOptions {
   store: CursorBotStore;
   config: GatewayConfig;
   fetchImpl?: ConnectFetch;
   workspace?: string;
+  /**
+   * 包 B：额度分桶钩子（模型 → 桶解析 + 桶耗尽标记，含与源 Cursor key 的双向联动）。
+   * 未提供时不做桶过滤、不标桶，行为与改造前一致（测试装配不用改）。
+   */
+  quotaBuckets?: QuotaBucketHooks;
 }
 
 /**
@@ -77,7 +104,6 @@ export interface CursorBotServiceOptions {
  * 以及把两者喂给 `CursorBotProvider`。选路本身在 `router.ts`，不在这里。
  */
 export class CursorBotService implements CursorRunner {
-  private readonly settings: BotSettings;
   private readonly localTools?: LocalToolRegistry;
   private readonly catalogs = new Map<string, { value: BotCatalog; expiresAt: number }>();
   private readonly inflight = new Map<string, Promise<BotCatalog | undefined>>();
@@ -85,13 +111,21 @@ export class CursorBotService implements CursorRunner {
   private readonly listeners = new Map<string, Set<(event: UnifiedEvent) => void>>();
 
   constructor(private readonly options: CursorBotServiceOptions) {
-    this.settings = botSettings(options.config);
-    if (this.settings.localTools.length) {
+    if (botSettings(options.config).localTools.length) {
       this.localTools = new LocalToolRegistry({
         workspace: options.workspace ?? options.config.cursorWorkingDirectory,
-        allowlist: this.settings.localTools
+        allowlist: botSettings(options.config).localTools
       });
     }
+  }
+
+  /**
+   * 每次现查而不是构造时固化（包 A）：后台改 Bot 侧覆盖（sendTools / codec 等）要立即生效，
+   * 不能让启动时的快照把运行期改动挡住。botSettings 是纯函数、开销可忽略；
+   * localTools 的注册表仍只在构造时建——它绑定工作区，不属于可运行期修改的运行设置。
+   */
+  private get settings(): BotSettings {
+    return botSettings(this.options.config);
   }
 
   get available(): boolean {
@@ -147,16 +181,19 @@ export class CursorBotService implements CursorRunner {
   }
 
   async *stream(input: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorStreamEvent> {
-    const credential = this.pickCredential(input.model);
+    // 包 B：整条请求（含失败标桶、成功清标记）都按这个桶算。vendor 推断用目录缓存里的
+    // 任意一份——vendor 是模型属性，与用哪把凭据拉到的目录无关。
+    const bucket = this.options.quotaBuckets?.resolveBucket(input.model, this.anyVendorIsCursor(input.model));
+    const credential = this.pickCredential(input.model, bucket);
     try {
       // 网关侧需要代跑工具（本地工具 / 子代理）时走多轮循环；否则单发单收。
       // 两条路都产出同样的 `CursorStreamEvent`，对外 SSE 层不区分。
       const orchestrated = this.orchestratedTools(input);
       if (orchestrated.length) yield* this.streamWithTools(credential, input, orchestrated, signal);
       else yield* this.providerFor(credential, input).stream(input, signal);
-      this.options.store.recordCredentialUse(credential.id);
+      this.options.store.recordCredentialUse(credential.id, bucket);
     } catch (error) {
-      this.noteFailure(credential, error);
+      this.noteFailure(credential, error, input.model);
       throw error;
     }
   }
@@ -244,7 +281,9 @@ export class CursorBotService implements CursorRunner {
         conversation,
         requestedModel: resolved.requestedModel,
         runId: run.id,
-        ...(signal ? { signal } : {})
+        ...(signal ? { signal } : {}),
+        // 包 D：上游轮次全文经 debugRef 回写（server 侧在 CursorRunRequest 上挂的快照通道）。
+        ...(input.debugRef ? { debugRef: input.debugRef } : {})
       }
     );
 
@@ -294,7 +333,9 @@ export class CursorBotService implements CursorRunner {
       readMaxBytes: this.settings.readMaxBytes,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
     });
-    const normalizer = new ResponseNormalizer();
+    // child 声明了工具时同样可能收到正文形态的调用，开启同款标记还原（包 F）；
+    // 还原出的调用同样按声明过滤 + 别名归一（与 SDK 侧同口径，见 ResponseNormalizer）。
+    const normalizer = new ResponseNormalizer({ parseToolMarkers: context.tools.length > 0, tools: context.tools });
     const request = buildInferenceStreamRequest({
       messages: [{ role: "user", text: context.prompt }],
       // child 默认不继承父的工具，`tools` 由 scheduler 按 childTools 决定。
@@ -309,7 +350,9 @@ export class CursorBotService implements CursorRunner {
       }
     }
     return {
-      text: normalizer.state.text,
+      // 读 result() 而不是 state.text：held / 未闭合 marker 的尾部残文只有 result() 的
+      // 聚合口径收全了（这里没人迭代 flush 事件），直接读 state 会漏最后一段正文。
+      text: normalizer.result().text,
       ...(normalizer.state.usage ? { usage: normalizer.state.usage } : {})
     };
   }
@@ -341,10 +384,25 @@ export class CursorBotService implements CursorRunner {
    *
    * 按 `lastUsedAt` 升序里的**最近使用者优先**（fill-first）：与 SDK 路线的默认策略一致，
    * 换凭据会丢掉上游按设备/账号维持的 prompt 缓存。
+   *
+   * 包 B：bucket 给出时，该桶已耗尽且未到期的凭据不参与候选（顺手懒清除到期标记并落库）。
+   * 全部候选都耗尽时回落到不过滤——标记只是网关自己的保守估计，宁可照常试也不能直接 503。
    */
-  pickCredential(model?: string): BotCredential {
+  pickCredential(model?: string, bucket?: QuotaBucket): BotCredential {
     const active = this.options.store.activeCredentials().filter((credential) => allowsModel(credential, model));
-    if (!active.length) {
+    let usable = active;
+    if (bucket && active.length) {
+      const filtered = active.filter((credential) => {
+        const pruned = pruneExhaustedBuckets(credential.exhaustedBuckets);
+        if (pruned !== credential.exhaustedBuckets) {
+          this.options.store.setCredentialExhaustedBuckets(credential.id, pruned);
+        }
+        return !bucketExhausted(pruned, bucket);
+      });
+      // 全部候选都耗尽时回落到不过滤：标记只是网关自己的保守估计，宁可照常试也不能直接 503。
+      if (filtered.length) usable = filtered;
+    }
+    if (!usable.length) {
       const total = this.options.store.listCredentials().length;
       throw new ApiError(
         total
@@ -355,7 +413,7 @@ export class CursorBotService implements CursorRunner {
       );
     }
     // 最近用过的排前面，尽量固定在同一把上。
-    return active.sort((a, b) => (b.lastUsedAt ?? "").localeCompare(a.lastUsedAt ?? ""))[0];
+    return usable.sort((a, b) => (b.lastUsedAt ?? "").localeCompare(a.lastUsedAt ?? ""))[0];
   }
 
   /** 目录：按凭据分片缓存，失败短缓存，不让一次抖动把之后几分钟全拖成降级。 */
@@ -496,16 +554,66 @@ export class CursorBotService implements CursorRunner {
     return { parameters: entry.parameters, variants: entry.variants };
   }
 
-  private noteFailure(credential: BotCredential, error: unknown): void {
+  private noteFailure(credential: BotCredential, error: unknown, model?: string): void {
     const status = error instanceof ApiError ? error.statusCode : 500;
+    // 包 B：只有**上游 EndStream 帧亲口带回的** resource_exhausted 才算额度桶耗尽
+    // （isUpstreamResourceExhausted 的 symbol 标记只有 endStreamError 会挂）。本地构造的 429
+    // ——EnvelopeTooLargeError 是 502、InferenceStreamError 的 RATE_LIMIT 不带标记——都不会进这。
+    // 只标桶：凭据保持 active，不计失败、不禁用，同 key 的 other 桶模型照常可用。
+    if (status === 429 && isUpstreamResourceExhausted(error)) {
+      const hooks = this.options.quotaBuckets;
+      if (hooks) {
+        const bucket = hooks.resolveBucket(model, this.anyVendorIsCursor(model));
+        const expiresAt = new Date(Date.now() + DEFAULT_QUOTA_BUCKET_RESET_MS).toISOString();
+        hooks.markCredentialExhausted(credential.id, bucket, expiresAt);
+      }
+      return;
+    }
+    // 402：账号级欠费（Connect 协议的 HTTP 层状态码，httpTransportError 原样透传到
+    // ApiError.statusCode；endStream 那条路出不了 402——Connect code 表里没有它）。
+    // 欠费是账号级的，影响全部额度桶，语义对齐 key-pool 的 quota 失败：一次即禁用，
+    // 不等阈值累计；并经 sourceCursorKeyId 联动禁用兑换出这把凭据的源 Cursor key
+    //（同一个账号一起欠费，两侧都该停）。
+    if (status === 402) {
+      this.options.store.recordCredentialFailure(credential.id, errorText(error));
+      if (botAutoDisablePolicy(this.options.config).enabled) {
+        this.options.store.setCredentialStatus(credential.id, "disabled");
+        console.error(`[cursor-bot] credential ${credential.id} disabled after quota failure (402)`);
+        if (credential.sourceCursorKeyId) {
+          this.options.quotaBuckets?.disableSourceKey?.(credential.sourceCursorKeyId, errorText(error));
+        }
+      }
+      return;
+    }
     // 只有凭据本身的问题才计数。429/5xx 是上游状态，跟这把 token 的有效性无关，
     // 按失败累计会把一次限流演变成把凭据停掉。
     if (status !== 401 && status !== 403) return;
     const failures = this.options.store.recordCredentialFailure(credential.id, errorText(error));
-    if (failures >= CREDENTIAL_FAILURE_LIMIT) {
+    // 包 A：Bot 侧禁用策略独立于 SDK 的 key 池；未覆盖时保持改造前的默认（开、阈值 5）。
+    const policy = botAutoDisablePolicy(this.options.config);
+    if (policy.enabled && failures >= policy.threshold) {
       this.options.store.setCredentialStatus(credential.id, "disabled");
       console.error(`[cursor-bot] credential ${credential.id} disabled after ${failures} auth failures`);
     }
+  }
+
+  /**
+   * 包 B：从目录缓存里查模型的 vendor 是否 Cursor 自家（额度分桶的兜底信号）。
+   * vendor 是模型属性，任意凭据拉到的目录都行；缓存里查不到就返回 undefined，
+   * 让 resolveBucket 走主表 / default——归类不确定时往「不标错桶」的方向退。
+   */
+  private anyVendorIsCursor(model?: string): boolean | undefined {
+    if (!model) return undefined;
+    const wanted = model.trim().toLowerCase();
+    for (const cached of this.catalogs.values()) {
+      const entry = cached.value.models.find(
+        (candidate) =>
+          candidate.id.toLowerCase() === wanted ||
+          candidate.aliases.some((alias) => alias.toLowerCase() === wanted)
+      );
+      if (entry) return entry.vendorIsCursor;
+    }
+    return undefined;
   }
 }
 

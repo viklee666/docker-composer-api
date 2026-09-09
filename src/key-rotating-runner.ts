@@ -1,6 +1,8 @@
 import { ApiError } from "./errors.js";
-import { classifyKeyFailure, CursorKeyPool, errorMessage } from "./key-pool.js";
+import { classifyKeyFailure, CursorKeyPool, errorMessage, maskKey } from "./key-pool.js";
 import type { NoKeyReason, RoutingPolicy } from "./key-pool.js";
+import type { QuotaBucket } from "./quota-buckets.js";
+import { DEFAULT_QUOTA_BUCKET_RESET_MS } from "./quota-buckets.js";
 import { denyRuleUnverifiable, identityAllowed, modelIdentity, sessionBindingHash } from "./routing.js";
 import type {
   CursorRunRequest,
@@ -29,6 +31,17 @@ export interface KeyRotatingOptions {
   resolveMaxTransientAttempts?: () => number;
   /** 取用策略；未提供时读 key 池自己的策略（选 key 本来就以池上的策略为准）。 */
   resolveRoutingPolicy?: () => RoutingPolicy;
+  /**
+   * 包 B：把请求模型解析到额度桶（人工维护表 + vendor 兜底）。未提供时不做桶过滤，
+   * 行为与改造前一致（测试与旧装配不用改）。
+   */
+  resolveQuotaBucket?: (model: string) => QuotaBucket;
+  /**
+   * 包 B（§3.6 第 8 条）：SDK 侧把某把 key 的桶标耗尽时的联动通道（装配层接
+   * QuotaBucketSync.markKeyBucket），由它把同账号的 bot 凭据一起标上。
+   * 未提供时只标 key 自己，行为与改造前一致。
+   */
+  markKeyBucket?: (keyId: string, bucket: QuotaBucket, expiresAt: string) => Promise<boolean>;
 }
 
 /**
@@ -44,6 +57,8 @@ export class KeyRotatingRunner implements CursorRunner {
   private readonly resolveMaxKeyAttempts: () => number;
   private readonly resolveMaxTransientAttempts: () => number;
   private readonly resolveRoutingPolicy?: () => RoutingPolicy;
+  private readonly resolveQuotaBucket?: (model: string) => QuotaBucket;
+  private readonly markKeyBucket?: (keyId: string, bucket: QuotaBucket, expiresAt: string) => Promise<boolean>;
 
   constructor(
     private readonly inner: CursorRunner,
@@ -55,6 +70,8 @@ export class KeyRotatingRunner implements CursorRunner {
     this.resolveMaxKeyAttempts = options.resolveMaxKeyAttempts ?? (() => maxKeyAttempts);
     this.resolveMaxTransientAttempts = options.resolveMaxTransientAttempts ?? (() => maxTransientAttempts);
     this.resolveRoutingPolicy = options.resolveRoutingPolicy;
+    this.resolveQuotaBucket = options.resolveQuotaBucket;
+    this.markKeyBucket = options.markKeyBucket;
   }
 
   private maxKeyAttempts(): number {
@@ -112,6 +129,8 @@ export class KeyRotatingRunner implements CursorRunner {
     // durableSessionId 反查（那哈希含 apiKey，先有 key 才能算，鸡生蛋）。
     // 无绑定的首轮仍走下面的轮换，成功后既有 bindSession 会钉上。
     const pinnedKeyId = await this.pinnedDurableKeyId(input, sessionHash);
+    // 包 B：本次请求模型所属的额度桶，整轮换 key 期间不变。选 key 时避开该桶已耗尽的 key。
+    const quotaBucket = this.resolveQuotaBucket?.(input.model);
     // 最近一次软失败（换过 key 但没禁用）的错误；所有 key 都软失败时透出它而非误报额度耗尽。
     let softError: unknown;
     let softCount = 0;
@@ -123,7 +142,8 @@ export class KeyRotatingRunner implements CursorRunner {
         allowedKeyIds: pinnedKeyId ? [pinnedKeyId] : input.allowedKeyIds,
         // 钉死后续不能把 sessionHash 交给 selectKey：粘性回落会在绑定 key 已试过/禁用时
         // 删绑定并改选下一把，正好丢掉 held execute。
-        sessionHash: pinnedKeyId ? undefined : sessionHash
+        sessionHash: pinnedKeyId ? undefined : sessionHash,
+        ...(quotaBucket ? { quotaBucket } : {})
       }, attempted.size < this.maxKeyAttempts());
       if (!("key" in selection)) {
         if (pinnedKeyId) throw pinnedKeyUnavailable();
@@ -147,6 +167,12 @@ export class KeyRotatingRunner implements CursorRunner {
         input.keyUsageRef.keyId = key.id;
         input.keyUsageRef.keyLabel = key.label;
       }
+      // 包 D：选中的 key（掩码）进快照。在 recordUse 之前记：此刻的 keyId/keyLabel 就是本次真正使用的那把。
+      try {
+        input.debugRef?.noteSelectedKey(maskKey(key.apiKey), key.id, key.label);
+      } catch {
+        // 观测路径不得影响选 key。
+      }
       await this.pool.recordUse(key.id);
 
       let emitted = false;
@@ -167,7 +193,8 @@ export class KeyRotatingRunner implements CursorRunner {
         }
         if (buffering) yield* buffered;
         // 跑通即认为该 key 健康：清掉连续失败计数，偶发失败不会跨请求累积到禁用阈值。
-        await this.pool.recordSuccess(key.id);
+        // 包 B：该桶能跑通说明额度已恢复，顺带清掉这个桶的耗尽标记。
+        await this.pool.recordSuccess(key.id, quotaBucket);
         if (sessionHash && this.routingPolicy().sessionAffinity) {
           try {
             await this.pool.bindSession(sessionHash, key.id);
@@ -178,6 +205,13 @@ export class KeyRotatingRunner implements CursorRunner {
         return;
       } catch (error) {
         const failure = classifyKeyFailure(error);
+        // 包 B（§3.6 第 8 条）：quota 失败顺带把该桶标耗尽——key 是否整把禁用仍由
+        // reportFailure 的策略决定，桶标记只影响选路避开；联动通道（markKeyBucket）
+        // 会把同账号的 bot 凭据一起标上，两侧额度同池。失败不该冒泡：标桶是旁路动作。
+        if (failure === "quota" && quotaBucket && this.markKeyBucket) {
+          const expiresAt = new Date(Date.now() + DEFAULT_QUOTA_BUCKET_RESET_MS).toISOString();
+          await this.markKeyBucket(key.id, quotaBucket, expiresAt).catch(() => false);
+        }
         // 是否禁用由 key 池的自动禁用策略决定（可关闭，也可要求连续失败若干次）。
         const disabled = failure ? await this.pool.reportFailure(key.id, failure, errorMessage(error)) : false;
         if (pinnedKeyId) {

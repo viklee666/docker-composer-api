@@ -11,6 +11,13 @@ import {
 } from "./cursor-bot/router.js";
 import type { CursorBotService } from "./cursor-bot/service.js";
 import { shouldUseDurableHub } from "./config.js";
+import {
+  createDebugRecorder,
+  type DebugAbortAttribution,
+  type DebugRecorder,
+  type DebugRecorderSettings,
+  type DebugSession
+} from "./debug-recorder.js";
 import { durableIdentity, explicitSessionIdFromHeaders } from "./durable-id.js";
 import {
   recordDurableCache,
@@ -30,10 +37,12 @@ import {
 } from "./errors.js";
 import type { GatewayKeyPool } from "./gateway-key-pool.js";
 import type { CursorKeyPool } from "./key-pool.js";
-import { policyIntent } from "./model-param-policy.js";
 import { errorMessage } from "./key-pool.js";
+import type { QuotaBucketSync } from "./quota-bucket-sync.js";
 import type { UsageReconciler } from "./usage-reconciler.js";
 import { effectiveIntentFromParams, mergeIntents, parseModelParamsSpec, type ModelIntent } from "./model-params.js";
+import type { ModelQuotaBucketStore } from "./quota-buckets.js";
+import { providerModelDefaults, providerRequestTimeoutMs } from "./provider-settings.js";
 import {
   applyModelScope,
   findModelAcrossCatalogues,
@@ -78,6 +87,7 @@ import {
 } from "./protocol.js";
 import { sse, sseDone } from "./sse.js";
 import type {
+  AbortReason,
   AgentMode,
   AuthContext,
   CursorKeyRecord,
@@ -128,6 +138,35 @@ export interface AppDeps {
     setRequestLogKeep?: (value: number) => void;
     configureSessionHub?: (patch: { holdTtlMs?: number; idleTtlMs?: number; maxLiveSessions?: number }) => void;
   };
+  /**
+   * Debug 快照记录器（包 D）。不提供 = Debug 模式整块关闭（open 永远短路），
+   * 测试与既有部署的 config 字面量不必知道这个字段的存在。
+   * 运行期开关 / 过滤 / 上限存在 recorder 自己的 settings 读取器里，后台改完即时生效。
+   */
+  debugRecorder?: DebugRecorder;
+  /**
+   * 后台改 Debug 开关 / 过滤 / 上限时落到 config 与内存过滤副本（index.ts 装配）。
+   * 测试可不提供：settings API 的 Debug 分支会被跳过。
+   */
+  debugRuntime?: {
+    setDebugEnabled: (enabled: boolean) => void;
+    setDebugMaxEntries: (value: number) => void;
+    setDebugMaxTotalBytes: (value: number) => void;
+    setDebugFilters: (filters: { owner?: string; endpoint?: string; model?: string }) => void;
+    readDebugSnapshot: (logId: string) => string | undefined;
+    /** 后台回显当前的过滤条件（内存副本，跟 setDebugFilters 同一份数据）。 */
+    getDebugFilters: () => { owner?: string; endpoint?: string; model?: string };
+  };
+  /**
+   * 模型 → 额度桶主表的读写器（包 B）。后台的 quota-buckets 端点从这里拿；
+   * 不提供时那些端点报 503，选路侧的桶过滤由 runner 自己的 resolveQuotaBucket 决定。
+   */
+  quotaBuckets?: ModelQuotaBucketStore;
+  /**
+   * 额度桶双向联动协调器（包 B）。后台「清除额度标记」经它把 key 与由它兑换出的
+   * bot 凭据一起清；未提供时只清 key 侧（测试 / 旧装配），bot 侧标记留在原地。
+   */
+  quotaBucketSync?: QuotaBucketSync;
 }
 
 /**
@@ -167,6 +206,15 @@ interface RequestLog {
   fast?: boolean;
   agentMode?: AgentMode;
   provider?: GatewayProvider;
+  /** 请求日志行的 id。begin 时生成（Debug 快照文件名要与它一致），finishLog 落库时复用。 */
+  logId: string;
+  /**
+   * 流式 abort 的归因（包 C）：streamAbort 触发 abort 时写入，finishLog 落进 request_logs.abort_reason。
+   * 非流式请求与未被 abort 的流式请求不写。
+   */
+  abortReason?: AbortReason;
+  /** Debug 快照句柄（包 D）。开关关闭时为 undefined，所有挂钩点用 ?. 短路。 */
+  debug?: DebugSession;
 }
 
 type RequestWithLog = FastifyRequest & { gatewayRequestLog?: RequestLog };
@@ -256,7 +304,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
     const created = nowSeconds();
-    const log = beginLog("/v1/chat/completions", auth, prepared, request);
+    const log = beginLog(deps, "/v1/chat/completions", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "openai-chat",
@@ -268,10 +316,12 @@ export function createApp(deps: AppDeps): FastifyInstance {
       request
     });
     if (prepared.stream) {
-      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      // 归因（包 C）：attribution.abortReason 由 streamAbort 在触发那一刻给出，
+      // 这里同步写进 log（finishLog 落 request_logs.abort_reason）与 Debug 快照。
+      const abort = streamAbort(request, providerRequestTimeoutMs(deps.config, run.provider), noteStreamAbort(log));
       // 立刻提交 SSE：协议生成器先写出握手，第一次拉 events 才 runner.stream（Agent.create 在握手之后）。
       const events = deferRunnerStream(deps, run, abort.signal);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, events, deps, log, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, chatStream({ id, created, prepared, auth, events, deps, log, signal: abort.signal, socketAlive: () => isClientSocketAlive(request) }))));
     }
     const output = await runLogged(deps, log, run, (result) => ({
       completionChars: chatCompletionChars(result)
@@ -304,7 +354,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
       undefined,
       promptSettings
     );
-    const log = beginLog("/v1/responses", auth, prepared, request);
+    const log = beginLog(deps, "/v1/responses", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "openai-responses",
@@ -316,9 +366,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
       request
     });
     if (prepared.stream) {
-      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      // 归因（包 C）：同 chat 端点，attribution.abortReason 在触发那一刻写进 log 与 Debug 快照。
+      const abort = streamAbort(request, providerRequestTimeoutMs(deps.config, run.provider), noteStreamAbort(log));
       const events = deferRunnerStream(deps, run, abort.signal);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, conversationSeed: seed, auth, events, deps, log, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, conversationSeed: seed, auth, events, deps, log, signal: abort.signal, socketAlive: () => isClientSocketAlive(request) }))));
     }
     const output = await runLogged(deps, log, run, (result) => {
       const outputChars = responseCompletionChars(result);
@@ -390,7 +441,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const seed = noteDurableIdentity(request, request.body, "anthropic-messages", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;
-    const log = beginLog("/v1/messages", auth, prepared, request);
+    const log = beginLog(deps, "/v1/messages", auth, prepared, request);
     const run = loggedRunRequest(deps, log, {
       prepared,
       protocol: "anthropic-messages",
@@ -402,9 +453,10 @@ export function createApp(deps: AppDeps): FastifyInstance {
       request
     });
     if (prepared.stream) {
-      const abort = streamAbort(request, deps.config.requestTimeoutMs);
+      // 归因（包 C）：同 chat 端点，attribution.abortReason 在触发那一刻写进 log 与 Debug 快照。
+      const abort = streamAbort(request, providerRequestTimeoutMs(deps.config, run.provider), noteStreamAbort(log));
       const events = deferRunnerStream(deps, run, abort.signal);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, events, deps, log, signal: abort.signal }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, anthropicStream({ id, prepared, events, deps, log, signal: abort.signal, socketAlive: () => isClientSocketAlive(request) }))));
     }
     const output = await runLogged(deps, log, run, (result) => ({
       completionChars: anthropicCompletionChars(prepared, result)
@@ -709,7 +761,8 @@ function persistHandlerError(deps: AppDeps, request: FastifyRequest, error: ApiE
     telemetryRef: {},
     stream: false,
     startedAt: Date.now(),
-    finished: false
+    finished: false,
+    logId: compactId()
   };
   finishLog(deps, stub, error.statusCode, error.message);
 }
@@ -767,7 +820,7 @@ function logSafeErrorText(error: string): string {
     .slice(0, 500);
 }
 
-function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest, request: FastifyRequest): RequestLog {
+function beginLog(deps: AppDeps, endpoint: string, auth: AuthContext, prepared: PreparedRequest, request: FastifyRequest): RequestLog {
   const log: RequestLog = {
     endpoint,
     model: prepared.model,
@@ -779,8 +832,23 @@ function beginLog(endpoint: string, auth: AuthContext, prepared: PreparedRequest
     finished: false,
     gatewayKeyId: auth.gatewayKeyId,
     gatewayKeyLabel: auth.gatewayKeyLabel,
-    ...(auth.mode === "direct" && auth.apiKey ? { directApiKey: auth.apiKey } : {})
+    ...(auth.mode === "direct" && auth.apiKey ? { directApiKey: auth.apiKey } : {}),
+    // logId 在 begin 时就要定下来：Debug 快照的文件名 = logId，且要与 finishLog 落库的行 id 相同。
+    logId: compactId()
   };
+  // 入站取证必须在 begin 时做：headers / body 在 handler 路径上会被消费与改写。
+  // 开关关闭时 open 返回 undefined，这里零开销短路。
+  log.debug = deps.debugRecorder?.open({
+    logId: log.logId,
+    endpoint,
+    model: prepared.model,
+    ownerLabel: auth.gatewayKeyLabel,
+    ownerHash: auth.ownerHash,
+    headers: request.headers as Record<string, string | string[] | undefined>,
+    body: request.body,
+    keyUsageRef: log.keyUsageRef,
+    telemetryRef: log.telemetryRef
+  });
   (request as RequestWithLog).gatewayRequestLog = log;
   return log;
 }
@@ -798,7 +866,7 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
       (safeError ? ` error=${safeError.slice(0, 300)}` : "")
     );
   }
-  const id = compactId();
+  const id = log.logId;
   const params = loggedModelParams(log);
   const usageFields = loggedUsage(log.telemetryRef);
   void deps.store
@@ -814,6 +882,8 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
       durationMs: Date.now() - log.startedAt,
       stream: log.stream,
       error: safeError,
+      // 只有真正触发过 abort 的流式请求才带归因；其余（成功收尾、非流式）落 NULL。
+      ...(log.abortReason ? { abortReason: log.abortReason } : {}),
       gatewayKeyId: log.gatewayKeyId,
       gatewayKeyLabel: log.gatewayKeyLabel,
       reasoningEffort: params.reasoningEffort,
@@ -843,6 +913,12 @@ export function finishLog(deps: AppDeps, log: RequestLog, status: number, error?
       cacheWriteTokens: usage.cacheWriteTokens,
       outputTokens: usage.outputTokens
     });
+  }
+  // Debug 快照收尾：status / error / agentId / runId 此刻才齐，落盘由 finish 幂等保证只发生一次。
+  try {
+    log.debug?.finish(status, safeError);
+  } catch {
+    // 观测路径绝不允许影响请求收尾。
   }
 }
 
@@ -942,7 +1018,7 @@ function loggedRunRequest(
       sessionKey: input.sessionKey,
       workingDirectory: deps.config.cursorWorkingDirectory,
       keyUsageRef: log.keyUsageRef,
-      controls: requestModelControls(input.request, deps.config, input.prepared.model)
+      controls: requestModelControls(input.request, deps.config, input.prepared.model, selection.provider)
     }),
     telemetryRef: log.telemetryRef,
     modelIdentity: input.identity,
@@ -967,6 +1043,23 @@ function loggedRunRequest(
   log.fast = run.fast;
   log.agentMode = run.mode;
   log.provider = selection.provider;
+  // 包 D：选路结果与 durable 身份在请求对象成形这一刻就进快照（debugRef 挂上后 runner / bot 侧才能回写上游轮次）。
+  log.debug?.noteRouting({ provider: selection.provider, model: selection.model, reason: selection.reason });
+  log.debug?.noteDurable({
+    ...(input.conversationSeed ? { sessionId: input.conversationSeed } : {}),
+    reuseDurableAgent: run.reuseDurableAgent,
+    ...(run.durableTurn
+      ? {
+        turnKind: run.durableTurn.kind,
+        ...(run.durableTurn.userText !== undefined ? { turnUserText: run.durableTurn.userText } : {}),
+        ...(run.durableTurn.images?.length ? { turnImages: run.durableTurn.images.length } : {}),
+        ...(run.durableTurn.toolResults?.length
+          ? { turnToolResults: run.durableTurn.toolResults.map((result) => ({ id: result.id, ...(result.isError ? { isError: true } : {}) })) }
+          : {})
+      }
+      : {})
+  });
+  run.debugRef = log.debug;
   return run;
 }
 
@@ -1072,6 +1165,8 @@ async function runLogged(
     // 而响应体（连同它自己那套按协议估算的用量）要等 runLogged 返回之后才构造。
     const estimated = estimate(output);
     noteEstimatedUsage(log, run.prompt.length, estimated.completionChars, estimated.outputTokens);
+    // 包 D：非流式响应的语义产出（正文 / 工具调用）进快照；协议信封在 handler 侧组装，不影响取证语义。
+    log.debug?.noteResponse({ text: output.text, toolCalls: output.toolCalls, ...(output.reasoningText ? { reasoningText: output.reasoningText } : {}) });
     finishLog(deps, log, 200);
     return output;
   } catch (error) {
@@ -1082,7 +1177,15 @@ async function runLogged(
 
 async function* withStreamLog(deps: AppDeps, log: RequestLog, chunks: AsyncIterable<string>): AsyncIterable<string> {
   try {
-    yield* chunks;
+    for await (const chunk of chunks) {
+      // 包 D：SSE 逐事件全文（受单条快照预算约束，超限后只计数）。
+      try {
+        log.debug?.noteSseEvent(chunk);
+      } catch {
+        // 观测路径不得影响流本身。
+      }
+      yield chunk;
+    }
     finishLog(deps, log, 200);
   } catch (error) {
     finishLog(deps, log, normalizeError(error).statusCode, errorMessage(error));
@@ -1094,19 +1197,21 @@ async function* withStreamLog(deps: AppDeps, log: RequestLog, chunks: AsyncItera
 }
 
 async function runWithTimeout(deps: AppDeps, run: Parameters<CursorRunner["run"]>[0]): Promise<CursorRunResult> {
+  // 包 A：按本次请求的 provider 取「该侧覆盖 ?? 全局值」，两侧都没覆盖时与改造前一致。
+  const timeoutMs = providerRequestTimeoutMs(deps.config, run.provider);
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, deps.config.requestTimeoutMs);
+  }, timeoutMs);
   try {
     // 双保险：runner 内部已对 SDK 调用做 abort 竞速，这里再对整个 run 竞速一次，
     // 即使上游出现完全不感知 signal 的挂死，客户端也一定能等到 504 而不是请求永久悬挂。
     return await raceWithAbort(deps.runner.run(run, controller.signal), controller.signal);
   } catch (error) {
     // 内部 abort 用 499 表达，但非流式请求的客户端还连着：对外必须是 504,而不是一个不存在的 HTTP 语义。
-    if (timedOut) throw new ApiError(`Upstream run timed out after ${deps.config.requestTimeoutMs}ms.`, 504, "timeout_error");
+    if (timedOut) throw new ApiError(`Upstream run timed out after ${timeoutMs}ms.`, 504, "timeout_error");
     throw error;
   } finally {
     clearTimeout(timer);
@@ -1127,21 +1232,69 @@ function sendSse(reply: FastifyReply, chunks: AsyncIterable<string>): FastifyRep
  * 流式请求的取消控制：客户端断连（socket close）立即 abort 底层 run；
  * 超时按“无输出空闲时间”计（每写出一个 SSE chunk 重置），避免误杀仍在正常吐字的长回答。
  */
-function streamAbort(request: FastifyRequest, idleTimeoutMs: number): { signal: AbortSignal; touch: () => void; done: () => void } {
+function streamAbort(
+  request: FastifyRequest,
+  idleTimeoutMs: number,
+  onDebug?: (attribution: DebugAbortAttribution) => void
+): { signal: AbortSignal; touch: () => void; done: () => void } {
   const controller = new AbortController();
+  // 归因一旦写出就不再变：后续 finishLog / reportStreamError 都读同一份。
+  let abortReason: AbortReason | undefined;
+  const noteReason = (reason: AbortReason): void => {
+    abortReason ??= reason;
+  };
   // 空闲超时与客户端断连共用一个 signal，但语义不同：超时时客户端还连着，要收到规范的 504 超时错误事件；
   // 断连则谁也收不到，只按 499 记日志。用 abort reason 区分两者。
-  const abortIdle = (): void => controller.abort(new ApiError(`Upstream produced no output for ${idleTimeoutMs}ms.`, 504, "timeout_error"));
+  const abortIdle = (): void => {
+    noteReason("idle_timeout");
+    // 包 D：超时分支同样进归因（signal.reason 的落盘由 signalReason 携带）。
+    onDebug?.({
+      branch: "idle-timeout",
+      rawDestroyed: request.raw.destroyed,
+      rawComplete: request.raw.complete,
+      socketDestroyed: request.raw.socket?.destroyed,
+      abortReason
+    });
+    controller.abort(new ApiError(`Upstream produced no output for ${idleTimeoutMs}ms.`, 504, "timeout_error"));
+  };
   let timer = setTimeout(abortIdle, idleTimeoutMs);
   const socket = request.raw.socket;
-  const onClose = () => {
+  const closeAttribution = (branch: DebugAbortAttribution["branch"]): DebugAbortAttribution => ({
+    branch,
+    rawDestroyed: request.raw.destroyed,
+    rawComplete: request.raw.complete,
+    socketDestroyed: socket?.destroyed,
+    // signal.reason 只在 abort 之后有值；这里取不到就留空（abort 调用紧接着发生）。
+    signalReason: undefined
+  });
+  // branch 由调用方显式给出：close 事件触发时是 socket-close-listener，早退判定时是 early-destroyed-check。
+  // 不能把 onClose 直接挂到 close 事件上——监听器首参是 hadError 布尔，会顶掉 branch 参数。
+  const onClose = (branch: DebugAbortAttribution["branch"]): void => {
     clearTimeout(timer);
-    socket?.removeListener?.("close", onClose);
+    socket?.removeListener?.("close", onSocketClose);
+    noteReason("client_disconnect");
+    // 包 D：无论从哪条路进来，三个 destroyed/complete 值必须在 abort 前拍下——
+    // abort 之后 socket 状态会被改写，事后补拍就不是现场了。
+    if (onDebug) {
+      const attribution = closeAttribution(branch);
+      controller.abort();
+      attribution.signalReason = describeAbortReason(controller.signal.reason);
+      attribution.abortReason = abortReason;
+      onDebug(attribution);
+      return;
+    }
     controller.abort();
   };
-  socket?.once?.("close", onClose);
+  const onSocketClose = (): void => onClose("socket-close-listener");
+  socket?.once?.("close", onSocketClose);
   // 连接可能在注册监听前就断了（例如前置的 previous_response_id 查库期间）；否则会被空闲超时误判成 504。
-  if (request.raw.destroyed || socket?.destroyed) onClose();
+  // 判据收紧（包 C）：socket 真断了，或 raw destroyed 且 body 未读完，才算「注册监听前就断连」。
+  // 不能只看 request.raw.destroyed——Node ≥16 上 IncomingMessage 在请求体读完后 destroyed 即为 true，
+  // 不代表连接断开（§1.1 假设，待线上快照验证）；把「body 读完」当断连会在 0ms 误杀每个正常请求。
+  // 早退分支统一走 onClose：清 timer、摘 close 监听与断连路径完全对称——否则 socket 未销毁时
+  // 后续真关闭会用 socket-close-listener 的归因整体覆盖早退现场（包 D 的 snapshot.abort 会被二次写入）；
+  // branch 参数保住 early-destroyed-check 的取证标记。
+  if (isDisconnectedBeforeListener(request)) onClose("early-destroyed-check");
   return {
     signal: controller.signal,
     touch: () => {
@@ -1151,9 +1304,47 @@ function streamAbort(request: FastifyRequest, idleTimeoutMs: number): { signal: 
     },
     done: () => {
       clearTimeout(timer);
-      socket?.removeListener?.("close", onClose);
+      socket?.removeListener?.("close", onSocketClose);
     }
   };
+}
+
+/**
+ * streamAbort 的归因出口（包 C）：把 attribution 里的 abortReason 同步进
+ * 请求日志（finishLog 落 request_logs.abort_reason）与 Debug 快照。
+ * attribution 里没有 abortReason 时（理论上不该发生）按 local_abort 兜底，
+ * 保证读得到 signal.aborted 的请求一定有归因可查。
+ */
+function noteStreamAbort(log: RequestLog): (attribution: DebugAbortAttribution) => void {
+  return (attribution) => {
+    log.abortReason ??= attribution.abortReason ?? "local_abort";
+    log.debug?.noteAbort(attribution);
+  };
+}
+
+/**
+ * reportStreamError 的判活探针（包 C）：abort 发生时客户端 socket 是否真的销毁。
+ * 只有 socket 确实销毁了才「没必要再写错误事件」；否则必须给客户端一个规范的收尾。
+ */
+function isClientSocketAlive(request: FastifyRequest): boolean {
+  return request.raw.socket?.destroyed !== true;
+}
+
+/**
+ * 「注册监听前就断连」的判据（包 C 收紧后）：
+ * socket 已销毁 = 连接层真实断开；raw.destroyed 且 raw.complete !== true = 请求体没读完就被销毁，
+ * 即监听注册前的真断连。两者都不满足时即使 raw.destroyed 为 true（body 读完的正常路径）也不算断连。
+ */
+function isDisconnectedBeforeListener(request: FastifyRequest): boolean {
+  const socket = request.raw.socket;
+  return socket?.destroyed === true || (request.raw.destroyed === true && request.raw.complete !== true);
+}
+
+/** abort reason 的人话摘要：ApiError 取 message，其余取 constructor name + String。 */
+function describeAbortReason(reason: unknown): string | undefined {
+  if (reason === undefined) return undefined;
+  if (reason instanceof Error) return reason.message.slice(0, 200);
+  return `${String(reason)}`.slice(0, 200);
 }
 
 async function* withStreamAbort(abort: { touch: () => void; done: () => void }, chunks: AsyncIterable<string>): AsyncIterable<string> {
@@ -1210,6 +1401,8 @@ async function* chatStream(input: {
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
+  /** 包 C：reportStreamError 判活探针——abort 时客户端 socket 是否真的销毁。 */
+  socketAlive?: () => boolean;
 }): AsyncIterable<string> {
   const includeUsage = input.prepared.includeUsage;
   const chunk = (delta: Record<string, unknown>, finishReason: string | null): string => sse({
@@ -1262,7 +1455,7 @@ async function* chatStream(input: {
     yield sseDone();
   } catch (error) {
     // 流已开始，只能用流内错误事件收场；[DONE] 不再发出，客户端据此判定本次响应失败。
-    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal, input.socketAlive);
     if (apiError) yield sse({ error: openAiErrorPayload(apiError) });
   }
 }
@@ -1271,15 +1464,43 @@ async function* chatStream(input: {
  * 流中途失败：错误已通过流内事件送达客户端，这里把真实状态写进请求日志。
  * finishLog 幂等，`withStreamLog` 随后的 200 不会覆盖它。
  * runner 把任何 abort 都表达成内部 499，这里按 abort reason 还原成对客户端有意义的语义（空闲超时 → 504）。
+ *
+ * 包 C：是否跳过流内 error 事件改按**真实 socket 状态**判断，不再把 signal.aborted 等同「客户端已走」——
+ * 0ms 误杀场景下客户端还连着，裸 EOF 会让 SDK 把它当连接错误去重试。socket 存活时必须返回错误
+ * （各协议生成器据此发规范的 error 事件再收尾）；socket 确实销毁了才返回 undefined 不写。
  */
-function reportStreamError(deps: AppDeps, log: RequestLog, error: unknown, signal?: AbortSignal): ApiError | undefined {
+function reportStreamError(
+  deps: AppDeps,
+  log: RequestLog,
+  error: unknown,
+  signal?: AbortSignal,
+  socketAlive?: () => boolean
+): ApiError | undefined {
   const normalized = normalizeError(error);
-  const aborted = normalized.statusCode === 499 && signal?.aborted === true;
-  // 空闲超时用 ApiError 作为 abort reason；纯断连没有 reason。
-  const resolved = aborted && signal?.reason instanceof ApiError ? signal.reason : normalized;
+  const resolved = resolveStreamError(error, normalized, signal);
   finishLog(deps, log, resolved.statusCode, resolved === normalized ? errorMessage(error) : resolved.message);
-  // 客户端已断连：没人再读这条流，不必也不该再写错误事件。
-  return aborted && resolved.statusCode === 499 ? undefined : resolved;
+  // 客户端 socket 已销毁：没人再读这条流，不必也不该再写错误事件。
+  return shouldSuppressStreamError(resolved, signal, socketAlive) ? undefined : resolved;
+}
+
+/**
+ * 把 runner 抛出的错误还原成对客户端有意义的 ApiError：内部 499 且 abort reason 是 ApiError
+ * （空闲超时）时用 reason 本身，其余按原错误归一。
+ */
+export function resolveStreamError(error: unknown, normalized: ApiError, signal?: AbortSignal): ApiError {
+  const aborted = normalized.statusCode === 499 && signal?.aborted === true;
+  return aborted && signal?.reason instanceof ApiError ? signal.reason : normalized;
+}
+
+/**
+ * 是否跳过流内 error 事件（包 C 的判定核心，抽成纯函数便于单测）：
+ * 只有「内部 499 + signal 已 abort + 客户端 socket 确实销毁」才算没人收流，返回 true。
+ * socket 判活探针缺失时维持旧行为（按 abort 语义跳过）——inject 测试与非流式路径都不传探针。
+ * socket 存活时即使 signal 已 abort 也必须发 error 事件（false），不能裸 EOF。
+ */
+export function shouldSuppressStreamError(resolved: ApiError, signal?: AbortSignal, socketAlive?: () => boolean): boolean {
+  const aborted = resolved.statusCode === 499 && signal?.aborted === true;
+  return aborted && (socketAlive ? socketAlive() === false : true);
 }
 
 /**
@@ -1299,6 +1520,8 @@ async function* responsesStream(input: {
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
+  /** 包 C：reportStreamError 判活探针——abort 时客户端 socket 是否真的销毁。 */
+  socketAlive?: () => boolean;
 }): AsyncIterable<string> {
   let sequence = 1;
   const emit = (payload: Record<string, unknown>): string => sse({ ...payload, sequence_number: sequence++ }, String(payload.type));
@@ -1455,7 +1678,7 @@ async function* responsesStream(input: {
     if (input.prepared.store) await saveResponse(input.deps, input.auth, input.id, response, input.prepared.inputItems, input.conversationSeed);
     yield emit({ type: "response.completed", response });
   } catch (error) {
-    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal, input.socketAlive);
     if (apiError) {
       yield sse({
         type: "error",
@@ -1479,6 +1702,8 @@ async function* anthropicStream(input: {
   deps: AppDeps;
   log: RequestLog;
   signal?: AbortSignal;
+  /** 包 C：reportStreamError 判活探针——abort 时客户端 socket 是否真的销毁。 */
+  socketAlive?: () => boolean;
 }): AsyncIterable<string> {
   // 客户端没请求思考时不产出 thinking 块；display:"omitted" 时仍产出空块（含 signature）但省略思考文本。
   const thinkingVisibility = input.prepared.thinkingVisibility ?? "off";
@@ -1571,7 +1796,7 @@ async function* anthropicStream(input: {
     yield sse({ type: "message_stop" }, "message_stop");
   } catch (error) {
     // 规范的流内错误：发 error 事件后结束，不再补 message_stop（那会让客户端把失败当成正常收尾）。
-    const apiError = reportStreamError(input.deps, input.log, error, input.signal);
+    const apiError = reportStreamError(input.deps, input.log, error, input.signal, input.socketAlive);
     if (apiError) {
       yield sse({
         type: "error",
@@ -1599,19 +1824,19 @@ async function saveResponse(deps: AppDeps, auth: AuthContext, id: string, respon
  * 网关默认值（env）+ 请求头推导的模型运行意图，优先级低于请求体 / 模型 id 后缀。
  * 请求头支持：anthropic-beta（含 context-1m → Max Mode）、x-cursor-reasoning-effort/max-mode/fast/mode/model-params。
  *
+ * 包 A：默认值按本次请求的 provider 取「该侧覆盖 ?? 顶层」；两侧都没覆盖时与改造前完全一致。
+ *
  * Fast / Max Mode 走三态策略按当前请求的模型解析成显式布尔：passthrough 就是 false——
  * 留 undefined 会被 resolveModelParams 当成「没表态」，Composer 默认档的 fast=true 原样出门。
  * `CURSOR_MODEL_PARAMS=fast=true` 仍在最上层（显式 params），可以盖过策略。
  */
-function requestModelControls(request: FastifyRequest, config: GatewayConfig, model: string): ModelIntent {
-  const configDefaults: ModelIntent = {
-    reasoningEffort: config.cursorReasoningEffort,
-    maxMode: policyIntent(config.cursorMaxModePolicy, model),
-    fast: policyIntent(config.cursorFastPolicy, model),
-    mode: config.cursorAgentMode,
-    params: config.cursorModelParams
-  };
-  return mergeIntents(configDefaults, headerModelIntent(request.headers));
+function requestModelControls(
+  request: FastifyRequest,
+  config: GatewayConfig,
+  model: string,
+  provider: GatewayProvider | undefined
+): ModelIntent {
+  return mergeIntents(providerModelDefaults(config, provider, model), headerModelIntent(request.headers));
 }
 
 function headerModelIntent(headers: FastifyRequest["headers"]): ModelIntent {

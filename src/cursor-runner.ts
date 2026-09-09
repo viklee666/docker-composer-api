@@ -9,6 +9,9 @@ import {
   EventPump,
   createSessionSlot,
   durableSlotReplaceReason,
+  inboundAssistantTextMismatch,
+  markTurnDelivered,
+  recordAssistantDigest,
   recordIssuedToolCalls,
   rememberCallAlias,
   responsesCallId,
@@ -67,6 +70,18 @@ export interface AgentFactory {
 
 export class CursorSdkRunner implements CursorRunner {
   private readonly durableRunOrdinals = new Map<string, number>();
+  /**
+   * 包 E 第 7 条：held execute 续跑的幂等键（session → 已驱动过 consume 的 execute id 集合）。
+   * 同一 execute resolve 之后只允许驱动一次 consumeDurablePump，防止上游多收一个无输入轮次。
+   */
+  private readonly durableConsumedExecutes = new Map<string, Set<string>>();
+  /**
+   * 包 E 审阅修复（建议 4）：session → 当前 send 的 pump 引用盒。
+   * durableCustomTools 的 captured 回调闭包捕获这个盒（不再动态读 hub.get(sessionId)?.pump），
+   * durableSend 每次换泵时同步盒里的引用；槽被 drop+create 换掉后旧盒指向死泵，
+   * 旧 agent 迟到的 tool 调用自然落空，推不进新槽的泵、也盖不上新印章。
+   */
+  private readonly durableCapturedPumps = new Map<string, { current?: EventPump }>();
 
   constructor(
     private readonly store: StateStore,
@@ -97,7 +112,15 @@ export class CursorSdkRunner implements CursorRunner {
       sessionHub?: SessionHub;
     },
     private readonly agentFactory?: AgentFactory
-  ) {}
+  ) {
+    // 包 E 审阅修复（应修 2）：Hub 内部回收（idle/hold/LRU）不走 dropDurableSession，
+    // 注册监听同步清 runner 侧按 session 记的边车 Map，防止随会话数无界增长。
+    this.input.sessionHub?.onDrop((sessionId) => {
+      this.durableRunOrdinals.delete(sessionId);
+      this.durableConsumedExecutes.delete(sessionId);
+      this.durableCapturedPumps.delete(sessionId);
+    });
+  }
 
   async run(input: CursorRunRequest, signal?: AbortSignal): Promise<CursorRunResult> {
     const events = this.stream(input, signal);
@@ -292,25 +315,80 @@ export class CursorSdkRunner implements CursorRunner {
     const turn = input.durableTurn;
 
     if (turn?.kind === "empty") {
-      throw new ApiError("Empty durable turn: the last user message is unchanged.", 400, "invalid_request_error");
+      // 包 E 第 5 条：入站请求本身无可发送内容。文案与 new_user 重试分支（已不再 400）区分开。
+      throw new ApiError(
+        "Empty durable turn: the request has no sendable content (no new user message).",
+        400,
+        "request_empty"
+      );
+    }
+
+    // 包 E 第 1 条：禁止发空轮次。new_user（或缺 durableTurn 的直连调用）且没有
+    // userText / images 时绝不 send——按不一致处理退 stateless，并在 debug 快照标红。
+    if ((turn?.kind ?? "new_user") === "new_user" && !turn?.userText && !turn?.images?.length) {
+      recordDurableDecision({
+        decision: "fallback",
+        reason: "empty_turn_guard",
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
+      try {
+        input.debugRef?.noteUpstreamTurn("sdk", {
+          kind: "new_user",
+          blocked: "empty_turn_guard",
+          remark: "blocked: no user text and no images, would have sent an empty turn upstream"
+        });
+      } catch {
+        // 观测路径不得影响主流程。
+      }
+      yield* this.streamStatelessFallback(input, signal);
+      return;
     }
 
     let slot = await this.ensureDurableSlot(hub, sessionId, input, resolved, signal, turn);
+    if (!slot) {
+      // 包 E 第 3 条：入站历史与 slot 记录的上一轮输出对不上（历史分叉）。
+      // 只牺牲本轮缓存退 stateless，绝不销毁槽、不关 reuse。
+      recordDurableDecision({
+        decision: "fallback",
+        reason: "history_mismatch",
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
+      try {
+        input.debugRef?.noteUpstreamTurn("sdk", {
+          kind: turn?.kind ?? "new_user",
+          blocked: "history_mismatch",
+          remark: "inbound last assistant text does not match the slot's last delivered turn"
+        });
+      } catch {
+        // 观测路径不得影响主流程。
+      }
+      yield* this.streamStatelessFallback(input, signal);
+      return;
+    }
+    // ensureDurableSlot 从这里往后必有槽（上面的 undefined 分支已 return）；
+    // let 供 sendRecoverable 的 drop+create 恢复路径重新赋值。
+    let liveSlot: SessionSlot = slot;
 
+    // 包 E 第 5 条：new_user 重复（客户端重试同一轮）不再 400。
     if (
       turn?.kind === "new_user"
-      && slot.lastUserText !== undefined
-      && turn.userText === slot.lastUserText
+      && liveSlot.lastUserText !== undefined
+      && turn.userText === liveSlot.lastUserText
       && !turn.images?.length
     ) {
-      throw new ApiError("Empty durable turn: the last user message is unchanged.", 400, "invalid_request_error");
+      yield* this.retryDurableTurn(hub, sessionId, liveSlot, input, signal, turn);
+      return;
     }
 
     const sendRecoverable = async (
       spec: { kind: "new_user" | "tool_results"; message: unknown; firstSend: boolean }
     ): Promise<void> => {
       try {
-        await this.durableSend(hub, slot, sessionId, input, resolved, signal, spec);
+        await this.durableSend(hub, liveSlot, sessionId, input, resolved, signal, spec);
       } catch (error) {
         if (isActiveRunError(error) || isRetryableStaleSessionError(error)) {
           const reason = isActiveRunError(error) ? "busy" : "stale";
@@ -323,7 +401,7 @@ export class CursorSdkRunner implements CursorRunner {
             liveSessions: hub.size
           });
           await this.dropDurableSession(hub, sessionId);
-          slot = await this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
+          liveSlot = await this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
           const recovered = spec.kind === "new_user"
             ? {
               kind: "new_user" as const,
@@ -335,7 +413,7 @@ export class CursorSdkRunner implements CursorRunner {
               }), turn?.images)
             }
             : spec;
-          await this.durableSend(hub, slot, sessionId, input, resolved, signal, recovered);
+          await this.durableSend(hub, liveSlot, sessionId, input, resolved, signal, recovered);
           return;
         }
         const keyError = keySemanticApiError(input.model, error);
@@ -346,6 +424,8 @@ export class CursorSdkRunner implements CursorRunner {
 
     if (turn?.kind === "tool_results") {
       let resolvedAny = false;
+      const consumedExecutes = this.durableConsumedExecutes.get(sessionId) ?? new Set<string>();
+      const newlyResolved: string[] = [];
       for (const result of turn.toolResults ?? []) {
         const sdkResult = {
           content: [{ type: "text", text: result.content }],
@@ -353,6 +433,8 @@ export class CursorSdkRunner implements CursorRunner {
         };
         if (hub.resolvePending(sessionId, result.id, sdkResult)) {
           resolvedAny = true;
+          // 包 E 第 7 条：只统计本 HTTP 真正新 resolve 的 execute；已驱动过 consume 的不算。
+          if (!consumedExecutes.has(result.id)) newlyResolved.push(result.id);
           console.error(`[durable] resolve execute id=${result.id}`);
         }
       }
@@ -361,28 +443,59 @@ export class CursorSdkRunner implements CursorRunner {
           // Path A HTTP2: same Run continues; leave awaiting_tools only while execute is still held.
           hub.markRunning(sessionId);
         }
-        slot = hub.get(sessionId) ?? slot;
-        yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+        liveSlot = hub.get(sessionId) ?? liveSlot;
+        if (newlyResolved.length) {
+          // 包 E 第 7 条：同一 execute 只允许驱动一次 consumeDurablePump（幂等键：session + execute id）。
+          // durableSend 换新 run 时集合清空——新 run 的 execute 是全新的键。
+          const known = this.durableConsumedExecutes.get(sessionId) ?? new Set<string>();
+          for (const id of newlyResolved) known.add(id);
+          this.durableConsumedExecutes.set(sessionId, known);
+          yield* this.consumeDurablePump(hub, sessionId, liveSlot, input, signal);
+        } else {
+          // 全部 execute 都已驱动过 consume：重放的 tool_results，绝不再 send 一次（避免上游多收一轮）。
+          recordDurableDecision({
+            decision: "fallback",
+            reason: "duplicate_tool_results",
+            session: sessionId.slice(0, 12),
+            kind: turn.kind,
+            liveSessions: hub.size
+          });
+          yield* this.streamStatelessFallback(input, signal);
+        }
+        return;
+      }
+      const replayedResults = (turn.toolResults ?? []).filter((result) => consumedExecutes.has(result.id));
+      if (!turn.toolResults?.length || replayedResults.length === turn.toolResults.length) {
+        // 包 E 第 7 条：resolvePending 全部落空且都是已消费过的 execute——上一条 HTTP 的重放，
+        // 不能再走 path B send（上游会多收一个无输入轮次，§1.2 未解释缺口的候选之一）。
+        recordDurableDecision({
+          decision: "fallback",
+          reason: "duplicate_tool_results",
+          session: sessionId.slice(0, 12),
+          kind: turn.kind,
+          liveSessions: hub.size
+        });
+        yield* this.streamStatelessFallback(input, signal);
         return;
       }
       // Nothing resolved. If execute is still hung, path B send would hit "active run" and drop+create.
-      if (slot.pending.size > 0) {
+      if (liveSlot.pending.size > 0) {
         console.error(`[durable] unmatched tool_results; abort hung execute session=${sessionId.slice(0, 12)}`);
-        await this.abortHungDurableRun(hub, sessionId, slot, "unmatched tool_result");
+        await this.abortHungDurableRun(hub, sessionId, liveSlot, "unmatched tool_result");
       }
       const text = formatPathBToolResults(turn.toolResults ?? []);
       await sendRecoverable({ kind: "tool_results", message: text, firstSend: false });
-      slot = hub.get(sessionId) ?? slot;
-      yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+      liveSlot = hub.get(sessionId) ?? liveSlot;
+      yield* this.consumeDurablePump(hub, sessionId, liveSlot, input, signal);
       return;
     }
 
-    if (slot.state === "awaiting_tools") {
+    if (liveSlot.state === "awaiting_tools") {
       console.error(`[durable] user cancelled pending tools session=${sessionId.slice(0, 12)}`);
-      await this.abortHungDurableRun(hub, sessionId, slot, "user cancelled tools");
+      await this.abortHungDurableRun(hub, sessionId, liveSlot, "user cancelled tools");
     }
 
-    const firstSend = slot.lastUserText === undefined && !slot.resumed;
+    const firstSend = liveSlot.lastUserText === undefined && !slot.resumed;
     const userText = turn?.userText ?? "";
     const text = formatDurableUserMessage({
       firstSend,
@@ -394,9 +507,47 @@ export class CursorSdkRunner implements CursorRunner {
       message: sdkTextMessage(text, turn?.images),
       firstSend
     });
-    slot = hub.get(sessionId) ?? slot;
-    touchSlotHistory(slot, userText);
-    yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+    liveSlot = hub.get(sessionId) ?? liveSlot;
+    touchSlotHistory(liveSlot, userText);
+    yield* this.consumeDurablePump(hub, sessionId, liveSlot, input, signal);
+  }
+
+  /**
+   * 包 E 第 5/6 条：new_user 重复（客户端重试同一轮）不再 400。
+   * - 已交付（done/tool_call 已发给客户端）⇒ 上游已有这轮，不能重发增量，退 stateless 全量重跑；
+   * - 已发送未交付且还有可续播的输出（park 住的 Run/pump 残留或挂起 execute）⇒ 继续消费；
+   * - 拿不到可续播输出 ⇒ 退 stateless，绝不报错。
+   */
+  private async *retryDurableTurn(
+    hub: SessionHub,
+    sessionId: string,
+    slot: SessionSlot,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined,
+    turn: NonNullable<CursorRunRequest["durableTurn"]>
+  ): AsyncIterable<CursorStreamEvent> {
+    const delivered = slot.deliveredUserText !== undefined && slot.deliveredUserText === slot.lastUserText;
+    if (!delivered && (slot.pending.size > 0 || slot.pump.hasQueued())) {
+      // 已发送未交付：优先续播 park 住的 Run（挂起 execute 或未排空的 pump）。
+      recordDurableDecision({
+        decision: "reuse",
+        reason: "retry_after_send",
+        session: sessionId.slice(0, 12),
+        kind: turn.kind,
+        liveSessions: hub.size
+      });
+      yield* this.consumeDurablePump(hub, sessionId, slot, input, signal);
+      return;
+    }
+    // 已交付（或没有任何可续播输出）：上游已收到这一轮，增量重发会造成轮次错位，退 stateless 全量重跑。
+    recordDurableDecision({
+      decision: "fallback",
+      reason: "retry_after_deliver",
+      session: sessionId.slice(0, 12),
+      kind: turn.kind,
+      liveSessions: hub.size
+    });
+    yield* this.streamStatelessFallback(input, signal);
   }
 
   private async ensureDurableSlot(
@@ -406,8 +557,20 @@ export class CursorSdkRunner implements CursorRunner {
     resolved: ResolvedModelRun,
     signal: AbortSignal | undefined,
     turn: CursorRunRequest["durableTurn"]
-  ): Promise<SessionSlot> {
+  ): Promise<SessionSlot | undefined> {
     let slot = hub.get(sessionId);
+    // 包 E 第 3 条：入站上一条 assistant 文本与 slot 记录的上一轮输出摘要对不上 = 历史分叉。
+    // 先于指纹/历史规则检查：分叉只退 stateless（调用方处理），绝不能落到 drop+create。
+    // tool_results 例外：工具结果轮次里 transcript 的上一条 assistant 是工具调用轮，
+    // 文本口径不可比（且该分支另有 pending/alias 护栏）。
+    if (
+      slot
+      && turn?.kind !== "tool_results"
+      && inboundAssistantTextMismatch(slot, turn?.assistantDigest)
+    ) {
+      console.error(`[durable] history mismatch; stateless fallback session=${sessionId.slice(0, 12)}`);
+      return undefined;
+    }
     const replaceReason = durableSlotReplaceReason(slot, {
       kind: turn?.kind,
       apiKey: input.apiKey,
@@ -415,7 +578,8 @@ export class CursorSdkRunner implements CursorRunner {
       systemFingerprint: turn?.systemFingerprint,
       toolsFingerprint: turn?.toolsFingerprint,
       toolResults: turn?.toolResults,
-      prompt: input.prompt
+      prompt: input.prompt,
+      assistantDigest: turn?.assistantDigest
     });
     if (slot && replaceReason) {
       console.error(`[durable] drop+create ${replaceReason} session=${sessionId.slice(0, 12)}`);
@@ -440,6 +604,8 @@ export class CursorSdkRunner implements CursorRunner {
       return slot;
     }
 
+    // 包 E 第 3 条：历史分叉时 ensureDurableSlot 返回 undefined（上面 early return），
+    // 走不到这里。下面的 resume/create 只服务「指纹兼容且历史对得上」的请求。
     if (!replaceReason) {
       const existingAgentId = await this.store.getSession(sessionId);
       const resumed = await this.tryResumeDurableSlot(
@@ -462,6 +628,22 @@ export class CursorSdkRunner implements CursorRunner {
     return this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
   }
 
+  /**
+   * 包 E：护栏共用的退回路径——本轮 forceStateless 全量重跑（streamLocked 已有同款路径，
+   * 见 streamDurable 的 locked 分支）。只牺牲本轮缓存命中，不销毁 slot、不动 park/reuse。
+   *
+   * 口径决策（有意为之，不要“修”）：fallback 之后本会话粘性 stateless。slot.lastAssistantDigest
+   * 停在 fallback 前的旧轮，后续每轮入站 transcript（反映的是 stateless 全量轮的输出）都与它对不上，
+   * 于是继续退 stateless——这是正确的：stateless 轮走的是全新 agent，上游 durable agent 的历史
+   * 已经分叉，恢复增量只会错位。槽被 TTL/LRU 回收（Hub drop 会连带清 store 映射）后基线自然重置。
+   */
+  private async *streamStatelessFallback(
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined
+  ): AsyncIterable<CursorStreamEvent> {
+    yield* this.streamLocked({ ...input, forceStateless: true }, signal, sessionId(input));
+  }
+
   private async tryResumeDurableSlot(
     hub: SessionHub,
     sessionId: string,
@@ -479,7 +661,7 @@ export class CursorSdkRunner implements CursorRunner {
     const customTools = this.durableCustomTools(hub, sessionId, input);
     try {
       const agent = await raceCreateAgent(
-        factory.resume(agentId, this.agentOptions(input, resolved, customTools, sessionId)),
+        factory.resume(agentId, this.agentOptions(input, resolved, customTools.tools, sessionId)),
         signal
       );
       // Restart cannot restore in-memory pending executes. Resume is always idle.
@@ -491,9 +673,15 @@ export class CursorSdkRunner implements CursorRunner {
         toolsFingerprint: turn?.toolsFingerprint ?? "",
         systemFingerprint: turn?.systemFingerprint ?? "",
         state: "idle",
-        resumed: true
+        resumed: true,
+        // 包 E 审阅修复（应修 1）：resumed 槽没有内存里的上一轮输出可记，用入站 transcript 的
+        // 上一条 assistant 摘要播种基线，恢复后的下一轮即可与 live 槽共用同一套分叉比对口径。
+        // （agent-store 只落 SDK 的 agent 文档，不存 slot 字段；digest 的恢复链路只有这条。）
+        // deliveredUserText 不播种：resume 轮 lastUserText 缺号，重试判定的「已交付」分支天然走不到。
+        lastAssistantDigest: turn?.assistantDigest
       });
       hub.put(sessionId, slot);
+      this.durableCapturedPumps.set(sessionId, customTools.pumpRef);
       if (slot.agentId && slot.agentId !== agentId) {
         await this.store.saveSession(sessionId, slot.agentId);
       }
@@ -504,7 +692,7 @@ export class CursorSdkRunner implements CursorRunner {
         liveSessions: hub.size
       });
       console.error(
-        `[durable] resume agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
+        `[durable] resume agentId=${slot.agentId} customTools=${customTools.tools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
       );
       return slot;
     } catch (error) {
@@ -528,7 +716,7 @@ export class CursorSdkRunner implements CursorRunner {
   ): Promise<SessionSlot> {
     const factory = this.agentFactory ?? await this.loadAgentFactory();
     const customTools = this.durableCustomTools(hub, sessionId, input);
-    const options = this.agentOptions(input, resolved, customTools, sessionId);
+    const options = this.agentOptions(input, resolved, customTools.tools, sessionId);
     let agent: AgentLike;
     try {
       agent = await raceCreateAgent(factory.create(options), signal);
@@ -561,6 +749,7 @@ export class CursorSdkRunner implements CursorRunner {
       state: "running"
     });
     hub.put(sessionId, slot);
+    this.durableCapturedPumps.set(sessionId, customTools.pumpRef);
     await this.store.saveSession(sessionId, slot.agentId);
     recordDurableDecision({
       decision: "create",
@@ -569,21 +758,29 @@ export class CursorSdkRunner implements CursorRunner {
       liveSessions: hub.size
     });
     console.error(
-      `[durable] create agentId=${slot.agentId} customTools=${customTools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
+      `[durable] create agentId=${slot.agentId} customTools=${customTools.tools ? "yes" : "no"} session=${sessionId.slice(0, 12)}`
     );
     return slot;
   }
 
-  /** create/resume register customTools; later send omits them (whole-table replace). */
+  /**
+   * create/resume register customTools; later send omits them (whole-table replace).
+   *
+   * 包 E 审阅修复（建议 4）：captured 推送不再动态读 `hub.get(sessionId)?.pump`——泵被换/槽被
+   * drop+create 换掉后，旧 run 迟到的 tool 调用会推进新泵并盖上新印章。改为闭包捕获本地 pump
+   * 引用盒（与 durableSend 里 onDelta/stream 闭包捕获本次 send 的 pump 同构）：durableSend 每次
+   * 换泵时同步盒里的引用；新槽创建时换新盒，旧 agent 的回调握着旧盒、推不进新槽的泵。
+   */
   private durableCustomTools(
     hub: SessionHub,
     sessionId: string,
     input: CursorRunRequest
-  ): ReturnType<typeof createSdkCustomTools> {
+  ): { tools: ReturnType<typeof createSdkCustomTools>; pumpRef: { current?: EventPump } } {
     const toolNames = new Map<string, string>();
-    return createSdkCustomTools(input.tools, (toolCall) => {
+    const pumpRef: { current?: EventPump } = {};
+    const tools = createSdkCustomTools(input.tools, (toolCall) => {
       toolNames.set(toolCall.id, toolCall.name);
-      hub.get(sessionId)?.pump.push({
+      pumpRef.current?.push({
         kind: "captured",
         id: toolCall.id,
         name: toolCall.name,
@@ -595,6 +792,7 @@ export class CursorSdkRunner implements CursorRunner {
         hub.registerHold(sessionId, toolCallId, toolNames.get(toolCallId) ?? "tool", resolve, reject);
       }
     });
+    return { tools, pumpRef };
   }
 
   private async abortHungDurableRun(
@@ -615,7 +813,11 @@ export class CursorSdkRunner implements CursorRunner {
   }
 
   private async dropDurableSession(hub: SessionHub, sessionId: string): Promise<void> {
+    // 包 E 审阅修复（应修 2）：三个按 session 记的边车 Map 一起清（原先漏了 consumedExecutes/capturedPumps）。
+    // Hub 内部的 idle/hold/LRU 回收走不到这里，由构造器里注册的 onDrop 监听兜底。
     this.durableRunOrdinals.delete(sessionId);
+    this.durableConsumedExecutes.delete(sessionId);
+    this.durableCapturedPumps.delete(sessionId);
     await hub.drop(sessionId).catch(() => undefined);
     await this.store.deleteSession(sessionId).catch(() => undefined);
   }
@@ -634,10 +836,24 @@ export class CursorSdkRunner implements CursorRunner {
     console.error(
       `[durable] send ${spec.firstSend ? "first" : "follow-up"} session=${sessionId.slice(0, 12)} chars=${preview.length}`
     );
+    // 包 D：上游实际发出的轮次全文（含 firstSend 标记与消息原文），在 send 之前记——send 之后没有任何可靠的等价物。
+    try {
+      input.debugRef?.noteUpstreamTurn("sdk", { kind: spec.kind, firstSend: spec.firstSend, message: spec.message });
+    } catch {
+      // 观测路径不得影响 send。
+    }
     hub.markRunning(sessionId);
-    hub.attachPump(sessionId, new EventPump());
+    // 包 E 第 6 条：每次 send 换新 pump 并按 run 盖章。onDelta/stream 推的是「本次 send 的 pump」
+    // （闭包捕获，绝不读写 slot.pump——它可能已被下一轮 send 换掉），旧 run 的残余事件
+    // 因此不可能污染新轮次；消费方还会按 runId 印章丢弃陈旧项（见 consumeDurablePump）。
+    const pump = new EventPump();
+    hub.attachPump(sessionId, pump);
+    // 换泵时同步 captured 推送的落点（durableCustomTools 闭包捕获的引用盒）：本 run 的
+    // tool 调用推「本次 send 的 pump」，与 onDelta/stream 的闭包捕获同构。
+    const capturedPumpRef = this.durableCapturedPumps.get(sessionId);
+    if (capturedPumpRef) capturedPumpRef.current = pump;
     const onDelta = (args: { update: unknown }) => {
-      if (args?.update !== undefined) slot.pump.push({ kind: "event", event: args.update });
+      if (args?.update !== undefined) pump.push({ kind: "event", event: args.update });
     };
     const agent = slot.agent as AgentLike;
     const run = await raceSendRun(agent.send(spec.message, {
@@ -652,15 +868,19 @@ export class CursorSdkRunner implements CursorRunner {
     });
     slot.run = run;
     slot.runId = run.id;
+    // send 落定后才拿到 run 句柄：此刻起 pump 项盖上本 run 印章；早于此刻的项无印章、按本 run 处理。
+    pump.runId = run.id;
+    // 包 E 第 7 条：换新 run，旧的 execute 幂等标记作废（新 run 的 execute 是全新的键）。
+    this.durableConsumedExecutes.delete(sessionId);
     const waitPromise = run.wait();
     slot.waitPromise = waitPromise;
     void waitPromise.catch(() => undefined);
     void (async () => {
       try {
-        for await (const event of run.stream()) slot.pump.push({ kind: "event", event });
-        slot.pump.push({ kind: "end" });
+        for await (const event of run.stream()) pump.push({ kind: "event", event });
+        pump.push({ kind: "end" });
       } catch (error) {
-        slot.pump.push({ kind: "end", error });
+        pump.push({ kind: "end", error });
       }
     })();
     if (input.telemetryRef) {
@@ -895,6 +1115,27 @@ export class CursorSdkRunner implements CursorRunner {
         }
         throw new ApiError("Request was aborted.", 499, "request_aborted");
       }
+      // 包 E 第 6 条：pump 项归属校验。带印章且不等于当前 runId 的事件属于上一轮 run 的残留
+      // （换 run 只靠 attachPump 整体换队列，早于本轮 send 的项可能还在排队）——丢弃并打点，
+      // 绝不能当作本轮输出（线上那些 0.0s 却有 token 估算的 200 行的最可疑来源）。
+      // 无印章项 = 本次 send 早于 run 句柄就绪的窗口推入，按本 run 处理。
+      const stampedRunId = item.runId;
+      if (stampedRunId !== undefined && slot.runId !== undefined && stampedRunId !== slot.runId) {
+        console.error(
+          `[durable] dropped stale pump ${item.kind} run=${stampedRunId} current=${slot.runId} session=${sessionId.slice(0, 12)}`
+        );
+        recordDurableDecision({
+          decision: "fallback",
+          reason: "stale_pump_events",
+          session: sessionId.slice(0, 12),
+          kind: input.durableTurn?.kind,
+          liveSessions: hub.size
+        });
+        // 陈旧 end 是旧流的终止信号：丢弃后不能再回 nextHubItem 死等（上一轮 send 的 pump
+        // 不会再有新项），本轮 pump 消费到此为止，wait/收尾照常接手。
+        if (item.kind === "end") break;
+        continue;
+      }
       if (item.kind === "captured") {
         streamHadItems = true;
         pushToolCall(capturedToolCalls, {
@@ -1027,6 +1268,13 @@ export class CursorSdkRunner implements CursorRunner {
       ) {
         await parkKeepAlive();
       }
+      // 包 E 第 2/6 条（收尾口径统一放在 finally：done / parkHeld / pathBDone / 异常全都要走）：
+      // - 上一轮 assistant 输出摘要（normalize 后 sha256），下一轮 new_user 与入站 transcript 比对；
+      // - 「已交付」标记：本轮发过语义输出（文本或工具调用）即算交付，重试判定据此选续播还是 stateless。
+      // live 槽可能与闭包 slot 不是同一对象（中途被换过），一律取 live ?? slot（slot 恒有值）。
+      const target = live ?? slot;
+      recordAssistantDigest(target, textParts.join(""));
+      if (textParts.length > 0 || toolCalls.length > 0) markTurnDelivered(target);
     }
   }
 
@@ -1315,6 +1563,12 @@ export class CursorSdkRunner implements CursorRunner {
       onDelta,
       ...(resolved.mode ? { mode: resolved.mode } : {})
     });
+    // 包 D：stateless / 旧 resume 路径的上游轮次全文（与 durable 路径同一出口口径）。
+    try {
+      input.debugRef?.noteUpstreamTurn("sdk", { kind: "stateless-send", message: this.sdkMessage(input) });
+    } catch {
+      // 观测路径不得影响 send。
+    }
     const send = (opts: Record<string, unknown>) => raceSendRun(agent.send(this.sdkMessage(input), opts), signal);
     if (!customTools) return send(options());
     try {

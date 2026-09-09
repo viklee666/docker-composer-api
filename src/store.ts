@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { NO_KEY_SENTINEL } from "./routing.js";
 import type {
+  AbortReason,
   CursorKeyPatch,
   CursorKeyRecord,
   EffectiveParamField,
@@ -87,6 +88,7 @@ export class SqliteStateStore implements StateStore {
         allowed_models TEXT,
         excluded_models TEXT,
         weight INTEGER NOT NULL DEFAULT 1,
+        exhausted_buckets TEXT,
         created_at TEXT NOT NULL
       );
 
@@ -218,6 +220,10 @@ export class SqliteStateStore implements StateStore {
     if (!columns.has("weight")) {
       this.db.exec("ALTER TABLE cursor_keys ADD COLUMN weight INTEGER NOT NULL DEFAULT 1");
     }
+    // 包 B：额度桶标记（桶名 → 耗尽截止时间）。可空，老记录读出来是 undefined = 无标记。
+    if (!columns.has("exhausted_buckets")) {
+      this.db.exec("ALTER TABLE cursor_keys ADD COLUMN exhausted_buckets TEXT");
+    }
   }
 
   /**
@@ -245,7 +251,9 @@ export class SqliteStateStore implements StateStore {
       ["total_tokens", "INTEGER"],
       ["usage_source", "TEXT"],
       ["raw_cost_cents", "REAL"],
-      ["charged_cents", "REAL"]
+      ["charged_cents", "REAL"],
+      // 包 C：流式 abort 的归因。只有真正触发 abort 的请求写，老记录读出来是 undefined。
+      ["abort_reason", "TEXT"]
     ];
     for (const [name, type] of added) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE request_logs ADD COLUMN ${name} ${type}`);
@@ -360,8 +368,8 @@ export class SqliteStateStore implements StateStore {
   async insertCursorKey(record: CursorKeyRecord): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, failure_count, allowed_models, excluded_models, weight, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO cursor_keys (id, api_key, label, status, source, sort_order, disabled_reason, disabled_at, last_used_at, last_error, request_count, failure_count, allowed_models, excluded_models, weight, exhausted_buckets, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -379,6 +387,7 @@ export class SqliteStateStore implements StateStore {
         encodeList(record.modelScope?.allowed),
         encodeList(record.modelScope?.excluded),
         normalizeWeight(record.weight),
+        encodeBuckets(record.exhaustedBuckets),
         record.createdAt
       );
   }
@@ -432,6 +441,10 @@ export class SqliteStateStore implements StateStore {
       sets.push("weight = ?");
       values.push(normalizeWeight(patch.weight));
     }
+    if (patch.exhaustedBuckets !== undefined) {
+      sets.push("exhausted_buckets = ?");
+      values.push(encodeBuckets(patch.exhaustedBuckets ?? undefined));
+    }
     if (!sets.length) return false;
     const result = this.db
       .prepare(`UPDATE cursor_keys SET ${sets.join(", ")} WHERE id = ?`)
@@ -448,6 +461,23 @@ export class SqliteStateStore implements StateStore {
       this.dropCursorKeyFromGatewayKeys(id);
     }
     return removed;
+  }
+
+  /**
+   * 额度桶标记（包 B）：读改写整段同步完成（better-sqlite3 不让出事件循环），
+   * 并发标记不会互相覆盖——拆成 get → await → update 的话，后一次标记会把
+   * 先落的那条桶标记整包冲掉。
+   */
+  async markCursorKeyBucketExhausted(id: string, bucket: string, expiresAt: string): Promise<boolean> {
+    const row = this.db
+      .prepare("SELECT exhausted_buckets FROM cursor_keys WHERE id = ?")
+      .get(id) as { exhausted_buckets: unknown } | undefined;
+    if (!row) return false;
+    const merged = { ...decodeBuckets(row.exhausted_buckets), [bucket]: expiresAt };
+    const result = this.db
+      .prepare("UPDATE cursor_keys SET exhausted_buckets = ? WHERE id = ?")
+      .run(encodeBuckets(merged), id);
+    return Number(result.changes) > 0;
   }
 
   /** key 被删除后，把它从所有网关密钥的绑定列表里剔除，避免残留一个指向空的授权。 */
@@ -599,9 +629,9 @@ export class SqliteStateStore implements StateStore {
            id, ts, endpoint, model, auth_mode, key_id, key_label, status, duration_ms, stream, error,
            gateway_key_id, gateway_key_label, reasoning_effort, max_mode, fast, effective_params, client_type, provider, agent_mode, model_params,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-           usage_source, raw_cost_cents, charged_cents
+           usage_source, raw_cost_cents, charged_cents, abort_reason
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -633,7 +663,8 @@ export class SqliteStateStore implements StateStore {
         record.usage?.totalTokens ?? null,
         record.usageSource ?? (record.usage ? "sdk" : null),
         record.cost?.rawCostCents ?? null,
-        record.cost?.chargedCents ?? null
+        record.cost?.chargedCents ?? null,
+        record.abortReason ?? null
       );
     this.requestLogInsertCount += 1;
     if (this.requestLogInsertCount % REQUEST_LOG_CLEANUP_EVERY === 0) {
@@ -950,6 +981,11 @@ export class MemoryStateStore implements StateStore {
     if (patch.incrementFailureCount) key.failureCount += 1;
     if (patch.modelScope !== undefined) key.modelScope = cloneScope(patch.modelScope);
     if (patch.weight !== undefined) key.weight = normalizeWeight(patch.weight);
+    if (patch.exhaustedBuckets !== undefined) {
+      key.exhaustedBuckets = patch.exhaustedBuckets
+        ? { ...patch.exhaustedBuckets }
+        : undefined;
+    }
     return true;
   }
 
@@ -964,6 +1000,14 @@ export class MemoryStateStore implements StateStore {
       if (!gatewayKey.allowedCursorKeyIds.includes(id)) continue;
       gatewayKey.allowedCursorKeyIds = dropBoundKey(gatewayKey.allowedCursorKeyIds, id);
     }
+    return true;
+  }
+
+  /** 额度桶标记（包 B）：内存实现天然同步，读改写不会被打断，直接合并即可。 */
+  async markCursorKeyBucketExhausted(id: string, bucket: string, expiresAt: string): Promise<boolean> {
+    const key = this.cursorKeys.find((item) => item.id === id);
+    if (!key) return false;
+    key.exhaustedBuckets = { ...(key.exhaustedBuckets ?? {}), [bucket]: expiresAt };
     return true;
   }
 
@@ -1349,6 +1393,26 @@ function encodeList(values: string[] | undefined): string | null {
   return values?.length ? JSON.stringify(values) : null;
 }
 
+/** 额度桶标记（包 B）：与 encodeList 同一套「空 = NULL」约定；脏 JSON 读回来按无标记处理。 */
+function encodeBuckets(buckets: Record<string, string> | undefined): string | null {
+  return buckets && Object.keys(buckets).length ? JSON.stringify(buckets) : null;
+}
+
+function decodeBuckets(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const buckets: Record<string, string> = {};
+    for (const [bucket, until] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof until === "string" && until) buckets[bucket] = until;
+    }
+    return Object.keys(buckets).length ? buckets : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function decodeList(value: unknown): string[] {
   if (typeof value !== "string" || !value) return [];
   try {
@@ -1377,7 +1441,11 @@ function cloneScope(scope: ModelScope | undefined): ModelScope {
 }
 
 function cloneKey(key: CursorKeyRecord): CursorKeyRecord {
-  return { ...key, modelScope: cloneScope(key.modelScope) };
+  return {
+    ...key,
+    modelScope: cloneScope(key.modelScope),
+    ...(key.exhaustedBuckets ? { exhaustedBuckets: { ...key.exhaustedBuckets } } : {})
+  };
 }
 
 function cloneGatewayKey(key: GatewayKeyRecord): GatewayKeyRecord {
@@ -1385,6 +1453,7 @@ function cloneGatewayKey(key: GatewayKeyRecord): GatewayKeyRecord {
 }
 
 function rowToKey(row: Record<string, unknown>): CursorKeyRecord {
+  const exhaustedBuckets = decodeBuckets(row.exhausted_buckets);
   return {
     id: String(row.id),
     apiKey: String(row.api_key),
@@ -1400,6 +1469,7 @@ function rowToKey(row: Record<string, unknown>): CursorKeyRecord {
     failureCount: Number(row.failure_count ?? 0),
     modelScope: decodeScope(row.allowed_models, row.excluded_models),
     weight: normalizeWeight(Number(row.weight ?? 1)),
+    ...(exhaustedBuckets ? { exhaustedBuckets } : {}),
     createdAt: String(row.created_at)
   };
 }
@@ -1434,6 +1504,8 @@ function rowToLog(row: Record<string, unknown>): RequestLogRecord {
     durationMs: Number(row.duration_ms ?? 0),
     stream: Number(row.stream ?? 0) === 1,
     error: optional(row.error),
+    // 老记录没有这一列（或值不是合法归因）读出来是 undefined，后台按「未记录归因」展示。
+    abortReason: decodeAbortReason(row.abort_reason),
     gatewayKeyId: optional(row.gateway_key_id),
     gatewayKeyLabel: optional(row.gateway_key_label),
     reasoningEffort: optional(row.reasoning_effort),
@@ -1483,6 +1555,13 @@ function decodeEffectiveParams(value: unknown): EffectiveParamField[] | undefine
   const fields = decodeList(value).filter((field): field is EffectiveParamField =>
     field === "reasoningEffort" || field === "maxMode" || field === "fast");
   return fields.length ? fields : undefined;
+}
+
+/** 只认四个已知归因；其余（包括脏数据与老库的 NULL）一律 undefined。 */
+function decodeAbortReason(value: unknown): AbortReason | undefined {
+  return value === "client_disconnect" || value === "idle_timeout" || value === "upstream_canceled" || value === "local_abort"
+    ? value
+    : undefined;
 }
 
 function decodeModelParams(value: unknown): RequestLogRecord["modelParams"] {
