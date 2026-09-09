@@ -1227,7 +1227,9 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       var lines = Object.keys(models).sort().map(function(model){
         return '  "' + model + '": "' + models[model] + '"';
       });
-      box.value = '{\n  "models": {\n' + (lines.length ? lines.join(',\n') + '\n' : '') + '  },\n  "default": "' + (table.default || 'other') + '"\n}';
+      // 注意：ADMIN_HTML 是 TS 模板字面量，字符串里的换行转义必须双写反斜杠，
+      // 否则编译成真实换行会把单引号字符串拆成多行，整个 script 块解析失败（登录按钮无反应就是这类错）。
+      box.value = '{\\n  "models": {\\n' + (lines.length ? lines.join(',\\n') + '\\n' : '') + '  },\\n  "default": "' + (table.default || 'other') + '"\\n}';
       $('quota-buckets-hint').textContent = '';
     }).catch(function(err){
       if (err.message !== 'unauthorized') $('quota-buckets-hint').textContent = '读取失败：' + err.message;
