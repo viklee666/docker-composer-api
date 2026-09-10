@@ -311,6 +311,19 @@ $env:ANTHROPIC_MODEL = "gpt-5.6-sol[1m]"   # 或 claude-sonnet-5[1m] 等带 cont
 
 **这个 token 是账号级凭据，比它铸出来的 API key 权限大得多。** 网关只在这一次请求里用它，不落库、不写日志、不回显；网关生成的错误信息会按已知 session-token 形状抹掉它。会话过期时返回 401 并提示重新复制（不跟随后台的登录页跳转，避免报成看不懂的「响应不是 JSON」）。
 
+## Bot 路线（Connect 协议）与 Box relay
+
+`GATEWAY_PROVIDER=bot`（或请求带 `provider: "bot"`）走 Connect 协议路线：凭据是 session JWT（后台「从 Key 拉取」用 key 池里的 `crsr_` 自动兑换），推理走 `aiserver.v1.InferenceService/Stream`。
+
+**2026-09 起（Grok Bot 0.44+）上游要求推理带 Box 内部 token，api2 直连会被拒（endStream `unauthenticated`）**，Bot 路线必须经 Box relay：
+
+1. 后台「运行设置」→ Bot 推理出口 → **Box relay**（或 env `CURSOR_BOT_INFERENCE_ROUTE=relay`）；
+2. 后台「Bot 凭据」行点 **Relay** → 未装配时一键装配（指令发给 Box 里当前打开的 Bot，约 2-8 分钟；该 Bot 的聊天里会出现这条指令，属预期）。
+
+连接三件套（gatewayUrl / gatewayToken / networkToken）由网关自动经 `GrokBotService/EnsureSandBox` 获取并按凭据缓存；token 轮换或 Box 重启换 pod 时自动重取重试一次（未产出内容的请求才重试）。**无需手工同步任何 token。**
+
+维护点只有一个：**Box 重建（升级/迁移）后 relay 补丁会丢失**——推理报「Box relay 未装配」时，回到后台凭据行点一次 Relay 重新装配即可。模型受上游账号白名单限制（受限模型返回 `permission_denied`）。协议字段来源见 `docs/reference/grokbot-service-descriptor.txt`（`scripts/extract-grokbot-descriptor.mjs` 从 Grok Bot 客户端机械取证）。
+
 ## 出站代理
 
 `PROXY_URL` 或后台「代理设置」页配置，支持 `http` / `https` / `socks5` / `socks5h` / `socks4`，可带账号密码（`socks5://user:pass@host:1080`），只写 `host:port` 时按 `http://` 处理。只写用户名或只写密码也接受，两条链路会带上同一份 `Basic` 凭据（不会出现「REST 407、模型流量却通」这种半通状态）。

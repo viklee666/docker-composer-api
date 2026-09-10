@@ -133,6 +133,18 @@ export interface GatewayConfig {
   botMachineId?: string;
   /** 播种凭据的客户端版本号。env: CURSOR_BOT_CLIENT_VERSION。 */
   botClientVersion?: string;
+  /**
+   * Bot 路线的额外出站头（JSON 对象）。Box relay 场景注入 `x-anyrun-network-token` 等
+   * 路由凭据：`CURSOR_BOT_BASE_URL` 指向 Box relay 时必需，缺失会被 relay 以 404 拒掉。
+   * env: CURSOR_BOT_EXTRA_HEADERS。
+   */
+  botExtraHeaders?: Record<string, string>;
+  /**
+   * Bot 路线的推理出口：`direct` = api2 直连（0.44 前的老路径，现在被上游拒绝）；
+   * `relay` = 经 Box relay（自动 EnsureSandBox 取连接）。后台「运行设置」可覆盖。
+   * env: CURSOR_BOT_INFERENCE_ROUTE。
+   */
+  botInferenceRoute?: "direct" | "relay";
 
   /* ------------------------------- Debug 模式（包 D，计划 §3.1） */
 
@@ -479,6 +491,12 @@ export interface ProviderRunOverrides {
   sendTools?: boolean;
   /** Bot 路线：请求体编码（顶层 botCodec 的覆盖）。 */
   codec?: "proto" | "json";
+  /**
+   * Bot 路线：推理出口（顶层 botInferenceRoute 的覆盖）。
+   * `direct` = api2 直连（0.44 前老路径）；`relay` = 经 Box relay，连接由
+   * EnsureSandBox 自动获取、失效自动重取。
+   */
+  inferenceRoute?: "direct" | "relay";
 }
 
 export interface CursorRunResult {

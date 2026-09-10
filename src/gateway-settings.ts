@@ -359,7 +359,8 @@ const PROVIDER_OVERRIDE_KEYS = {
   modelParams: "ModelParams",
   agentMode: "AgentMode",
   sendTools: "SendTools",
-  codec: "Codec"
+  codec: "Codec",
+  inferenceRoute: "InferenceRoute"
 } as const;
 
 function providerSettingKey(
@@ -416,10 +417,12 @@ export async function loadProviderRunOverrides(
   if (agentMode === "agent" || agentMode === "plan") overrides.agentMode = agentMode;
 
   if (provider === "bot") {
-    // sendTools / codec 只属于 Bot 路线；SDK 侧没有对应的同名 key。
+    // sendTools / codec / inferenceRoute 只属于 Bot 路线；SDK 侧没有对应的同名 key。
     overrides.sendTools = await loadOverrideFlag(store, providerSettingKey("bot", "sendTools"));
     const codec = await store.getSetting(providerSettingKey("bot", "codec"));
     if (codec === "proto" || codec === "json") overrides.codec = codec;
+    const route = await store.getSetting(providerSettingKey("bot", "inferenceRoute"));
+    if (route === "direct" || route === "relay") overrides.inferenceRoute = route;
   }
 
   return Object.values(overrides).some((value) => value !== undefined) ? overrides : undefined;
@@ -462,6 +465,7 @@ export async function saveProviderRunOverrides(
   if (provider === "bot") {
     await saveOverrideFlag(store, providerSettingKey("bot", "sendTools"), overrides.sendTools);
     await store.setSetting(providerSettingKey("bot", "codec"), overrides.codec ?? "");
+    await store.setSetting(providerSettingKey("bot", "inferenceRoute"), overrides.inferenceRoute ?? "");
   }
 }
 

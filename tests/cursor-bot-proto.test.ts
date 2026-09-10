@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { gzipSync, brotliCompressSync } from "node:zlib";
 import { test } from "node:test";
@@ -171,7 +171,11 @@ function generatedRef(field: Record<string, unknown>): string {
   return `map:${field.K as number}:${inner}`;
 }
 
-test("inference_pb.ts covers every descriptor message with matching field numbers", () => {
+// 参考文件是从 Cursor 客户端 bundle 取证导出的，不入库（新机器上没有）；
+// 缺失时跳过对照而不是失败——有文件的机器上照常逐字段校验。
+const DESCRIPTOR_PRESENT = existsSync(DESCRIPTOR_PATH);
+
+test("inference_pb.ts covers every descriptor message with matching field numbers", { skip: !DESCRIPTOR_PRESENT && "缺少 docs/reference/inference-descriptor-8844.txt（本机取证产物）" }, () => {
   const descriptor = parseDescriptor();
   const generated = generatedTypes();
   assert.equal(descriptor.size, 54);
@@ -411,6 +415,29 @@ test("headers omit sandbox and internal-only names", () => {
   ]) {
     assert.equal(headers[name], undefined, `不应发送 ${name}`);
   }
+});
+
+test("extra headers are merged but protocol-critical names and secrets stay protected", () => {
+  const headers = buildConnectHeaders({
+    credential: CREDENTIAL,
+    extraHeaders: {
+      "x-anyrun-network-token": "nto-secret-value",
+      "Content-Type": "text/plain",
+      "connect-protocol-version": "9",
+      authorization: "Bearer evil",
+      " ": "ignored",
+      "x-custom": " kept "
+    }
+  });
+  assert.equal(headers["x-anyrun-network-token"], "nto-secret-value");
+  assert.equal(headers["x-custom"], "kept");
+  // 协议关键头不可被额外头覆盖。
+  assert.equal(headers["content-type"], "application/connect+proto");
+  assert.equal(headers["connect-protocol-version"], "1");
+  assert.equal(headers.authorization, `Bearer ${CREDENTIAL.sessionToken}`);
+  // 路由凭据与主凭据同口径脱敏。
+  const redacted = redactHeaders(headers);
+  assert.equal(redacted["x-anyrun-network-token"], "***");
 });
 
 test("optional device fields are dropped rather than sent empty", () => {

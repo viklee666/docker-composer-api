@@ -832,6 +832,15 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                     <div class="hint">改完立即生效，对下一个 Bot 请求生效。</div>
                   </div>
                   <div class="setting-field">
+                    <label>推理出口 <span class="env">CURSOR_BOT_INFERENCE_ROUTE</span></label>
+                    <select id="bot-inference-route">
+                      <option value="">跟随 env / 公共默认</option>
+                      <option value="direct">api2 直连（0.44 前老路径）</option>
+                      <option value="relay">Box relay（自动取连接，推荐）</option>
+                    </select>
+                    <div class="hint">0.44 起直连会被上游拒绝，Bot 路线要用 relay。切换后到「Bot 凭据」页点 Relay 检查装配状态。</div>
+                  </div>
+                  <div class="setting-field">
                     <label>Bot 上游空闲超时（ms）</label>
                     <input id="bot-request-timeout" type="number" min="5000" step="1000" placeholder="留空 = 跟随公共默认">
                     <div class="hint">只作用于走 Bot 路线的请求。</div>
@@ -1320,6 +1329,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       var actions = [
         '<button data-bot-copy="' + esc(item.id) + '" title="复制完整 session token 到剪贴板（页面不显示明文）">复制</button>',
         '<button data-bot-test="' + esc(item.id) + '">测试</button>',
+        '<button data-bot-relay="' + esc(item.id) + '" title="检查 Box relay 状态；未装配时可一键装配">Relay</button>',
         item.status === 'active'
           ? '<button data-bot-disable="' + esc(item.id) + '">停用</button>'
           : '<button data-bot-enable="' + esc(item.id) + '">启用</button>',
@@ -1338,6 +1348,23 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         '<td class="row" style="gap:6px">' + actions + '</td>' +
         '</tr>';
     }).join('');
+  }
+
+  /** 装配任务轮询：30s 一次、最多 20 次（10 分钟），任务结束 toast 一次。 */
+  function pollRelayProvision(id, attempt){
+    if (attempt > 20) return;
+    setTimeout(function(){
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/relay-status').then(function(res){
+        var job = res && res.provisioning;
+        if (!job) return;
+        if (job.state === 'running') { pollRelayProvision(id, attempt + 1); return; }
+        if (job.state === 'ok') toast('Relay 装配完成：' + (job.message || ''));
+        else toast('Relay 装配未完成：' + (job.message || '原因未知'), true);
+      }).catch(function(err){
+        if (err.message === 'unauthorized') return;
+        pollRelayProvision(id, attempt + 1);
+      });
+    }, 30000);
   }
 
   function loadBotModels(force){
@@ -1547,6 +1574,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     $('bot-model-params').value = bot.modelParams || '';
     $('bot-send-tools').value = bot.sendTools == null ? '' : (bot.sendTools ? 'on' : 'off');
     $('bot-codec').value = bot.codec || '';
+    $('bot-inference-route').value = bot.inferenceRoute || '';
     $('bot-request-timeout').value = bot.requestTimeoutMs == null ? '' : bot.requestTimeoutMs;
     $('bot-auto-disable').value = bot.autoDisableKeys == null ? '' : (bot.autoDisableKeys ? 'on' : 'off');
     $('bot-auto-disable-threshold').value = bot.autoDisableThreshold == null ? '' : bot.autoDisableThreshold;
@@ -2482,6 +2510,40 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
       });
       return;
     }
+    id = target.getAttribute('data-bot-relay');
+    if (id) {
+      target.disabled = true;
+      var relayBtn = target;
+      relayBtn.textContent = '探测中…';
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/relay-status').then(function(res){
+        relayBtn.disabled = false;
+        relayBtn.textContent = 'Relay';
+        if (!res.route) {
+          toast('Relay 探测失败 ' + (res.status || '') + '：' + (res.error || '未知错误'), true);
+          return;
+        }
+        var probe = res.probe || {};
+        var label = { ok: '已就绪', missing: '未装配', 'auth-expired': 'token 已轮换', unreachable: '不可达' }[probe.status] || probe.status;
+        var msg = '推理出口 ' + (res.route === 'relay' ? 'relay' : 'direct（未切）') + ' | Box ' + (res.connection ? res.connection.gatewayHost : '?') + ' | relay ' + label + (probe.detail ? '：' + probe.detail : '');
+        var job = res.provisioning;
+        if (job && job.state === 'running') msg += ' | 装配中：' + job.message;
+        toast(msg, probe.status !== 'ok');
+        if (probe.status === 'missing' && (!job || job.state !== 'running') &&
+            window.confirm('Box relay 未装配。现在装配？（指令会发给 Box 里当前打开的 Bot，约需 2-8 分钟，期间该 Bot 聊天里会出现这条指令）')) {
+          api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/provision-relay').then(function(r2){
+            toast('装配已启动：' + ((r2.provisioning && r2.provisioning.message) || ''));
+            pollRelayProvision(id, 0);
+          }).catch(function(err){
+            if (err.message !== 'unauthorized') toast('装配启动失败：' + err.message, true);
+          });
+        }
+      }).catch(function(err){
+        relayBtn.disabled = false;
+        relayBtn.textContent = 'Relay';
+        if (err.message !== 'unauthorized') toast('Relay 探测失败：' + err.message, true);
+      });
+      return;
+    }
     id = target.getAttribute('data-bot-enable') || target.getAttribute('data-bot-disable');
     if (id) {
       var action = target.hasAttribute('data-bot-enable') ? 'enable' : 'disable';
@@ -2793,6 +2855,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
         modelParams: $('bot-model-params').value.trim() || null,
         sendTools: $('bot-send-tools').value === '' ? null : $('bot-send-tools').value === 'on',
         codec: $('bot-codec').value || null,
+        inferenceRoute: $('bot-inference-route').value || null,
         requestTimeoutMs: botTimeout,
         autoDisableKeys: $('bot-auto-disable').value === '' ? null : $('bot-auto-disable').value === 'on',
         autoDisableThreshold: botThreshold

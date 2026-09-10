@@ -9,7 +9,7 @@
  *
  * `--check` 只比对不写盘，退出码非 0 表示生成物与 descriptor 已经不一致。
  */
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,7 +18,13 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** 需要生成的 descriptor → 生成物。新增一份参考文件时在这里加一行。 */
 const TARGETS = [
   { descriptor: "docs/reference/inference-descriptor-8844.txt", output: "src/cursor-bot/proto/inference_pb.ts" },
-  { descriptor: "docs/reference/available-models-descriptor.txt", output: "src/cursor-bot/proto/available_models_pb.ts" }
+  { descriptor: "docs/reference/available-models-descriptor.txt", output: "src/cursor-bot/proto/available_models_pb.ts" },
+  {
+    descriptor: "docs/reference/grokbot-service-descriptor.txt",
+    output: "src/cursor-bot/proto/grokbot_service_pb.ts",
+    format: "grokbot-dump",
+    title: "Grok Bot 0.44.0 proto descriptor dump"
+  }
 ];
 
 /** descriptor 的 `kind:"scalar"` T 值 → protobuf-es ScalarType 与 TS 类型/零值。 */
@@ -33,17 +39,28 @@ const SCALAR = {
   13: { name: "UINT32", ts: "number", zero: "0" }
 };
 
-main();
+
 
 function main() {
   const check = process.argv.includes("--check");
   for (const target of TARGETS) {
     const descriptor = resolve(ROOT, target.descriptor);
     const output = resolve(ROOT, target.output);
+    if (!existsSync(descriptor)) {
+      // 参考文件是从客户端 bundle 取证导出的，不在仓库里；本机没有就跳过该目标。
+      console.warn(`skip ${target.output}: 缺少 ${target.descriptor}`);
+      continue;
+    }
     const source = readFileSync(descriptor, "utf8");
-    const enums = parseEnums(source);
-    const messages = parseMessages(source, enums);
-    const emitted = emit(enums, messages, target.descriptor);
+    let enums;
+    let messages;
+    if (target.format === "grokbot-dump") {
+      ({ enums, messages } = parseGrokbotDump(source));
+    } else {
+      enums = parseEnums(source);
+      messages = parseMessages(source, enums);
+    }
+    const emitted = emit(enums, messages, target.descriptor, target.title);
 
     if (check) {
       if (normalizeEol(readFileSync(output, "utf8")) !== normalizeEol(emitted)) {
@@ -64,6 +81,141 @@ function normalizeEol(text) {
 }
 
 /* ------------------------------------------------------------------ 解析 */
+
+/**
+ * 解析 extract-grokbot-descriptor.mjs 的 runtime dump 格式（grokbot-proto-dump/1）。
+ * 与上面两个「压缩 bundle 原文」解析器不同：字段来源是加载过的 protobuf-es 运行时
+ * 本体，dump 只是它的可读序列化。产物结构与 legacy 解析器完全一致，emit 复用。
+ *
+ *   version grokbot-proto-dump/1
+ *   enum aiserver.v1.SandBoxRunState
+ *     RUNNING = 3 as SAND_BOX_RUN_STATE_RUNNING
+ *   end
+ *   message aiserver.v1.EnsureSandBoxRequest
+ *     field 2 wake bool optional
+ *     defaults none
+ *   end
+ */
+function parseGrokbotDump(source) {
+  if (!/^version grokbot-proto-dump\/1$/m.test(source)) {
+    throw new Error("不是 grokbot-proto-dump/1 格式");
+  }
+  const enums = [];
+  const messages = [];
+  const enumByTypeName = new Map(enums.map((item) => [item.typeName, item]));
+  const lines = source.split(/\r?\n/);
+
+  let block = null; // {kind:"enum"|"message", typeName, values|fields, defaults}
+  for (const line of lines) {
+    const text = line.trim();
+    if (!text || text.startsWith("#") || text.startsWith("version ")) continue;
+    if (text === "end") {
+      if (!block) throw new Error("多余的 end");
+      (block.kind === "enum" ? enums : messages).push(finishBlock(block, enumByTypeName));
+      block = null;
+      continue;
+    }
+    const enumHeader = /^enum (\S+)$/.exec(text);
+    if (enumHeader) {
+      if (block) throw new Error(`${enumHeader[1]}: 上一块未闭合`);
+      block = { kind: "enum", typeName: enumHeader[1], values: [] };
+      continue;
+    }
+    const messageHeader = /^message (\S+)$/.exec(text);
+    if (messageHeader) {
+      if (block) throw new Error(`${messageHeader[1]}: 上一块未闭合`);
+      block = { kind: "message", typeName: messageHeader[1], fields: [], defaults: null };
+      continue;
+    }
+    if (!block) throw new Error(`块外出现内容：${text}`);
+
+    const enumValue = /^(\w+) = (\d+) as (\S+)$/.exec(text);
+    if (block.kind === "enum" && enumValue) {
+      block.values.push({ name: enumValue[1], no: Number(enumValue[2]), wireName: enumValue[3] });
+      continue;
+    }
+    const field = /^field (\d+) (\S+) (\S+)(.*)$/.exec(text);
+    if (block.kind === "message" && field) {
+      block.fields.push(parseDumpField(field, block.typeName));
+      continue;
+    }
+    const defaults = /^defaults (.+|none)$/.exec(text);
+    if (block.kind === "message" && defaults) {
+      block.defaults = defaults[1] === "none" ? "" : defaults[1];
+      continue;
+    }
+    throw new Error(`${block.typeName}: 无法解析行「${text}」`);
+  }
+  if (block) throw new Error(`${block.typeName}: 缺少 end`);
+  if (!messages.length) throw new Error("dump 里没有任何 message");
+  return { enums, messages };
+}
+
+const DUMP_SCALARS = {
+  double: 1, float: 2, int64: 3, int32: 5, bool: 8, string: 9, bytes: 12, uint32: 13
+};
+
+function parseDumpField(match, owner) {
+  const [, noRaw, name, typeDesc, restRaw] = match;
+  const rest = restRaw.trim().split(/\s+/).filter(Boolean);
+  const field = {
+    no: Number(noRaw),
+    name,
+    localName: camelCase(name),
+    kind: undefined,
+    opt: rest.includes("optional"),
+    repeated: rest.includes("repeated"),
+    oneof: undefined
+  };
+  const oneofIndex = rest.findIndex((token) => token === "oneof");
+  if (oneofIndex >= 0) field.oneof = rest[oneofIndex + 1];
+
+  if (typeDesc in DUMP_SCALARS) {
+    field.kind = "scalar";
+    const T = DUMP_SCALARS[typeDesc];
+    // 与 legacy 的 requireScalar 同构：SCALAR 表本身不带 T，这里补上。
+    field.scalar = { ...SCALAR[T], T };
+    if (!field.scalar.name) throw new Error(`${owner}.${name}: 未知 scalar ${typeDesc}`);
+  } else if (typeDesc === "enum") {
+    // 形状：`field <no> <name> enum <typeName> [flags]` —— typeName 紧跟 kind 之后。
+    field.kind = "enum";
+    const typeName = rest.shift();
+    if (!typeName || !typeName.includes(".")) {
+      throw new Error(`${owner}.${name}: enum 字段缺少类型名`);
+    }
+    field.enumTypeName = typeName;
+  } else {
+    throw new Error(`${owner}.${name}: 无法解析类型「${typeDesc}」（message 字段按需扩展）`);
+  }
+  return field;
+}
+
+/** 块收尾：enum 字段回填 enumRef、message 组装 ctorDefaults，并跑与 legacy 相同的零值校验。 */
+function finishBlock(block, enumByTypeName) {
+  if (block.kind === "enum") {
+    const entry = { local: block.typeName, typeName: block.typeName, tsName: tsNameOf(block.typeName), values: block.values };
+    enumByTypeName.set(entry.typeName, entry);
+    return entry;
+  }
+  const fields = block.fields.map((field) => {
+    if (field.kind === "enum") {
+      const enumRef = enumByTypeName.get(field.enumTypeName);
+      if (!enumRef) throw new Error(`${block.typeName}.${field.name}: 未知的 enum ${field.enumTypeName}`);
+      const { enumTypeName, ...rest } = field;
+      return { ...rest, enumRef };
+    }
+    return field;
+  });
+  const entry = {
+    local: block.typeName,
+    typeName: block.typeName,
+    tsName: tsNameOf(block.typeName),
+    fields,
+    ctorDefaults: new Set((block.defaults ?? "").split(",").filter(Boolean))
+  };
+  verifyDefaults(entry);
+  return entry;
+}
 
 /**
  * 枚举成员名直接取 descriptor 自己的 IIFE 体（`e[e.USER=1]="USER"`），
@@ -320,7 +472,7 @@ function camelCase(name) {
 
 /* ------------------------------------------------------------------ 生成 */
 
-function emit(enums, messages, descriptorPath) {
+function emit(enums, messages, descriptorPath, title = "Cursor 3.18.9 protobuf descriptor") {
   const lines = [];
   const usesInt64 = messages.some((m) => m.fields.some((f) => !f.oneof && !f.opt && !f.repeated && f.scalar?.T === 3));
   const wellKnown = new Set();
@@ -334,7 +486,7 @@ function emit(enums, messages, descriptorPath) {
   const runtime = ["Message", "proto3", ...(usesInt64 ? ["protoInt64"] : []), ...[...wellKnown].sort()];
   lines.push(
     `// @generated by scripts/gen-inference-pb.mjs from ${descriptorPath}`,
-    "// 该文件是 Cursor 3.18.9 protobuf descriptor 的机械转写，请勿手改。",
+    `// 该文件是 ${title} 的机械转写，请勿手改。`,
     "// 重新生成：node scripts/gen-inference-pb.mjs   校验：node scripts/gen-inference-pb.mjs --check",
     "/* eslint-disable */",
     "",
@@ -485,3 +637,5 @@ function fieldDescriptor(field) {
   if (field.opt) parts.push("opt: true");
   return `{ ${parts.join(", ")} }`;
 }
+
+main();

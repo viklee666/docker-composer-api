@@ -78,6 +78,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     botSessionToken: optionalString(env.CURSOR_BOT_TOKEN),
     botMachineId: optionalString(env.CURSOR_BOT_MACHINE_ID),
     botClientVersion: stringValue(env.CURSOR_BOT_CLIENT_VERSION, DEFAULT_BOT_CLIENT_VERSION),
+    // Box relay 场景：注入 x-anyrun-network-token 等路由凭据（JSON 对象，键值都是字符串）。
+    // 解析失败按空处理并告警——一个写错的 env 不该让网关起不来。
+    botExtraHeaders: parseExtraHeaders(env.CURSOR_BOT_EXTRA_HEADERS),
+    // 推理出口：relay = 经 Box relay（自动 EnsureSandBox）；直连路径 0.44 起已被上游拒绝，
+    // 默认仍取 direct 保持行为兼容，部署时显式开 relay。
+    botInferenceRoute: env.CURSOR_BOT_INFERENCE_ROUTE?.trim().toLowerCase() === "relay" ? "relay" : "direct",
 
     // Debug 快照（包 D）：env 只做总开关与上限默认值，过滤条件与运行期开关走 gateway-settings。
     // 默认关：全量落盘会把请求原文（含 prompt）写进磁盘，必须显式开启。
@@ -90,6 +96,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
 /** 播种凭据的默认客户端版本。与本地 Cursor 一致，便于上游按版本识别。 */
 export const DEFAULT_BOT_CLIENT_VERSION = "3.18.9";
 
+/**
+ * 解析 `CURSOR_BOT_EXTRA_HEADERS`（JSON 对象，string→string）。
+ * 非 JSON / 非对象 / 值非字符串的条目一律丢弃——额外头是逃生舱不是核心配置，
+ * 写错时降级为「不注入」比让网关拒绝启动更可运维（请求会拿到清晰的 404/401 再回来排查）。
+ */
+function parseExtraHeaders(value: string | undefined): Record<string, string> {
+  const trimmed = value?.trim();
+  if (!trimmed) return {};
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.warn("[config] CURSOR_BOT_EXTRA_HEADERS 不是 JSON 对象，已忽略");
+      return {};
+    }
+    const result: Record<string, string> = {};
+    for (const [name, headerValue] of Object.entries(parsed as Record<string, unknown>)) {
+      if (name.trim() && typeof headerValue === "string" && headerValue.trim()) {
+        result[name.trim()] = headerValue.trim();
+      }
+    }
+    return result;
+  } catch {
+    console.warn("[config] CURSOR_BOT_EXTRA_HEADERS 不是合法 JSON，已忽略");
+    return {};
+  }
+}
+
 function parseProvider(value: string | undefined): GatewayProvider {
   // "connect" / "cursor-connect" 是改名前的旧值（env 里可能残留），仅读侧承认，对外一律产出 "bot"。
   const trimmed = value?.trim().toLowerCase();
@@ -98,8 +131,7 @@ function parseProvider(value: string | undefined): GatewayProvider {
 
 function parseList(value: string | undefined): string[] {
   return (value ?? "")
-    .split(/[,;\n]/)
-    .map((item) => item.trim())
+    .split(/[,;\n]/)    .map((item) => item.trim())
     .filter(Boolean);
 }
 

@@ -27,6 +27,8 @@ export interface CursorBotProviderOptions {
   acceptEncoding?: string;
   readMaxBytes?: number;
   fetchImpl?: ConnectFetch;
+  /** 额外出站头（Box relay 路由凭据等），见 buildConnectHeaders。 */
+  extraHeaders?: Record<string, string>;
   /** 模型目录来源；缺省时不查目录，参数解析走 model-params.ts 的家族兜底。 */
   getModelCatalog?: ModelCatalogPort;
   catalogTtlMs?: number;
@@ -120,6 +122,7 @@ export class CursorBotProvider implements CursorRunner {
       acceptEncoding: this.options.acceptEncoding,
       readMaxBytes: this.options.readMaxBytes,
       fetchImpl: this.options.fetchImpl,
+      extraHeaders: this.options.extraHeaders,
       nowMs: this.options.nowMs
     };
   }

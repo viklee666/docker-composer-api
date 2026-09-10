@@ -785,6 +785,35 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   /**
+   * relay 状态：EnsureSandBox 取连接 → 探测路由 → 附装配任务快照。
+   * 探测有网络往返（上限 30s），后台按钮专用。
+   */
+  app.post("/admin/api/bot/credentials/:id/relay-status", async (request) => {
+    requireAdmin(request, deps);
+    const bot = requireBot(deps);
+    const startedAt = Date.now();
+    try {
+      const report = await bot.relayStatus(keyId(request));
+      return { ...report, durationMs: Date.now() - startedAt };
+    } catch (error) {
+      const api = normalizeError(error);
+      return { ok: false, status: api.statusCode, error: api.message, durationMs: Date.now() - startedAt };
+    }
+  });
+
+  /** 装配 relay：异步任务（发指令给 Box agent + 轮询到就绪，最长 8 分钟），立即返回快照。 */
+  app.post("/admin/api/bot/credentials/:id/provision-relay", async (request) => {
+    requireAdmin(request, deps);
+    const bot = requireBot(deps);
+    try {
+      return { provisioning: bot.startRelayProvision(keyId(request)) };
+    } catch (error) {
+      const api = normalizeError(error);
+      return { ok: false, status: api.statusCode, error: api.message };
+    }
+  });
+
+  /**
    * 按 id 回传 session token 明文（JWT）。理由同 /admin/api/keys/:id/reveal：
    * 单人运维的内页，遮住管理员自己的凭据没有安全收益。只回 sessionToken，
    * 不附 machineId 等字段——复制场景用不到，别多给。
@@ -1769,6 +1798,13 @@ async function applyProviderOverrides(
       overrides.codec = patch.codec === "proto" || patch.codec === "json" ? patch.codec : undefined;
       touched = true;
     }
+    if (patch.inferenceRoute !== undefined) {
+      if (patch.inferenceRoute !== null && patch.inferenceRoute !== "direct" && patch.inferenceRoute !== "relay") {
+        throw new ApiError("botInferenceRoute must be direct, relay, or null.", 400, "invalid_request_error", "botInferenceRoute");
+      }
+      overrides.inferenceRoute = patch.inferenceRoute === "direct" || patch.inferenceRoute === "relay" ? patch.inferenceRoute : undefined;
+      touched = true;
+    }
   }
 
   if (!touched) return false;
@@ -1799,7 +1835,11 @@ function providerOverridesEcho(provider: GatewayProvider, overrides: ProviderRun
     modelParams: formatModelParamsSpec(overrides?.modelParams),
     agentMode: overrides?.agentMode ?? "",
     ...(provider === "bot"
-      ? { sendTools: overrides?.sendTools ?? null, codec: overrides?.codec ?? "" }
+      ? {
+          sendTools: overrides?.sendTools ?? null,
+          codec: overrides?.codec ?? "",
+          inferenceRoute: overrides?.inferenceRoute ?? ""
+        }
       : {})
   };
 }

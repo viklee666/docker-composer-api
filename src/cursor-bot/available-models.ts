@@ -34,6 +34,8 @@ export interface AvailableModelsOptions {
   fetchImpl?: ConnectFetch;
   signal?: AbortSignal;
   nowMs?: () => number;
+  /** 额外出站头（Box relay 路由凭据等），见 buildConnectHeaders。 */
+  extraHeaders?: Record<string, string>;
 }
 
 /** 目录里一个模型的网关视角摘要。只留网关真正会用到的字段。 */
@@ -88,6 +90,7 @@ export async function fetchAvailableModels(options: AvailableModelsOptions): Pro
       credential: options.credential,
       codec,
       kind: "unary",
+      extraHeaders: options.extraHeaders,
       nowMs: options.nowMs?.()
     }),
     body: payload,

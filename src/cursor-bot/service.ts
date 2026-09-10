@@ -14,6 +14,17 @@ import type {
 } from "../types.js";
 import { fetchAvailableModels, type BotCatalog, type BotModelEntry } from "./available-models.js";
 import { exchangeUserApiKey } from "./api-key-exchange.js";
+import {
+  BoxRelayConnectionManager,
+  relayExtraHeaders,
+  relayInferenceBaseUrl,
+  type BoxRelayConnection
+} from "./box-relay.js";
+import {
+  probeRelay,
+  provisionRelay,
+  type RelayProbeResult
+} from "./relay-provision.js";
 import { resolveRequestedModel } from "./catalog.js";
 import { CursorBotClient, DEFAULT_BOT_BASE_URL } from "./client.js";
 import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
@@ -50,6 +61,13 @@ export interface BotSettings {
   subagents: boolean;
   background: boolean;
   clientVersion: string;
+  /** 额外出站头（`CURSOR_BOT_EXTRA_HEADERS`）：Box relay 的路由凭据等。 */
+  extraHeaders: Record<string, string>;
+  /**
+   * 推理出口：`direct` = api2 直连（0.44 前的老路径，现在会被上游以 unauthenticated 拒）；
+   * `relay` = 经 Box relay（EnsureSandBox 自动取连接，token 失效自动重取重试）。
+   */
+  inferenceRoute: "direct" | "relay";
 }
 
 export function botSettings(config: GatewayConfig): BotSettings {
@@ -64,12 +82,59 @@ export function botSettings(config: GatewayConfig): BotSettings {
     localTools: config.botLocalTools ?? [],
     subagents: config.botSubagents ?? false,
     background: config.botBackground ?? false,
-    clientVersion: config.botClientVersion?.trim() || DEFAULT_BOT_CLIENT_VERSION
+    clientVersion: config.botClientVersion?.trim() || DEFAULT_BOT_CLIENT_VERSION,
+    extraHeaders: config.botExtraHeaders ?? {},
+    inferenceRoute: overrides?.inferenceRoute ?? config.botInferenceRoute ?? "direct"
   };
 }
 
 /** 目录缓存的存活时长。按凭据分片，不同账号可见的模型不同。 */
 const CATALOG_TTL_MS = 5 * 60 * 1000;
+
+/** 推理出口三要素（direct / relay 的统一表达）。 */
+interface InferenceTarget {
+  baseUrl: string;
+  credential: CursorBotCredential;
+  extraHeaders?: Record<string, string>;
+}
+
+/** relay 路径上值得重取连接再试一次的错误：
+ * - 401/403：Box gateway token 轮换（重取即新 token）；
+ * - 502：transport failed —— Box 重启后旧 pod URL 拒连（重取拿到新 gatewayUrl）。
+ * 404 不在此列（relay 未装配，换连接无用，streamPlain 已映射成可操作提示）。
+ */
+function isRelayRetryable(error: unknown): boolean {
+  return error instanceof ApiError && [401, 403, 502].includes(error.statusCode);
+}
+
+/** 供后台展示的 relay 状态。 */
+export interface RelayStatusReport {
+  /** 当前推理出口（settings，非探测结果）。 */
+  route: "direct" | "relay";
+  /** 缓存的 Box 连接（没有就先 EnsureSandBox 一次）。 */
+  connection: {
+    /** 只回 host，不回完整 URL——baseUrl 含 pod 标识，没必要进后台页面。 */
+    gatewayHost: string;
+    runState: string;
+    fetchedAt: number;
+  };
+  probe: RelayProbeResult;
+  /** 进行中/刚结束的装配任务。 */
+  provisioning?: RelayProvisionSnapshot;
+}
+
+/** 装配任务的对外快照。 */
+export interface RelayProvisionSnapshot {
+  state: "running" | "ok" | "failed";
+  startedAt: number;
+  finishedAt?: number;
+  agentName?: string;
+  message: string;
+}
+
+interface RelayProvisionJob {
+  snapshot: RelayProvisionSnapshot;
+}
 /** 连续失败到这个数就自动停用凭据，避免一把废 token 把每个请求都拖到超时。也是 Bot 侧禁用阈值的默认值。 */
 const CREDENTIAL_FAILURE_LIMIT = 5;
 
@@ -107,6 +172,10 @@ export class CursorBotService implements CursorRunner {
   private readonly localTools?: LocalToolRegistry;
   private readonly catalogs = new Map<string, { value: BotCatalog; expiresAt: number }>();
   private readonly inflight = new Map<string, Promise<BotCatalog | undefined>>();
+  /** relay 模式下按凭据缓存的 Box 连接（EnsureSandBox），失效驱动刷新。 */
+  private readonly boxConnections = new BoxRelayConnectionManager();
+  /** 装配任务（按凭据至多一个；进程内存态，重启即清）。 */
+  private readonly relayProvisions = new Map<string, RelayProvisionJob>();
   /** runId → SSE 订阅者。事件先落库、再从这里推出去。 */
   private readonly listeners = new Map<string, Set<(event: UnifiedEvent) => void>>();
 
@@ -190,7 +259,7 @@ export class CursorBotService implements CursorRunner {
       // 两条路都产出同样的 `CursorStreamEvent`，对外 SSE 层不区分。
       const orchestrated = this.orchestratedTools(input);
       if (orchestrated.length) yield* this.streamWithTools(credential, input, orchestrated, signal);
-      else yield* this.providerFor(credential, input).stream(input, signal);
+      else yield* this.streamPlain(credential, input, signal);
       this.options.store.recordCredentialUse(credential.id, bucket);
     } catch (error) {
       this.noteFailure(credential, error, input.model);
@@ -199,6 +268,70 @@ export class CursorBotService implements CursorRunner {
   }
 
   /** 网关自己负责执行的工具：本地工具 + 子代理。调用方声明的工具不在此列（由调用方自己执行）。 */
+
+  /**
+   * 单发单收路径。relay 模式下带一次性重试：
+   * 连接后**尚未产出任何事件**时遇 401/403/502（Box token 轮换 / Box 重启换了 pod）→
+   * 失效缓存重取连接再来一次；已经吐过内容的流绝不重放（客户端已收到一半）。
+   */
+  private async *streamPlain(
+    credential: BotCredential,
+    input: CursorRunRequest,
+    signal?: AbortSignal
+  ): AsyncIterable<CursorStreamEvent> {
+    if (this.settings.inferenceRoute !== "relay") {
+      yield* this.providerFor(credential, input, await this.inferenceTarget(credential)).stream(input, signal);
+      return;
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      let yieldedAny = false;
+      try {
+        const target = await this.inferenceTarget(credential);
+        for await (const event of this.providerFor(credential, input, target).stream(input, signal)) {
+          yieldedAny = true;
+          yield event;
+        }
+        return;
+      } catch (error) {
+        if (error instanceof ApiError && error.statusCode === 404) {
+          // relay 路由不在 = Box 侧补丁丢失（Box 重建即失），换连接无用。
+          throw new ApiError(
+            "Box relay 未装配（Box 重建后补丁会丢失）：请在管理后台该 Bot 凭据行重新「装配 relay」。",
+            502,
+            "upstream_error"
+          );
+        }
+        if (yieldedAny || attempt >= 1 || !isRelayRetryable(error)) throw error;
+        this.boxConnections.invalidate(credential.id);
+      }
+    }
+  }
+
+  /** 推理出口三要素：direct = settings 原样；relay = EnsureSandBox 连接换 baseUrl/token/头。 */
+  private async inferenceTarget(credential: BotCredential): Promise<InferenceTarget> {
+    const base = {
+      codec: this.settings.codec,
+      readMaxBytes: this.settings.readMaxBytes,
+      fetchImpl: this.options.fetchImpl
+    };
+    if (this.settings.inferenceRoute !== "relay") {
+      return {
+        baseUrl: this.settings.baseUrl,
+        credential: toProviderCredential(credential),
+        extraHeaders: this.settings.extraHeaders
+      };
+    }
+    const connection = await this.boxConnections.get(credential, {
+      baseUrl: this.settings.baseUrl,
+      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+    });
+    return {
+      baseUrl: relayInferenceBaseUrl(connection),
+      // relay 用 Box gateway token 鉴权；session JWT 只用来换连接（EnsureSandBox）。
+      credential: { ...toProviderCredential(credential), sessionToken: connection.gatewayToken },
+      extraHeaders: { ...this.settings.extraHeaders, ...relayExtraHeaders(connection) }
+    };
+  }
   private orchestratedTools(input: CursorRunRequest): GatewayTool[] {
     if (!this.settings.sendTools) return [];
     return [...(this.localTools?.advertise() ?? []), ...(this.settings.subagents ? [subagentTool()] : [])];
@@ -231,11 +364,14 @@ export class CursorBotService implements CursorRunner {
       catalog
     });
 
+    // 工具编排是多次上游往返：连接取一次复用整轮（token 刚换新，中途轮换属极端情形）。
+    const target = await this.inferenceTarget(credential);
     const client = new CursorBotClient({
-      credential: toProviderCredential(credential),
-      baseUrl: this.settings.baseUrl,
+      credential: target.credential,
+      baseUrl: target.baseUrl,
       codec: this.settings.codec,
       readMaxBytes: this.settings.readMaxBytes,
+      extraHeaders: target.extraHeaders,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
     });
 
@@ -326,11 +462,13 @@ export class CursorBotService implements CursorRunner {
 
   /** 子代理的 child run：同一把凭据、独立 conversation、可以是不同模型。 */
   private async runChild(credential: BotCredential, context: SubagentRunContext): Promise<{ text: string; isError?: boolean; usage?: RequestUsage }> {
+    const target = await this.inferenceTarget(credential);
     const client = new CursorBotClient({
-      credential: toProviderCredential(credential),
-      baseUrl: this.settings.baseUrl,
+      credential: target.credential,
+      baseUrl: target.baseUrl,
       codec: this.settings.codec,
       readMaxBytes: this.settings.readMaxBytes,
+      extraHeaders: target.extraHeaders,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
     });
     // child 声明了工具时同样可能收到正文形态的调用，开启同款标记还原（包 F）；
@@ -429,6 +567,7 @@ export class CursorBotService implements CursorRunner {
       baseUrl: this.settings.baseUrl,
       codec: this.settings.codec,
       readMaxBytes: this.settings.readMaxBytes,
+      extraHeaders: this.settings.extraHeaders,
       fetchImpl: this.options.fetchImpl
     })
       .then((value) => {
@@ -463,6 +602,7 @@ export class CursorBotService implements CursorRunner {
         baseUrl: this.settings.baseUrl,
         codec: this.settings.codec,
         readMaxBytes: this.settings.readMaxBytes,
+        extraHeaders: this.settings.extraHeaders,
         fetchImpl: this.options.fetchImpl
       });
       this.catalogs.set(credential.id, { value: catalog, expiresAt: Date.now() + CATALOG_TTL_MS });
@@ -518,13 +658,14 @@ export class CursorBotService implements CursorRunner {
     }
   }
 
-  private providerFor(credential: BotCredential, input: CursorRunRequest): CursorBotProvider {
+  private providerFor(credential: BotCredential, input: CursorRunRequest, target: InferenceTarget): CursorBotProvider {
     return new CursorBotProvider({
-      resolveCredential: () => toProviderCredential(credential),
-      baseUrl: this.settings.baseUrl,
+      resolveCredential: () => target.credential,
+      baseUrl: target.baseUrl,
       codec: this.settings.codec,
       readMaxBytes: this.settings.readMaxBytes,
       sendTools: this.settings.sendTools,
+      extraHeaders: target.extraHeaders,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {}),
       // 目录喂给参数解析：`parameter_definitions` 是参数 id 与值域的权威来源，
       // 拿到它之后 model-params.ts 的硬编码只作兜底。
@@ -554,8 +695,95 @@ export class CursorBotService implements CursorRunner {
     return { parameters: entry.parameters, variants: entry.variants };
   }
 
-  private noteFailure(credential: BotCredential, error: unknown, model?: string): void {
-    const status = error instanceof ApiError ? error.statusCode : 500;
+  /* -------------------------------------------------- relay 状态与装配（P3，后台用） */
+
+  /**
+   * 后台「relay 状态」：确保连接（EnsureSandBox）→ 探测路由 → 附上装配任务快照。
+   * 探测有网络往返（上限 30s），只供后台按钮触发，不进请求热路径。
+   */
+  async relayStatus(credentialId: string): Promise<RelayStatusReport> {
+    const credential = this.requireCredential(credentialId);
+    const connection = await this.boxConnections.get(credential, {
+      baseUrl: this.settings.baseUrl,
+      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+    });
+    const probe = await probeRelay(connection, {
+      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+    });
+    // 探测发现 token 轮换就顺手失效缓存：下一次 get 拿新连接。
+    if (probe.status === "auth-expired") this.boxConnections.invalidate(credential.id);
+    return {
+      route: this.settings.inferenceRoute,
+      connection: {
+        gatewayHost: new URL(connection.gatewayUrl).host,
+        runState: connection.runState.toString(),
+        fetchedAt: connection.fetchedAt
+      },
+      probe,
+      ...(this.relayProvisions.has(credential.id)
+        ? { provisioning: this.relayProvisions.get(credential.id)!.snapshot }
+        : {})
+    };
+  }
+
+  /**
+   * 后台「装配 relay」：发指令给 Box agent 并轮询到就绪（异步任务，立即返回快照）。
+   * 同一凭据同时只跑一个；装配指令会出现在所选 Bot 的聊天里，属预期。
+   */
+  startRelayProvision(credentialId: string): RelayProvisionSnapshot {
+    const credential = this.requireCredential(credentialId);
+    const existing = this.relayProvisions.get(credential.id);
+    if (existing?.snapshot.state === "running") return existing.snapshot;
+
+    const snapshot: RelayProvisionSnapshot = {
+      state: "running",
+      startedAt: Date.now(),
+      message: "正在获取 Box 连接…"
+    };
+    this.relayProvisions.set(credential.id, { snapshot });
+
+    const getConnection = (): Promise<BoxRelayConnection> =>
+      this.boxConnections.get(credential, {
+        baseUrl: this.settings.baseUrl,
+        ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+      });
+    // 装配期间连接可能因 host 重启轮换：探测报 auth/不可达就失效重取。
+    const refreshedConnection = async (): Promise<BoxRelayConnection> => {
+      try {
+        return await getConnection();
+      } catch (error) {
+        this.boxConnections.invalidate(credential.id);
+        throw error;
+      }
+    };
+
+    void provisionRelay(refreshedConnection, (message) => {
+      snapshot.message = message;
+    }, {
+      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+    })
+      .then((outcome) => {
+        snapshot.state = outcome.ok ? "ok" : "failed";
+        snapshot.finishedAt = Date.now();
+        snapshot.agentName = outcome.agentName;
+        snapshot.message = outcome.detail;
+      })
+      .catch((error: unknown) => {
+        snapshot.state = "failed";
+        snapshot.finishedAt = Date.now();
+        snapshot.message = `装配未启动：${errorText(error)}`;
+      });
+
+    return { ...snapshot };
+  }
+
+  private requireCredential(credentialId: string): BotCredential {
+    const credential = this.options.store.credential(credentialId);
+    if (!credential) throw new ApiError("Credential not found.", 404, "not_found");
+    return credential;
+  }
+
+  private noteFailure(credential: BotCredential, error: unknown, model?: string): void {    const status = error instanceof ApiError ? error.statusCode : 500;
     // 包 B：只有**上游 EndStream 帧亲口带回的** resource_exhausted 才算额度桶耗尽
     // （isUpstreamResourceExhausted 的 symbol 标记只有 endStreamError 会挂）。本地构造的 429
     // ——EnvelopeTooLargeError 是 502、InferenceStreamError 的 RATE_LIMIT 不带标记——都不会进这。

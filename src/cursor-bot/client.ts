@@ -32,6 +32,8 @@ export interface CursorBotClientOptions {
   acceptEncoding?: string;
   readMaxBytes?: number;
   fetchImpl?: ConnectFetch;
+  /** 额外出站头（Box relay 路由凭据等），见 buildConnectHeaders。 */
+  extraHeaders?: Record<string, string>;
   /** 测试注入固定时间，让 checksum 可断言。 */
   nowMs?: () => number;
 }
@@ -70,6 +72,7 @@ export class CursorBotClient {
       codec: this.codec,
       acceptEncoding: this.options.acceptEncoding ?? DEFAULT_ACCEPT_ENCODING,
       contentEncoding: compressed ? (this.options.requestCompression as "gzip" | "br") : undefined,
+      extraHeaders: this.options.extraHeaders,
       nowMs: this.options.nowMs?.()
     });
 

@@ -4,6 +4,9 @@ import { credentialClientType, type CursorBotCredential } from "./credentials.js
 
 export const CONNECT_PROTOCOL_VERSION = "1";
 
+/** Box gateway 的路由凭据头（relay 模式必发，缺失会被网关 404 拒掉）。 */
+export const NETWORK_TOKEN_HEADER = "x-anyrun-network-token";
+
 /**
  * Connect 的 content-type 分**流式**与**一元**两套，混用会被服务端以 415 拒掉（实测）：
  *
@@ -38,7 +41,9 @@ const REDACTED_HEADERS = new Set([
   "x-cursor-checksum",
   "x-client-key",
   "x-session-id",
-  "x-cursor-team-id"
+  "x-cursor-team-id",
+  // Box relay 的路由凭据（CURSOR_BOT_EXTRA_HEADERS 注入），落日志前同样整段脱敏。
+  "x-anyrun-network-token"
 ]);
 
 export interface BuildHeadersOptions {
@@ -54,6 +59,13 @@ export interface BuildHeadersOptions {
   contentEncoding?: "gzip" | "br";
   /** 供测试注入固定时间，保证 checksum 可断言。 */
   nowMs?: number;
+  /**
+   * 额外出站头（`CURSOR_BOT_EXTRA_HEADERS`）。Box relay 场景注入
+   * `x-anyrun-network-token` 这类路由凭据。协议关键头
+   * （content-type / connect-protocol-version / authorization）不可覆盖：
+   * 前两者错了会被上游 415/协议拒掉，后者由凭据独占。
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 /**
@@ -107,6 +119,15 @@ export function buildConnectHeaders(options: BuildHeadersOptions): Record<string
     credential.newOnboardingCompleted === undefined ? undefined : String(credential.newOnboardingCompleted)
   );
 
+  // 额外头最后落：Box relay 等中转需要的路由凭据在这里注入，但协议关键头不许碰。
+  for (const [name, value] of Object.entries(options.extraHeaders ?? {})) {
+    const trimmedName = name?.trim();
+    const trimmedValue = value?.trim();
+    if (!trimmedName || !trimmedValue) continue;
+    if (EXTRA_HEADER_BLOCKLIST.has(trimmedName.toLowerCase())) continue;
+    headers[trimmedName] = trimmedValue;
+  }
+
   return headers;
 }
 
@@ -115,6 +136,9 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
     Object.entries(headers).map(([name, value]) => [name, REDACTED_HEADERS.has(name.toLowerCase()) ? "***" : value])
   );
 }
+
+/** extraHeaders 不可覆盖的协议关键头。 */
+const EXTRA_HEADER_BLOCKLIST = new Set(["content-type", "connect-protocol-version", "authorization"]);
 
 function putIf(headers: Record<string, string>, name: string, value: string | undefined): void {
   const trimmed = value?.trim();
