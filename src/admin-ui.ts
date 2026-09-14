@@ -14,133 +14,133 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 <title>Composer API 管理后台</title>
 <style>
 :root{
-  --bg:#0b0f17;--panel:#111726;--panel-2:#161e30;--border:#232d45;
-  --text:#e6ebf5;--muted:#8b96ad;--accent:#5b8cff;--accent-2:#36c6b0;
-  --green:#2ecc8f;--red:#ff6b6b;--yellow:#f5b84d;
-  --radius:14px;--mono:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
-  --sidebar:248px;
+  --bg:#f0f2f5;--panel:#ffffff;--panel-2:#f7f8fa;--border:#e4e7ed;
+  --text:#303133;--muted:#909399;--accent:#409eff;--accent-2:#36cfc9;
+  --green:#67c23a;--red:#f56c6c;--yellow:#e6a23c;
+  --radius:10px;--radius-lg:16px;--mono:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+  --sidebar:220px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.04);--shadow-md:0 2px 8px rgba(0,0,0,.06);--shadow-lg:0 4px 16px rgba(0,0,0,.08);
+  --glass-bg:rgba(255,255,255,.85);--glass-blur:16px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
 body{
-  background:radial-gradient(1200px 600px at 80% -10%,#16203a 0%,var(--bg) 55%);
-  color:var(--text);min-height:100vh;
+  background:var(--bg);
+  color:var(--text);min-height:100vh;font-size:14px;line-height:1.6;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
 }
 a{color:var(--accent)}
 .hidden{display:none!important}
 button{
-  font:inherit;color:var(--text);background:var(--panel-2);border:1px solid var(--border);
-  border-radius:9px;padding:7px 14px;cursor:pointer;transition:.15s;font-size:13px;
+  font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);
+  border-radius:6px;padding:6px 16px;cursor:pointer;transition:.15s;font-size:13px;line-height:1.5;
 }
-button:hover{border-color:var(--accent);color:#fff}
-button.primary{background:linear-gradient(135deg,var(--accent),#3f6fe0);border-color:transparent;font-weight:600}
-button.primary:hover{filter:brightness(1.1)}
-button.danger:hover{border-color:var(--red);color:var(--red)}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500}
+button.primary:hover{filter:brightness(1.08);color:#fff}
+button.danger{border-color:var(--red);color:var(--red)}
+button.danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
 button:disabled{opacity:.5;cursor:not-allowed}
 input,select,textarea{
-  font:inherit;color:var(--text);background:#0d1322;border:1px solid var(--border);
-  border-radius:9px;padding:8px 11px;font-size:13px;outline:none;transition:.15s;
+  font:inherit;color:var(--text);background:#f5f7fa;border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;font-size:13px;outline:none;transition:.15s;line-height:1.5;
 }
-input:focus,select:focus,textarea:focus{border-color:var(--accent)}
-textarea{width:100%;min-height:120px;resize:vertical;line-height:1.5}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:18px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
-.card .k{color:var(--muted);font-size:12px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
-.card .v{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums}
-.card .d{color:var(--muted);font-size:12px;margin-top:6px}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:18px;overflow:hidden}
-.panel>.head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-wrap:wrap}
-.panel>.head h2{font-size:14.5px;font-weight:650}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 2px rgba(64,158,255,.1)}
+textarea{width:100%;min-height:120px;resize:vertical;line-height:1.6}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow-sm)}
+.card .k{color:var(--muted);font-size:12px;margin-bottom:8px;display:flex;align-items:center;gap:6px;font-weight:500}
+.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--text)}
+.card .d{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.5}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:20px;overflow:hidden;box-shadow:var(--shadow-sm)}
+.panel>.head{display:flex;align-items:center;gap:10px;padding:14px 20px;border-bottom:1px solid var(--border);flex-wrap:wrap;background:var(--panel-2)}
+.panel>.head h2{font-size:14px;font-weight:600}
 .panel>.head .hint{color:var(--muted);font-size:12px}
-.panel>.body{padding:16px 18px}
-table{width:100%;border-collapse:collapse;font-size:12.8px}
-th{color:var(--muted);text-align:left;font-weight:500;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
-td{padding:9px 10px;border-bottom:1px solid #1a2235;vertical-align:top}
+.panel>.body{padding:20px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--muted);text-align:left;font-weight:500;padding:10px 12px;border-bottom:2px solid var(--border);white-space:nowrap;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
 tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#f5f7fa}
+tbody tr:nth-child(even){background:#fafbfc}
+tbody tr:nth-child(even):hover{background:#f0f2f5}
 td.mono,.mono{font-family:var(--mono);font-size:12px}
-.badge{display:inline-block;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600}
-.badge.active{background:rgba(46,204,143,.12);color:var(--green)}
-.badge.disabled{background:rgba(255,107,107,.12);color:var(--red)}
-.badge.gateway{background:rgba(91,140,255,.12);color:var(--accent)}
-.badge.direct{background:rgba(245,184,77,.14);color:var(--yellow)}
-.badge.admin{background:rgba(54,198,176,.13);color:var(--accent-2)}
-.badge.sand{background:rgba(168,130,255,.14);color:#c4a6ff}
-.badge.sdk{background:rgba(91,140,255,.12);color:var(--accent)}
-.badge.inherit{background:rgba(139,150,173,.12);color:var(--muted)}
-.badge.s2xx{background:rgba(46,204,143,.12);color:var(--green)}
-.badge.s4xx{background:rgba(245,184,77,.14);color:var(--yellow)}
-.badge.s5xx{background:rgba(255,107,107,.12);color:var(--red)}
-.badge.estimated{background:rgba(245,184,77,.14);color:var(--yellow)}
-.badge.missing{background:rgba(139,150,173,.12);color:var(--muted)}
+.badge{display:inline-block;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:500;line-height:1.5}
+.badge.active,.badge.success{background:rgba(103,194,58,.1);color:var(--green)}
+.badge.disabled,.badge.danger{background:rgba(245,108,108,.1);color:var(--red)}
+.badge.gateway,.badge.sdk{background:rgba(64,158,255,.1);color:var(--accent)}
+.badge.direct,.badge.estimated{background:rgba(230,162,60,.12);color:var(--yellow)}
+.badge.admin{background:rgba(54,207,201,.1);color:var(--accent-2)}
+.badge.sand{background:rgba(168,130,255,.12);color:#7c5ce0}
+.badge.inherit,.badge.missing{background:rgba(144,147,153,.1);color:var(--muted)}
+.badge.s2xx{background:rgba(103,194,58,.1);color:var(--green)}
+.badge.s4xx{background:rgba(230,162,60,.12);color:var(--yellow)}
+.badge.s5xx{background:rgba(245,108,108,.1);color:var(--red)}
+.badge.warn{background:rgba(230,162,60,.12);color:var(--yellow)}
+.badge.ok{background:rgba(103,194,58,.1);color:var(--green)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .muted{color:var(--muted)}
 .small{font-size:12px}
-.err-text{color:var(--red);font-size:11.5px;word-break:break-all}
-.empty{color:var(--muted);text-align:center;padding:26px 0;font-size:13px}
-/* 操作列的按钮不允许换行：列被挤窄时换行会把按钮竖着堆起来，一行能撑到 200px 以上。 */
-.actions{display:flex;gap:6px;flex-wrap:nowrap}
-.actions button{padding:4px 10px;font-size:12px;border-radius:7px;white-space:nowrap}
-.chip{border:1px solid var(--border);background:var(--panel);border-radius:999px;padding:2px 10px;font-size:11.5px;color:var(--muted)}
-.chip.ok{color:var(--green);border-color:rgba(46,204,143,.35)}
+.err-text{color:var(--red);font-size:12px;word-break:break-all;line-height:1.5}
+.empty{color:var(--muted);text-align:center;padding:32px 0;font-size:13px}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.actions button{padding:4px 10px;font-size:12px;border-radius:5px;white-space:nowrap}
+.chip{border:1px solid var(--border);background:var(--panel);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:4px}
+.chip.ok{color:var(--green);border-color:rgba(103,194,58,.3)}
+.chip.bad{color:var(--red);border-color:rgba(245,108,108,.3)}
+.chip.warn{color:var(--yellow);border-color:rgba(230,162,60,.3)}
 .spacer{flex:1}
-.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent-2));
-  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#06101f;flex-shrink:0}
-#test-result,#bot-chat-result{margin-top:12px;background:#0d1322;border:1px solid var(--border);border-radius:9px;
-  padding:12px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all}
-.table-scroll{overflow-x:auto}
-/*
- * 列多的表（key 池 12 列、请求历史 17 列）必须让表格自己撑开再横向滚动。
- * 基础规则里 table 是 width:100%，那样表格只会压缩到容器宽度，
- * overflow-x 永远不触发，最后把「操作」列挤成几十像素、按钮竖排、整行拉到 200px 高。
- */
+.logo{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#66b1ff);
+  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#fff;flex-shrink:0}
+#test-result,#bot-chat-result{margin-top:12px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;
+  padding:14px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all;line-height:1.6}
+.table-scroll{overflow-x:auto;border-radius:8px;border:1px solid var(--border)}
 .table-scroll table{width:auto;min-width:100%}
 .table-scroll td{white-space:nowrap}
-/* 错误文本是唯一需要换行的列，否则一条长报错会把表格撑得无限宽。 */
-.table-scroll td .err-text{white-space:normal;display:inline-block;max-width:280px}
-label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12.5px;cursor:pointer;user-select:none}
-.callout{background:var(--panel-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:10px;padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.55}
-.callout strong{color:#fff}
-.callout.warn{border-left-color:var(--yellow)}
-.settings-block{margin:0 0 22px}
-.settings-block:last-child{margin-bottom:8px}
-.settings-block h3{font-size:13px;font-weight:650;margin:0 0 4px}
-.settings-block .lede{color:var(--muted);font-size:12px;line-height:1.5;margin-bottom:10px}
-.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px 16px}
-.setting-field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+.table-scroll td .err-text{white-space:normal;display:inline-block;max-width:300px}
+label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer;user-select:none}
+.callout{background:#f0f7ff;border:1px solid #d3e5f8;border-left:3px solid var(--accent);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;color:var(--text)}
+.callout strong{color:var(--text)}
+.callout.warn{background:#fdf6ec;border-color:#f5dab1;border-left-color:var(--yellow)}
+.settings-block{margin:0 0 24px;padding:20px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius)}
+.settings-block:last-child{margin-bottom:0}
+.settings-block h3{font-size:14px;font-weight:600;margin:0 0 6px;color:var(--text)}
+.settings-block .lede{color:var(--muted);font-size:12px;line-height:1.6;margin-bottom:14px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px 20px}
+.setting-field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:500}
 .setting-field .env{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400}
-.setting-field .hint{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.45}
+.setting-field .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
 .setting-field input[type="number"],.setting-field input[type="text"],.setting-field select{width:100%;max-width:100%}
 .setting-check{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--text);cursor:pointer}
 .setting-check input{margin-top:3px}
-.warn-loud{background:rgba(245,184,77,.12);border:1px solid rgba(245,184,77,.55);color:var(--yellow);
-  border-radius:12px;padding:14px 16px;margin:12px 0;font-size:13.5px;line-height:1.55}
-.warn-loud strong{color:#ffd789}
-.note{color:var(--muted);font-size:12.5px;line-height:1.55;margin-top:8px}
-.secret-box{background:rgba(46,204,143,.08);border:1px solid rgba(46,204,143,.4);border-radius:12px;padding:14px 16px;margin-bottom:14px}
+.warn-loud{background:#fdf6ec;border:1px solid #f5dab1;color:#8a6d1a;
+  border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13px;line-height:1.6}
+.warn-loud strong{color:#7c5e10}
+.note{color:var(--muted);font-size:12.5px;line-height:1.6;margin-top:8px}
+.secret-box{background:rgba(103,194,58,.06);border:1px solid rgba(103,194,58,.3);border-radius:10px;padding:14px 18px;margin-bottom:16px}
 .secret-box .mono{font-size:13.5px;word-break:break-all}
-.config-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
-.config-item{background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
-.config-item .k{font-size:11.5px;color:var(--muted);margin-bottom:4px}
+.config-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.config-item{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
+.config-item .k{font-size:11.5px;color:var(--muted);margin-bottom:4px;font-weight:500}
 .config-item .v{font-size:13.5px}
-.weight-input{width:72px;padding:4px 6px;font-size:12px}
+.weight-input{width:72px;padding:4px 8px;font-size:12px;text-align:center}
 .scope-chip{cursor:help;border-bottom:1px dashed var(--border)}
-.scope-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.scope-list{max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:#0d1322}
-.scope-list label{display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:12.5px;color:var(--text)}
-.bind-list{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:#0d1322}
+.scope-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.scope-list{max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--panel-2)}
+.scope-list label{display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:13px;color:var(--text)}
+.bind-list{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--panel-2)}
 .bind-list label{display:flex;align-items:flex-start;gap:8px;padding:5px 0;font-size:13px;color:var(--text)}
 #login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:50}
-.login-card{width:min(380px,92vw);background:var(--panel);border:1px solid var(--border);border-radius:18px;padding:34px 30px}
-.login-card .logo{width:46px;height:46px;font-size:20px;margin-bottom:16px}
-.login-card h1{font-size:20px;margin-bottom:6px}
-.login-card p{color:var(--muted);font-size:13px;margin-bottom:20px}
-.login-card input{width:100%;margin-bottom:12px;padding:11px 13px}
-.login-card button{width:100%;padding:11px}
+.login-card{width:min(400px,92vw);background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);padding:36px 32px;box-shadow:var(--shadow-lg)}
+.login-card .logo{width:48px;height:48px;font-size:20px;margin-bottom:18px}
+.login-card h1{font-size:20px;margin-bottom:6px;font-weight:600}
+.login-card p{color:var(--muted);font-size:13px;margin-bottom:22px}
+.login-card input{width:100%;margin-bottom:14px;padding:10px 14px}
+.login-card button{width:100%;padding:10px;font-size:14px}
 .login-err{color:var(--red);font-size:12.5px;min-height:18px;margin-bottom:8px}
-#toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:99}
-.toast{background:var(--panel-2);border:1px solid var(--border);border-left:3px solid var(--accent);
-  border-radius:10px;padding:10px 16px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.45);animation:in .2s ease}
+#toast{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:99}
+.toast{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);
+  border-radius:8px;padding:10px 16px;font-size:13px;box-shadow:var(--shadow-lg);animation:in .2s ease;color:var(--text)}
 .toast.bad{border-left-color:var(--red)}
 @keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 #app{min-height:100vh}
@@ -149,46 +149,71 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   width:var(--sidebar);flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);
   display:flex;flex-direction:column;position:sticky;top:0;height:100vh;z-index:30;
 }
-.sidebar-brand{display:flex;align-items:center;gap:10px;padding:18px 16px 14px}
-.sidebar-brand h1{font-size:14.5px;font-weight:700;letter-spacing:.2px;line-height:1.3}
+.sidebar-brand{display:flex;align-items:center;gap:10px;padding:18px 16px 14px;border-bottom:1px solid var(--border)}
+.sidebar-brand h1{font-size:14px;font-weight:600;letter-spacing:.2px;line-height:1.3}
 .sidebar-brand .sub{color:var(--muted);font-size:11.5px;margin-top:2px}
-.nav{flex:1;overflow:auto;padding:4px 0 12px}
-.nav-group{padding:12px 18px 4px;font-size:11px;color:var(--muted);letter-spacing:.08em}
+.nav{flex:1;overflow:auto;padding:8px 0 12px}
+.nav-group{padding:14px 18px 4px;font-size:11px;color:var(--muted);letter-spacing:.06em;font-weight:500;text-transform:uppercase}
 .nav-item{
-  display:block;width:calc(100% - 16px);margin:2px 8px;padding:8px 12px;border:0;background:transparent;
-  text-align:left;border-radius:9px;color:var(--text);font-size:13.5px;
+  display:flex;align-items:center;gap:8px;width:calc(100% - 16px);margin:1px 8px;padding:8px 12px;border:0;background:transparent;
+  text-align:left;border-radius:6px;color:var(--text);font-size:13px;cursor:pointer;transition:.15s;
 }
-.nav-item:hover{background:var(--panel-2);border-color:transparent;color:#fff}
-.nav-item.active{background:rgba(91,140,255,.16);color:#fff;box-shadow:inset 2px 0 0 var(--accent)}
-.sidebar-foot{padding:12px 16px 16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.55}
+.nav-item:hover{background:var(--panel-2);color:var(--text)}
+.nav-item.active{background:#ecf5ff;color:var(--accent);font-weight:500}
+.nav-item .nav-icon{width:18px;height:18px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.sidebar-foot{padding:12px 16px 16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.6}
 .main{flex:1;min-width:0;display:flex;flex-direction:column}
-.topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 18px;border-bottom:1px solid var(--border);background:rgba(17,23,38,.88);position:sticky;top:0;z-index:20}
-.topbar h2{font-size:16px;font-weight:700}
+.topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--glass-bg);backdrop-filter:blur(var(--glass-blur));-webkit-backdrop-filter:blur(var(--glass-blur));position:sticky;top:0;z-index:20}
+.topbar h2{font-size:16px;font-weight:600}
 .topbar .chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.content{padding:18px 20px 56px;flex:1}
-.menu-btn{display:none;width:38px;height:38px;padding:0;align-items:center;justify-content:center;font-size:18px}
+.content{padding:20px 24px 60px;flex:1}
+.menu-btn{display:none;width:36px;height:36px;padding:0;align-items:center;justify-content:center;font-size:18px;border-radius:6px}
 .sidebar-mask{display:none}
-.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
-.log-detail{background:#0d1322;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:6px;font-size:11.5px;color:var(--muted);white-space:pre-wrap;word-break:break-all}
-#modal-mask{position:fixed;inset:0;background:rgba(5,8,14,.62);z-index:80;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{width:min(760px,96vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:16px}
-.modal .head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border)}
-.modal .body{padding:16px 18px}
-.modal .foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--border)}
+.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.log-detail{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:8px;font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-all;line-height:1.6}
+#modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{width:min(720px,96vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg)}
+.modal .head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--border)}
+.modal .head h2{font-size:15px;font-weight:600}
+.modal .body{padding:20px}
+.modal .foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border)}
+details.help-details{margin-top:12px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+details.help-details summary{padding:10px 14px;cursor:pointer;font-size:13px;color:var(--muted);background:var(--panel-2);user-select:none}
+details.help-details summary:hover{color:var(--text)}
+details.help-details .detail-body{padding:14px;font-size:12.5px;line-height:1.7;color:var(--muted)}
+/* 展开的行内详情面板 */
+tr.log-expand-row td{padding:0!important;border-bottom:1px solid var(--border)}
+tr.log-expand-row .expand-panel{background:var(--panel-2);padding:16px 20px;border-top:1px dashed var(--border)}
+tr.log-expand-row .expand-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px;margin-bottom:12px}
+tr.log-expand-row .expand-grid .ek{font-size:11px;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.03em}
+tr.log-expand-row .expand-grid .ev{font-size:13px;margin-top:2px}
+tr.log-expand-row .expand-error{margin-top:10px;padding:10px 14px;background:#fef0f0;border:1px solid #fde2e2;border-radius:8px;font-size:12px;color:var(--red);white-space:pre-wrap;word-break:break-all;line-height:1.6}
+tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
+/* Bot 覆盖区视觉区分 */
+.settings-block.bot-override{border-left:3px solid var(--accent);background:#f8fbff}
+/* toggle switch */
+.toggle-switch{position:relative;display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)}
+.toggle-switch input{position:absolute;opacity:0;width:0;height:0}
+.toggle-slider{width:36px;height:20px;background:#dcdfe6;border-radius:10px;position:relative;transition:.2s;flex-shrink:0}
+.toggle-slider::after{content:'';position:absolute;width:16px;height:16px;background:#fff;border-radius:50%;top:2px;left:2px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+.toggle-switch input:checked + .toggle-slider{background:var(--accent)}
+.toggle-switch input:checked + .toggle-slider::after{left:18px}
 @media (max-width:900px){
-  .sidebar{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s ease;box-shadow:8px 0 30px rgba(0,0,0,.4)}
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s ease;box-shadow:var(--shadow-lg)}
   .sidebar.open{transform:none}
-  .sidebar-mask{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:25}
+  .sidebar-mask{display:block;position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:25}
   .sidebar-mask.hidden{display:none}
   .menu-btn{display:inline-flex}
   .topbar .chips .chip-extra{display:none}
   .scope-grid{grid-template-columns:1fr}
-  .content{padding:14px 12px 48px}
+  .content{padding:14px 14px 48px}
+  .settings-grid{grid-template-columns:1fr}
 }
 @media (max-width:600px){
   .grid{grid-template-columns:1fr 1fr}
-  .card .v{font-size:20px}
+  .card .v{font-size:18px}
   .topbar .chips{display:none}
+  .settings-grid{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -502,8 +527,12 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 把同一段对话钉在上次成功服务它的那把 key 上，让上游缓存保持热。
                 绑定的 key 被禁用、删除、或不在该模型的允许范围内时，会自动回退到当前策略重新选 key。
               </div>
-              <div class="row" style="margin-bottom:12px">
-                <label class="toggle" style="color:var(--text);font-size:13px"><input type="checkbox" id="affinity-toggle"> 启用会话粘性</label>
+              <div class="row" style="margin-bottom:14px">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="affinity-toggle">
+                  <span class="toggle-slider"></span>
+                  <span>启用会话粘性</span>
+                </label>
                 <label class="toggle" style="color:var(--text);font-size:13px">TTL
                   <input id="affinity-ttl" type="number" min="1000" step="1000" style="width:140px;padding:6px 8px">
                   ms（最小 1000）
@@ -592,9 +621,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
               <div class="table-scroll">
                 <table>
                   <thead><tr>
-                    <th>时间</th><th>端点</th><th>模型</th><th>鉴权方式</th><th>Cursor Key</th><th>网关密钥</th>
-                    <th>状态</th><th>耗时</th><th>流式</th><th>推理强度</th><th>Fast</th><th>1M/Max</th>
-                    <th>通道</th><th>模式</th><th>token 用量</th><th>花费</th><th>错误</th>
+                    <th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>Token 用量</th><th>花费</th><th>通道</th><th>操作</th>
                   </tr></thead>
                   <tbody id="logs-body"></tbody>
                 </table>
@@ -666,10 +693,18 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 <h3>请求与鉴权</h3>
                 <div class="settings-grid">
                   <div class="setting-field">
-                    <label class="setting-check"><input type="checkbox" id="allow-direct-toggle"> 允许客户端直传 Cursor API key <span class="env">ALLOW_DIRECT_CURSOR_KEYS</span></label>
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="allow-direct-toggle">
+                      <span class="toggle-slider"></span>
+                      <span>允许客户端直传 Cursor API key <span class="env">ALLOW_DIRECT_CURSOR_KEYS</span></span>
+                    </label>
                   </div>
                   <div class="setting-field">
-                    <label class="setting-check"><input type="checkbox" id="builtin-tools-toggle"> 允许网关容器内使用 Cursor 内置工具 <span class="env">CURSOR_ALLOW_BUILTIN_TOOLS</span></label>
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="builtin-tools-toggle">
+                      <span class="toggle-slider"></span>
+                      <span>允许网关容器内使用 Cursor 内置工具 <span class="env">CURSOR_ALLOW_BUILTIN_TOOLS</span></span>
+                    </label>
                     <div class="hint">默认关。打开后 agent 能在网关侧跑 shell/edit，再转发给客户端会双重执行。</div>
                   </div>
                   <div class="setting-field">
@@ -759,7 +794,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 </div>
               </div>
 
-              <div class="settings-block">
+              <div class="settings-block bot-override">
                 <h3>Bot 运行设置（bot/ 前缀与 Bot 凭据路线）</h3>
                 <p class="lede">每项都是对上面「SDK 运行设置 / 公共默认」的 Bot 侧覆盖：选「跟随」就不覆盖、沿用上面的值。保存后立即生效（sendTools / 编码无需重启）。</p>
                 <div class="settings-grid">
@@ -863,34 +898,39 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
 
               <div class="settings-block">
                 <h3>通道、协议与自动禁用</h3>
-              <div class="row" style="margin-bottom:10px">
-                <label class="toggle" style="font-size:13px;color:var(--text)">Cursor local agent 的 HTTP/1.1 + SSE
-                  <select id="sdk-http1-mode" style="min-width:210px" title="HTTP/2 不支持代理，配了代理时模型流量必须走 HTTP/1.1">
-                    <option value="auto">未设置（配了代理就自动开）</option>
-                    <option value="on">强制开启</option>
-                    <option value="off">强制关闭</option>
-                  </select>
-                </label>
-                <span class="muted small" id="sdk-http1-hint"></span>
-              </div>
-              <div class="row" style="margin-bottom:10px">
-                <label class="toggle" style="font-size:13px;color:var(--text)">
-                  <input type="checkbox" id="auto-disable-toggle">
-                  额度不足 / key 失效时自动禁用 key
-                </label>
-                <label class="toggle" style="font-size:13px;color:var(--text)">
-                  连续失败
-                  <input type="number" id="auto-disable-threshold" min="1" max="50" step="1" style="width:66px;padding:6px 8px">
-                  次后才禁用
-                </label>
-              </div>
+                <div class="settings-grid">
+                  <div class="setting-field">
+                    <label>Cursor local agent 的 HTTP/1.1 + SSE <span class="env">CURSOR_SDK_USE_HTTP1_FOR_AGENT</span></label>
+                    <select id="sdk-http1-mode" title="HTTP/2 不支持代理，配了代理时模型流量必须走 HTTP/1.1">
+                      <option value="auto">未设置（配了代理就自动开）</option>
+                      <option value="on">强制开启</option>
+                      <option value="off">强制关闭</option>
+                    </select>
+                    <div class="hint" id="sdk-http1-hint"></div>
+                  </div>
+                  <div class="setting-field">
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="auto-disable-toggle">
+                      <span class="toggle-slider"></span>
+                      <span>额度不足 / key 失效时自动禁用 key</span>
+                    </label>
+                  </div>
+                  <div class="setting-field">
+                    <label>连续失败 <span class="env">次后才禁用</span></label>
+                    <input type="number" id="auto-disable-threshold" min="1" max="50" step="1">
+                  </div>
+                </div>
               </div>
               <div class="settings-block">
                 <h3>Debug 快照（排障取证）</h3>
                 <p class="lede">开启后每个请求落一份 JSON 快照到 <code>data/debug/&lt;日期&gt;/&lt;logId&gt;.json</code>：入站 headers / body（密钥掩码）、选路与选中 key、上游实际发出的轮次全文、abort 归因、出站 SSE 逐事件。默认关——开了会把请求原文写进磁盘，务必只在排障时短开，并配合过滤缩小范围。</p>
                 <div class="settings-grid">
                   <div class="setting-field">
-                    <label class="setting-check"><input type="checkbox" id="debug-toggle"> 开启 Debug 快照 <span class="env">GATEWAY_DEBUG</span></label>
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="debug-toggle">
+                      <span class="toggle-slider"></span>
+                      <span>开启 Debug 快照 <span class="env">GATEWAY_DEBUG</span></span>
+                    </label>
                   </div>
                   <div class="setting-field">
                     <label>owner 过滤（网关密钥标签或哈希前缀）</label>
@@ -921,18 +961,24 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
                 <p class="lede">Cursor 自家模型与第三方模型的额度是两个池子。某类模型额度耗尽只让 key 避开那一类（标记 1 小时到期，或一次成功自动清除），账号级欠费（402）才会整把禁用。下表手工维护「模型 → 桶」：表里查不到时按目录 vendor 推断（Cursor 系归 cursor 桶），再查不到按 default。</p>
                 <div class="setting-field">
                   <label>分桶表 JSON（<code>{"models": {...}, "default": "other"}</code>，模型名小写、桶取 cursor / other）</label>
-                  <textarea id="quota-buckets-json" rows="8" style="font-family:ui-monospace,monospace" spellcheck="false" placeholder='{"models": {"composer": "cursor", "claude-4-sonnet": "other"}, "default": "other"}'></textarea>
+                  <textarea id="quota-buckets-json" rows="10" style="font-family:ui-monospace,monospace" spellcheck="false" placeholder='{"models": {"composer": "cursor", "claude-4-sonnet": "other"}, "default": "other"}'></textarea>
                   <div class="hint">留空保存 = 清空模型表（全靠 vendor 推断 + default）。文件：data/model-quota-buckets.json。</div>
                 </div>
-                <div class="row" style="margin-top:8px">
+                <div class="row" style="margin-top:10px">
                   <button id="btn-save-quota-buckets">保存分桶表</button>
+                  <button type="button" id="btn-format-quota-json">格式化</button>
                   <span class="muted small" id="quota-buckets-hint"></span>
                 </div>
               </div>
-              <div class="row">
-                <button id="btn-save-settings">保存设置</button>
-                <span class="muted small">Fast / Max Mode 各自三态独立：默认关闭 = 客户端未表态时网关下发显式关（fast=false / 最小 context），不是「不管」——省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast、Claude / GPT 默认档常是 1M）；强制开启只对支持对应参数的模型生效（composer 没有 context 档位，Max Mode 对它是空操作）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。</span>
+              <div class="row" style="margin-top:16px">
+                <button class="primary" id="btn-save-settings">保存设置</button>
               </div>
+              <details class="help-details">
+                <summary>关于 Fast / Max Mode / HTTP 协议的详细说明</summary>
+                <div class="detail-body">
+                  Fast / Max Mode 各自三态独立：默认关闭 = 客户端未表态时网关下发显式关（fast=false / 最小 context），不是「不管」——省略参数会让上游按目录默认档计费（Composer / Grok 默认档就是 Fast、Claude / GPT 默认档常是 1M）；强制开启只对支持对应参数的模型生效（composer 没有 context 档位，Max Mode 对它是空操作）。部分模型（如 GPT-5.x）1M 与 fast 不能共存，此时按模型的合法组合自动取舍，Max Mode 优先。客户端在请求里显式指定（请求体 / x-cursor-* 头 / 模型后缀 / 显式 model.params）时以客户端为准。HTTP/1.1 是三态的：保持「未设置」就交给网关按有没有代理决定（HTTP/2 不支持代理，模型流量只有走 HTTP/1.1 才进得了代理），选了强制开/关就以你的选择为准、网关不再插手；从强制态改回「未设置」会清掉这条设置，重新跟随环境变量与代理。关闭自动禁用后，出错的 key 只会本次跳过、永远不会被自动停用（需自己盯着额度）；计数按连续失败算，成功一次即清零。
+                </div>
+              </details>
             </div>
           </div>
           <div class="panel">
@@ -2022,33 +2068,47 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var html = '';
     logs.forEach(function(log, i){
       var modelTip = paramsTip(log.modelParams);
-      html += '<tr>'
+      // 模型列角标：Fast/Max 直接从模型名旁边标注
+      var modelBadges = '';
+      if (log.fast === true) modelBadges += ' <span class="badge ok" style="font-size:10px;padding:1px 5px">Fast</span>';
+      if (log.maxMode === true) modelBadges += ' <span class="badge sand" style="font-size:10px;padding:1px 5px">Max</span>';
+      // 通道列合并 clientType + agentMode
+      var channel = [];
+      if (log.clientType) channel.push('<span class="badge ' + esc(log.clientType) + '">' + esc(log.clientType) + '</span>');
+      if (log.agentMode) channel.push('<span class="muted small">' + esc(log.agentMode) + '</span>');
+      // 状态列：badge + abortReason + 错误红点
+      var statusCell = '<span class="badge ' + statusClass(log.status) + '">' + esc(log.status) + '</span>';
+      if (log.abortReason) statusCell += ' <span class="muted small" title="abort 归因">' + esc(log.abortReason) + '</span>';
+      if (log.error) statusCell += ' <span class="badge danger" style="font-size:10px;padding:1px 5px">err</span>';
+      html += '<tr data-log-row="' + i + '">'
         + '<td class="muted small" style="white-space:nowrap">' + fmtTime(log.ts) + '</td>'
-        + '<td class="mono">' + esc(log.endpoint) + '</td>'
-        + '<td class="mono" title="' + esc(modelTip) + '">' + esc(log.model || '—') + '</td>'
-        + '<td><span class="badge ' + esc(log.authMode || '') + '">' + esc(log.authMode || '—') + '</span></td>'
-        + '<td class="muted small">' + esc(log.keyLabel || '—') + '</td>'
-        + '<td class="muted small">' + esc(log.gatewayKeyLabel || '—') + '</td>'
-        + '<td><span class="badge ' + statusClass(log.status) + '">' + esc(log.status) + '</span>'
-        + (log.abortReason ? ' <span class="muted small" title="流式请求被 abort 的归因（包 C）">' + esc(log.abortReason) + '</span>' : '')
-        + '</td>'
+        + '<td class="mono" title="' + esc(modelTip) + '">' + esc(log.model || '—') + modelBadges + '</td>'
+        + '<td>' + statusCell + '</td>'
         + '<td class="muted">' + (log.durationMs == null ? '—' : (log.durationMs / 1000).toFixed(1) + 's') + '</td>'
-        + '<td>' + boolMark(log.stream) + '</td>'
-        + '<td class="muted small">' + paramCell(log, 'reasoningEffort', esc(log.reasoningEffort || '—')) + '</td>'
-        + '<td>' + paramCell(log, 'fast', boolMark(log.fast)) + '</td>'
-        + '<td>' + paramCell(log, 'maxMode', boolMark(log.maxMode)) + '</td>'
-        + '<td>' + (log.clientType ? '<span class="badge ' + esc(log.clientType) + '">' + esc(log.clientType) + '</span>' : '<span class="muted">—</span>') + '</td>'
-        + '<td>' + esc(log.agentMode || '—') + '</td>'
         + '<td>' + usageCell(log) + '</td>'
         + '<td>' + costCell(log) + '</td>'
-        + '<td>' + (log.error ? '<div class="err-text">' + esc(log.error) + '</div>' : '<span class="muted">—</span>')
-        + '<button data-action="expand" data-i="' + i + '" style="margin-top:4px;padding:2px 8px;font-size:11px">详情</button>'
-        + '<div class="log-detail hidden" id="log-extra-' + i + '">' + esc(logExtra(log)) + '</div>'
-        + '<button data-action="debug-snapshot" data-i="' + i + '" data-log-id="' + esc(log.id || '') + '" style="margin-top:4px;padding:2px 8px;font-size:11px">Debug 快照</button>'
-        + '<div class="log-detail hidden" id="log-debug-' + i + '" style="max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all">'
-        + '</div>'
-        + '</td>'
+        + '<td>' + (channel.length ? channel.join(' ') : '<span class="muted">—</span>') + '</td>'
+        + '<td><button data-action="expand" data-i="' + i + '" style="padding:3px 10px;font-size:12px">详情</button></td>'
         + '</tr>';
+      // 展开详情子行（默认隐藏）
+      html += '<tr class="log-expand-row hidden" id="log-row-' + i + '"><td colspan="8">'
+        + '<div class="expand-panel">'
+        + '<div class="expand-grid">'
+        + '<div><div class="ek">端点</div><div class="ev mono">' + esc(log.endpoint || '—') + '</div></div>'
+        + '<div><div class="ek">鉴权方式</div><div class="ev"><span class="badge ' + esc(log.authMode || '') + '">' + esc(log.authMode || '—') + '</span></div></div>'
+        + '<div><div class="ek">Cursor Key</div><div class="ev">' + esc(log.keyLabel || '—') + '</div></div>'
+        + '<div><div class="ek">网关密钥</div><div class="ev">' + esc(log.gatewayKeyLabel || '—') + '</div></div>'
+        + '<div><div class="ek">流式</div><div class="ev">' + boolMark(log.stream) + '</div></div>'
+        + '<div><div class="ek">推理强度</div><div class="ev">' + paramCell(log, 'reasoningEffort', esc(log.reasoningEffort || '—')) + '</div></div>'
+        + '<div><div class="ek">Fast</div><div class="ev">' + paramCell(log, 'fast', boolMark(log.fast)) + '</div></div>'
+        + '<div><div class="ek">1M/Max</div><div class="ev">' + paramCell(log, 'maxMode', boolMark(log.maxMode)) + '</div></div>'
+        + '</div>'
+        + (log.error ? '<div class="expand-error">' + esc(log.error) + '</div>' : '')
+        + '<div class="expand-actions">'
+        + '<button data-action="debug-snapshot" data-i="' + i + '" data-log-id="' + esc(log.id || '') + '" style="padding:4px 12px;font-size:12px">Debug 快照</button>'
+        + '</div>'
+        + '<div class="log-detail hidden" id="log-debug-' + i + '" style="max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all"></div>'
+        + '</div></td></tr>';
     });
     body.innerHTML = html;
     var from = logTotal === 0 ? 0 : logOffset + 1;
@@ -2787,6 +2847,19 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     }).finally(function(){ button.disabled = false; });
   });
 
+  // 包 B：格式化按钮——美化 JSON 并即时校验语法。
+  $('btn-format-quota-json').addEventListener('click', function(){
+    var raw = $('quota-buckets-json').value.trim();
+    if (!raw) { $('quota-buckets-hint').textContent = '内容为空'; return; }
+    try {
+      var table = JSON.parse(raw);
+      $('quota-buckets-json').value = JSON.stringify(table, null, 2);
+      $('quota-buckets-hint').textContent = '已格式化（JSON 合法）';
+    } catch (err) {
+      $('quota-buckets-hint').textContent = 'JSON 语法错误：' + err.message;
+    }
+  });
+
   $('btn-save-settings').addEventListener('click', function(){
     var threshold = parseInt($('auto-disable-threshold').value, 10);
     if (!(threshold >= 1 && threshold <= 50)) { toast('连续失败次数需为 1-50 的整数', true); return; }
@@ -2975,8 +3048,14 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
   $('logs-body').addEventListener('click', function(event){
     var expand = event.target.closest('button[data-action="expand"]');
     if (expand) {
-      var box = $('log-extra-' + expand.getAttribute('data-i'));
-      if (box) box.classList.toggle('hidden');
+      var row = $('log-row-' + expand.getAttribute('data-i'));
+      if (row) {
+        var isOpen = !row.classList.contains('hidden');
+        // 收起所有其他展开行
+        var allRows = document.querySelectorAll('.log-expand-row');
+        for (var j = 0; j < allRows.length; j++) allRows[j].classList.add('hidden');
+        if (!isOpen) row.classList.remove('hidden');
+      }
       return;
     }
     var debug = event.target.closest('button[data-action="debug-snapshot"]');
@@ -2984,7 +3063,7 @@ label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-siz
     var logId = debug.getAttribute('data-log-id') || '';
     var debugBox = $('log-debug-' + debug.getAttribute('data-i'));
     if (!debugBox || !logId) return;
-    // 再点一次收起，跟「详情」的交互保持一致。
+    // 再点一次收起
     if (!debugBox.classList.contains('hidden')) {
       debugBox.classList.add('hidden');
       return;
