@@ -328,6 +328,13 @@ export interface DurableTurn {
    * previous_response_id、transcript 里看不到 assistant 轮，此字段缺省（护栏不触发）。
    */
   assistantDigest?: string;
+  /**
+   * 碰撞分叉（collision fork）的 lineage 标记：入站 transcript 里**最早**出现的工具调用 id。
+   * 内容推导身份（derived-L3）下，同 prompt 并发的会话会撞进同一个 Hub 键；输家会话的
+   * 工具结果对本槽永远是 foreign。这个标记在同一会话的后续轮次里保持不变（历史只追加），
+   * 用来派生分叉槽键，让被锁出的会话从下一轮起恢复 durable 增量续跑。
+   */
+  lineageToolId?: string;
 }
 
 export interface KeyUsageRef {

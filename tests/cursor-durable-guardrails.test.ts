@@ -1153,3 +1153,165 @@ function toolResultText(result: unknown): string {
     return typeof item?.text === "string" ? item.text : "";
   }).join("");
 }
+
+/* ---------------------- 碰撞分叉（collision fork） ---------------------- */
+
+test("分叉：同 seed 的输家会话 tool_results → 派生分叉槽（全量首程），后续轮次增量续跑", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-fork-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-collision-fork";
+  const sessionId = sessionHash(seed);
+  resetDurableTelemetry();
+
+  // 会话 A（赢家）第一轮：正常 durable，交付 "reply 1"（纯文本轮；赢家发过工具调用的形态
+  // 用 issued 集合模拟——零交集判定需要基础槽有已发过的 id 作证据）。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: userTurn("hello from session A")
+  }));
+  assert.equal(created.length, 1);
+  const winnerSlot = hub.get(sessionId);
+  assert.ok(winnerSlot);
+  recordIssuedToolCalls(winnerSlot, ["tool_a_winner_1"]);
+
+  // 会话 B（输家）第二轮：tool_results 的 id 来自 B 自己第一轮的 stateless agent → 对基础槽 foreign。
+  // lineageToolId = B 的 transcript 里最早的工具 id，分叉键由它派生。
+  const bLineage = "tool_b_first_0001";
+  const forked = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    prompt: "Conversation:\nUSER: hello\nASSISTANT TOOL_USE: {b}\nTOOL RESULT (b): done\nUSER: continue",
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      lineageToolId: bLineage,
+      toolResults: [{ id: "tool_b_first_0001", content: "session B tool output" }]
+    }
+  }));
+  // 分叉首程：新建分叉 agent（全量 prompt），不得动 A 的基础槽 agent。
+  assert.equal(created.length, 2, "分叉必须新建自己的 agent");
+  const baseSlot = hub.get(sessionId);
+  assert.ok(baseSlot, "基础槽不得被分叉销毁");
+  assert.equal(baseSlot.agent, created[0].agent, "赢家的 agent 原样保留");
+  // 全量首程发的是完整 flatten（含历史与工具结果），而不是 path B 的工具结果摘要。
+  assert.ok(sendText(created[1].sends[0]).includes("TOOL RESULT (b): done"), "分叉首程必须带完整上下文");
+  assert.equal(forked.text, "reply 1");
+
+  // 会话 B 第三轮：同样的 lineage → 命中同一分叉槽，增量续跑（不再 stateless、不再 foreign）。
+  const third = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      lineageToolId: bLineage,
+      assistantDigest: assistantTextDigest("reply 1"),
+      toolResults: [{ id: "tool_b_second_0002", content: "more output" }]
+    }
+  }));
+  assert.equal(created.length, 2, "第三轮必须复用分叉 agent，不再新建");
+  assert.equal(created[1].sends.length, 2, "分叉槽增量续跑（第二次 send）");
+  assert.equal(third.text, "reply 2");
+  // 分叉槽键与基础槽不同，两个会话各归各的。
+  const forkSessionId = durableSessionId({
+    apiKey: "cursor-key",
+    model: "composer-2.5",
+    workingDirectory: "/workspace",
+    conversationSeed: `${seed}\u0000fork:${bLineage}`
+  });
+  assert.ok(forkSessionId);
+  assert.ok(hub.get(forkSessionId), "分叉槽必须落在 lineage 派生的键上");
+  assert.notEqual(forkSessionId, sessionId);
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok((snapshot.decisions["create:collision_fork"] ?? 0) >= 1, "必须留下 create:collision_fork 打点");
+  assert.ok((snapshot.decisions["reuse:collision_fork"] ?? 0) >= 1, "第三轮必须留下 reuse:collision_fork 打点");
+  await hub.dropAll();
+});
+
+test("分叉（fresh_session 路径）：输家 new_user 且带 lineage → 也走分叉，不再永久 stateless", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-fork-new-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-collision-fork-newuser";
+
+  // 赢家第一轮。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: userTurn("hello from winner")
+  }));
+  assert.equal(created.length, 1);
+
+  // 输家带工具历史的 new_user（fresh_session 护栏会拦）→ 分叉。
+  const result = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    prompt: "Conversation:\nUSER: task for B",
+    durableTurn: {
+      kind: "new_user",
+      ...FP,
+      lineageToolId: "tool_b_lineage_0001",
+      userText: "task for B"
+    }
+  }));
+  assert.equal(created.length, 2, "fresh_session + lineage 必须分叉新建，不得退 stateless（那会陷入全量重放循环）");
+  assert.ok(result.text.length > 0);
+  await hub.dropAll();
+});
+
+test("分叉不可递归：分叉槽内再触发护栏 → 退 stateless（同 lineage 不会无限套娃）", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-fork-deep-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-collision-fork-depth";
+
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: userTurn("winner")
+  }));
+  const winnerSlot2 = hub.get(sessionHash(seed));
+  assert.ok(winnerSlot2);
+  recordIssuedToolCalls(winnerSlot2, ["tool_a_w2"]);
+  // 输家第一轮：分叉。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    prompt: "Conversation:\nUSER: for B",
+    durableTurn: { kind: "tool_results", ...FP, lineageToolId: "tool_b_x", toolResults: [{ id: "tool_b_x", content: "r" }] }
+  }));
+  assert.equal(created.length, 2);
+  // 输家第二轮：分叉槽已在 → 复用（reuse:collision_fork），增量 send。
+  const second = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: { kind: "tool_results", ...FP, lineageToolId: "tool_b_x", toolResults: [{ id: "tool_b_y", content: "r2" }] }
+  }));
+  assert.equal(created.length, 2, "第二轮复用分叉 agent");
+  assert.equal(created[1].sends.length, 2, "分叉槽增量");
+  assert.ok(second.text.length > 0);
+  await hub.dropAll();
+});

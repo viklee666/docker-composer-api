@@ -3,7 +3,7 @@ import { ApiError, raceWithAbort } from "./errors.js";
 import { classifyErrorText, classifyKeyFailure, errorMessage, indicatesUpstreamAuthFailure, isRateLimitError, maskKey } from "./key-pool.js";
 import { resolveModelParams, type ModelCatalog, type ModelIntent } from "./model-params.js";
 import { isRitualAssistantText, normalizeRequestUsage, parseToolCallJson, parseToolMarkers, responseCallIds } from "./protocol.js";
-import { durableSessionId } from "./durable-id.js";
+import { durableAgentId, durableSessionId } from "./durable-id.js";
 import { recordDurableDecision } from "./durable-telemetry.js";
 import {
   EventPump,
@@ -308,7 +308,8 @@ export class CursorSdkRunner implements CursorRunner {
     hub: SessionHub,
     sessionId: string,
     input: CursorRunRequest,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    allowFork = true
   ): AsyncIterable<CursorStreamEvent> {
     const resolved = await raceWithAbort(this.resolveModelRun(input), signal);
     recordRunTelemetry(input, resolved);
@@ -332,6 +333,22 @@ export class CursorSdkRunner implements CursorRunner {
 
     let slot = await this.ensureDurableSlot(hub, sessionId, input, resolved, signal, turn);
     if (!slot) {
+      // 碰撞分叉：fresh_session 护栏拦下（基础槽已被同 seed 的另一个会话交付过输出）、
+      // 且入站历史带 lineage 标记（有工具轮的续聊）时，不再退 stateless——派生分叉槽，
+      // 首程全量落地、后续恢复增量，否则输家会话永远回不了 durable（快照实锤 25 轮循环）。
+      const baseSlot = hub.get(sessionId);
+      if (
+        allowFork
+        && turn?.lineageToolId
+        && turn.kind === "new_user"
+        && input.identitySource === "derived-L3"
+        && input.protocol !== "openai-responses"
+        && baseSlot
+        && inboundFreshSessionOnDeliveredSlot(baseSlot, turn.assistantDigest)
+      ) {
+        yield* this.runForkedDurable(hub, input, signal, turn, resolved);
+        return;
+      }
       // 包 E 第 3 条：入站历史与 slot 记录的上一轮输出对不上（历史分叉）。
       // 只牺牲本轮缓存退 stateless，绝不销毁槽、不关 reuse。
       recordDurableDecision({
@@ -417,6 +434,12 @@ export class CursorSdkRunner implements CursorRunner {
         input.identitySource === "derived-L3"
         && toolResultsForeignToSlot(liveSlot, turn.toolResults ?? [])
       ) {
+        // 碰撞分叉：外来工具结果 + lineage 标记 → 派生分叉槽（首程全量落地）。
+        // 没 lineage（纯文本首轮撞车、或历史被压缩掉了调用侧 id）才退 stateless。
+        if (allowFork && turn.lineageToolId) {
+          yield* this.runForkedDurable(hub, input, signal, turn, resolved);
+          return;
+        }
         console.error(`[durable] foreign tool_results; stateless fallback session=${sessionId.slice(0, 12)}`);
         recordDurableDecision({
           decision: "fallback",
@@ -707,6 +730,75 @@ export class CursorSdkRunner implements CursorRunner {
     }
 
     return this.createDurableSlot(hub, sessionId, input, resolved, signal, turn);
+  }
+
+  /**
+   * 碰撞分叉（collision fork）：内容推导身份撞进同一个 Hub 键时，输家会话的每一轮都是
+   * foreign/fresh_session，退 stateless 会陷入「每轮全量重放、模型反复重做任务」的循环
+   * （快照 0e4e94c2：输家子代理连打 25 轮工具）。这里用入站 transcript 里最早的工具调用
+   * id（lineageToolId，同会话跨轮稳定、跨会话随机不同）派生一个分叉会话键：
+   * - 分叉槽不存在 ⇒ create + 首程发完整 flatten（stateless 的口径，但 agent 保留）；
+   * - 分叉槽已存在 ⇒ 作为普通 durable 会话续跑（增量 + path A/B，禁再分叉防同 marker 递归）。
+   * 槽主（赢家会话）不受影响：它从不触发护栏，永远走基础槽。
+   */
+  private async *runForkedDurable(
+    hub: SessionHub,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined,
+    turn: NonNullable<CursorRunRequest["durableTurn"]>,
+    resolved: ResolvedModelRun
+  ): AsyncIterable<CursorStreamEvent> {
+    const lineage = turn.lineageToolId;
+    if (!lineage) {
+      // 调用点已保证 lineage 存在；这里只做防御：拿不到标记就无法派生稳定分叉键，退 stateless。
+      yield* this.streamStatelessFallback(input, signal);
+      return;
+    }
+    const baseIdentity = input.conversationSeed ?? input.stickyKey ?? input.sessionKey;
+    const forkIdentity = `${baseIdentity} fork:${lineage}`;
+    const forkSessionId = durableAgentId({ ownerHash: input.ownerHash ?? "", identity: forkIdentity, model: input.model });
+    const existing = hub.get(forkSessionId);
+    if (existing) {
+      recordDurableDecision({
+        decision: "reuse",
+        reason: "collision_fork",
+        session: forkSessionId.slice(0, 12),
+        kind: turn.kind,
+        liveSessions: hub.size
+      });
+      yield* this.runDurableLocked(hub, forkSessionId, input, signal, false);
+      return;
+    }
+    console.error(
+      `[durable] collision fork session=${forkSessionId.slice(0, 12)} lineage=${lineage.slice(0, 14)} kind=${turn.kind}`
+    );
+    recordDurableDecision({
+      decision: "create",
+      reason: "collision_fork",
+      session: forkSessionId.slice(0, 12),
+      kind: turn.kind,
+      liveSessions: hub.size
+    });
+    try {
+      input.debugRef?.noteUpstreamTurn("sdk", {
+        kind: turn.kind,
+        blocked: "collision_fork",
+        remark: "derived-L3 collision: forking a dedicated durable session for the locked-out conversation"
+      });
+    } catch {
+      // 观测路径不得影响主流程。
+    }
+    const slot = await this.createDurableSlot(hub, forkSessionId, input, resolved, signal, turn);
+    // 分叉首程：完整 flatten 落到新 agent（与 stateless 同口径），让模型带着全部上下文续跑；
+    // agent 保留在分叉槽里，后续轮次按 lineage 命中同一键，恢复增量。
+    await this.durableSend(hub, slot, forkSessionId, input, resolved, signal, {
+      // 调用点只在 new_user / tool_results 两个护栏分支进来；其余 kind 到不了这里。
+      kind: turn.kind === "tool_results" ? "tool_results" : "new_user",
+      message: input.prompt,
+      firstSend: true
+    });
+    const liveSlot = hub.get(forkSessionId) ?? slot;
+    yield* this.consumeDurablePump(hub, forkSessionId, liveSlot, input, signal);
   }
 
   /**

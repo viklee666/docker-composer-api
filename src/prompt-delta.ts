@@ -119,10 +119,16 @@ export function extractDurableTurn(
 
   const toolResults = bits.toolResults?.length ? bits.toolResults : undefined;
   // 包 E：上一条 assistant 文本的摘要进 turn（叠加 systemText 包装），runner 侧与 slot 记录的上一轮输出比对。
+  // lineageToolId（碰撞分叉标记）也在这里统一附加：三个分支共用，历史只追加所以最早 id 跨轮稳定。
   const withDigest = (turn: DurableTurn): DurableTurn => {
     const wrapped = withSystem(turn);
     const digest = bits.lastAssistantText ? assistantTextDigest(bits.lastAssistantText) : undefined;
-    return digest ? { ...wrapped, assistantDigest: digest } : wrapped;
+    const lineageToolId = earliestLineageToolId(protocol, record);
+    return {
+      ...wrapped,
+      ...(digest ? { assistantDigest: digest } : {}),
+      ...(lineageToolId ? { lineageToolId } : {})
+    };
   };
   if (toolResults) {
     return withDigest({ kind: "tool_results", systemFingerprint, toolsFingerprint, toolResults });
@@ -146,6 +152,57 @@ export function fingerprintTools(tools: GatewayTool[]): string {
     .map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema ?? null }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return sha256Hex(stableStringify(rows));
+}
+
+/**
+ * 碰撞分叉的 lineage 标记：入站 transcript 里最早出现的工具调用 id。
+ * 同一会话的后续请求里这个 id 永远还在（历史只追加），跨会话则几乎不可能相同
+ * （id 是上游生成的随机 UUID）——正好做「这是哪一段对话」的稳定派生材料。
+ * 只认调用侧 id（tool_use / tool_calls / function_call），不认结果侧 id：
+ * 结果可以脱离调用先出现在压缩后的历史里，语义上不属于「本会话发起过」的证据链。
+ */
+function earliestLineageToolId(protocol: ProtocolKind, record: Record<string, unknown>): string | undefined {
+  const items = protocol === "openai-responses"
+    ? (Array.isArray(record.input) ? record.input : [])
+    : (Array.isArray(record.messages) ? record.messages : []);
+  for (const item of items) {
+    const message = asRecord(item);
+    if (!message) continue;
+    if (protocol === "openai-responses") {
+      if (message.type !== "function_call") continue;
+      const callId = typeof message.call_id === "string" ? normalizeLineageId(message.call_id) : undefined;
+      if (callId) return callId;
+      continue;
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        const id = asRecord(call)?.id;
+        if (typeof id === "string") {
+          const normalized = normalizeLineageId(id);
+          if (normalized) return normalized;
+        }
+      }
+    }
+    const fn = asRecord(message.function_call);
+    if (fn && typeof fn.id === "string") {
+      const normalized = normalizeLineageId(fn.id);
+      if (normalized) return normalized;
+    }
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        const block = asRecord(part);
+        if (block?.type !== "tool_use" || typeof block.id !== "string") continue;
+        const normalized = normalizeLineageId(block.id);
+        if (normalized) return normalized;
+      }
+    }
+  }
+  return undefined;
+}
+
+function normalizeLineageId(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= 128 && !/\p{Cc}/u.test(trimmed) ? trimmed : undefined;
 }
 
 function parseTools(protocol: ProtocolKind, record: Record<string, unknown>): GatewayTool[] {
