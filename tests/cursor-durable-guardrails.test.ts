@@ -1315,3 +1315,53 @@ test("分叉不可递归：分叉槽内再触发护栏 → 退 stateless（同 l
   assert.ok(second.text.length > 0);
   await hub.dropAll();
 });
+
+test("分叉锁：分叉键被占用时退 stateless（基础键的锁保护不到分叉槽）", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-fork-lock-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-fork-lock";
+  const lineage = "tool_b_lock_0001";
+  resetDurableTelemetry();
+
+  // 赢家占基础槽（并种上 issued 证据，让零交集判定有依据）。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    durableTurn: userTurn("winner")
+  }));
+  const baseSlot = hub.get(sessionHash(seed));
+  assert.ok(baseSlot);
+  recordIssuedToolCalls(baseSlot, ["tool_a_lock"]);
+
+  // 手工占住分叉键的锁，模拟同一输家会话的另一条 HTTP 正在跑。
+  const forkSessionId = durableSessionId({
+    apiKey: "cursor-key",
+    model: "composer-2.5",
+    workingDirectory: "/workspace",
+    conversationSeed: `${seed}\u0000fork:${lineage}`
+  });
+  assert.ok(forkSessionId);
+  const held = await hub.acquire(forkSessionId);
+
+  // new_user 分叉走 tryAcquire → 拿不到锁 → 退 stateless，绝不无锁操作分叉槽。
+  const result = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "derived-L3",
+    prompt: "Conversation:\nUSER: locked out",
+    durableTurn: { kind: "new_user", ...FP, lineageToolId: lineage, userText: "locked out" }
+  }));
+  assert.ok(result.text.length > 0, "拿不到分叉锁也要有完整产出");
+  assert.equal(hub.get(forkSessionId), undefined, "锁被占时不得建分叉槽");
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok((snapshot.decisions["fallback:fork_locked"] ?? 0) >= 1, "必须留下 fallback:fork_locked 打点");
+  held();
+  await hub.dropAll();
+});

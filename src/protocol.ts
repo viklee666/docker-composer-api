@@ -939,8 +939,15 @@ export function parseAnthropicTools(value: unknown, toolChoice: unknown): Gatewa
   });
 }
 
-/** 历史短仪式句（拉齐 schema / GetMcpTools 等）不进合成 prompt；只判整段且 ≤200 字，避免误删讨论 schema 的长回复。 */
-const RITUAL_ASSISTANT_RE = /拉齐\s*schema|对齐\s*schema|schema\s*拉齐|schema\s*对齐|align\s+schema|对齐工具|拉齐工具|align\s+tools|align\s+the\s+tool|搜到工具了|found\s+the\s+tool|\bGetMcpTools\b|\bCallMcpTool\b/i;
+/**
+ * 历史短仪式句（拉齐 schema / 搜到工具了 等）不进合成 prompt；只判整段且 ≤200 字，避免误删讨论 schema 的长回复。
+ *
+ * 刻意不含工具名（GetMcpTools / CallMcpTool 等）：这些工具现在是客户端可声明、可正常调用的
+ * （宿主元过滤已在 983be1f 拆除），按名字判仪式会把模型「我用 CallMcpTool 查了一下」这类
+ * 合法短回复整段吞掉，入站历史与本轮上游输出两处都会中招（cursor-runner 的 waitedText 判定）。
+ * 留下的模式都是「只宣告要对齐 schema、没有实际产出」的句式，与具体工具名无关。
+ */
+const RITUAL_ASSISTANT_RE = /拉齐\s*schema|对齐\s*schema|schema\s*拉齐|schema\s*对齐|align\s+schema|对齐工具|拉齐工具|align\s+tools|align\s+the\s+tool|搜到工具了|found\s+the\s+tool/i;
 
 export function isRitualAssistantText(text: string): boolean {
   const trimmed = text.trim();

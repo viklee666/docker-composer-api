@@ -292,15 +292,24 @@ export class CursorSdkRunner implements CursorRunner {
       yield* this.runDurableLocked(hub, durableId, input, signal);
     } finally {
       try {
-        const slot = hub.get(durableId);
-        if (slot?.state === "running" && slot.pending.size > 0) {
-          hub.beginAwaitingTools(durableId);
-        } else if (slot?.state === "running") {
-          await this.dropDurableSession(hub, durableId).catch(() => undefined);
-        }
+        await this.settleDurableSlotState(hub, durableId);
       } finally {
         release();
       }
+    }
+  }
+
+  /**
+   * 请求收尾时把槽状态落定：还挂着 execute ⇒ awaiting_tools（等下一条 HTTP 送结果）；
+   * 仍是 running（既没挂起也没收尾，说明本轮异常中断）⇒ 丢弃，别把半死的 agent 留给下一轮。
+   * 基础槽与分叉槽共用这一套（两者都必须在自己的锁内收尾）。
+   */
+  private async settleDurableSlotState(hub: SessionHub, sessionId: string): Promise<void> {
+    const slot = hub.get(sessionId);
+    if (slot?.state === "running" && slot.pending.size > 0) {
+      hub.beginAwaitingTools(sessionId);
+    } else if (slot?.state === "running") {
+      await this.dropDurableSession(hub, sessionId).catch(() => undefined);
     }
   }
 
@@ -755,8 +764,46 @@ export class CursorSdkRunner implements CursorRunner {
       return;
     }
     const baseIdentity = input.conversationSeed ?? input.stickyKey ?? input.sessionKey;
+    // 分隔符是真正的 NUL（ ），与 durableIdentity 的 ` agent:` 同口径——普通空格会与提示词内容混淆。
     const forkIdentity = `${baseIdentity} fork:${lineage}`;
     const forkSessionId = durableAgentId({ ownerHash: input.ownerHash ?? "", identity: forkIdentity, model: input.model });
+    // 分叉槽有自己的键，基础键的锁保护不到它：必须单独取锁，否则同一输家会话的并发/重叠
+    // 请求会同时操作同一个分叉槽（破坏 Hub 互斥），且没有任何路径为它做状态收尾。
+    const forkRelease = turn.kind === "tool_results"
+      ? await hub.acquire(forkSessionId, signal)
+      : await hub.tryAcquire(forkSessionId);
+    if (!forkRelease) {
+      recordDurableDecision({
+        decision: "fallback",
+        reason: "fork_locked",
+        session: forkSessionId.slice(0, 12),
+        kind: turn.kind,
+        liveSessions: hub.size
+      });
+      yield* this.streamStatelessFallback(input, signal);
+      return;
+    }
+    try {
+      yield* this.runForkedDurableLocked(hub, forkSessionId, lineage, input, signal, turn, resolved);
+    } finally {
+      try {
+        await this.settleDurableSlotState(hub, forkSessionId);
+      } finally {
+        forkRelease();
+      }
+    }
+  }
+
+  /** 分叉槽已持锁后的主体：命中已有分叉槽 ⇒ 普通 durable 续跑；否则 create + 全量首程。 */
+  private async *runForkedDurableLocked(
+    hub: SessionHub,
+    forkSessionId: string,
+    lineage: string,
+    input: CursorRunRequest,
+    signal: AbortSignal | undefined,
+    turn: NonNullable<CursorRunRequest["durableTurn"]>,
+    resolved: ResolvedModelRun
+  ): AsyncIterable<CursorStreamEvent> {
     const existing = hub.get(forkSessionId);
     if (existing) {
       recordDurableDecision({
