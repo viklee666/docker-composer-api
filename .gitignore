@@ -46,3 +46,5 @@ logs/
 docs/*
 !docs/images/
 !docs/images/**
+
+temp/
