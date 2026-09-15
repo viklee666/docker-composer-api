@@ -16,34 +16,6 @@ const TOOL_ALIASES: Record<string, string[]> = {
   WebSearch: ["websearch", "web_search"]
 };
 
-/** Claude Code 宿主元工具不得进 customTools，否则内层会再演 MCP 发现或 Task 套娃。精确名、大小写不敏感。 */
-const HOST_META_TOOL_NAMES = new Set([
-  "getmcptools",
-  "callmcptool",
-  "fetchmcpresource",
-  "listmcpresources",
-  "mcp_auth",
-  "task",
-  "taskoutput",
-  "taskstop",
-  "agent",
-  "skill",
-  "slashcommand",
-  "enterplanmode",
-  "exitplanmode",
-  "switchmode",
-  "askuserquestion",
-  "askquestion"
-]);
-
-export function isHostMetaTool(name: string): boolean {
-  return HOST_META_TOOL_NAMES.has(name.toLowerCase());
-}
-
-export function filterHostMetaTools(tools: GatewayTool[]): GatewayTool[] {
-  return tools.filter((tool) => !isHostMetaTool(tool.name));
-}
-
 /**
  * 参数改名映射：同一来源键可尝试多个目标键（按顺序取第一个存在于客户端 schema 的）。
  * 例如 Claude Code 的 Grep 用 `-A`/`-B`/`-C`/`-i`，其他客户端可能用 context_after 等长名。
@@ -103,7 +75,9 @@ export function createSdkCustomTools(
   onToolCall: (toolCall: GatewayToolCall) => void,
   options?: CreateSdkCustomToolsOptions
 ): Record<string, SDKCustomTool> | undefined {
-  const clientTools = filterHostMetaTools(tools);
+  // 客户端声明的工具全量注册（Task / MCP 发现等宿主元名不再剔除——090d4a7 的剔除治的是
+  // 缓存错位造成的“仪式重演”，durable 上线后已无此现象，剔除只剩杀掉 byok 子代理的副作用）。
+  const clientTools = tools;
   if (!clientTools.length) return undefined;
   const hold = options?.hold === true;
   const customTools: Record<string, SDKCustomTool> = {};
@@ -160,8 +134,8 @@ export function normalizeToolCallForClient(toolCall: GatewayToolCall, tools: Gat
 export function matchesClientTool(toolCall: GatewayToolCall, tools: GatewayTool[]): boolean {
   if (!tools.length) return false;
   const unwrapped = unwrapMcpToolCall(toolCall);
-  // unwrap 后内层 toolName 若是 GetMcpTools / Task 等宿主元名，直接 false，不转发。
-  if (isHostMetaTool(unwrapped.name)) return false;
+  // 客户端没声明的工具名自然匹配不上（findClientTool undefined）；声明的（含 Task 等
+  // 宿主元名）一律可转发——客户端声明即代表它自己会执行。
   return findClientTool(unwrapped.name, tools) !== undefined;
 }
 

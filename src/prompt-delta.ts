@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import {
-  collectHostMetaCallIds,
   contentToTextAndImages,
   imageFromUrl,
   parseAnthropicTools,
@@ -11,7 +10,6 @@ import {
 import { systemSeedText } from "./routing.js";
 import { resolveSystemText } from "./system-prompt.js";
 import { assistantTextDigest } from "./session-hub.js";
-import { isHostMetaTool } from "./tool-compat.js";
 import type { DurableTurn, GatewayImage, GatewayTool, ProtocolKind, SystemPromptSettings } from "./types.js";
 
 /**
@@ -158,7 +156,6 @@ function parseTools(protocol: ProtocolKind, record: Record<string, unknown>): Ga
 
 function extractChat(record: Record<string, unknown>): TurnBits {
   const messages = Array.isArray(record.messages) ? record.messages : [];
-  const metaIds = collectHostMetaCallIds(messages);
   let i = messages.length - 1;
   while (i >= 0) {
     const role = asRecord(messages[i])?.role;
@@ -169,7 +166,7 @@ function extractChat(record: Record<string, unknown>): TurnBits {
     break;
   }
   const trailing = messages.slice(i + 1);
-  const toolResults = chatToolResults(trailing, metaIds);
+  const toolResults = chatToolResults(trailing);
   if (toolResults.length) return { toolResults, lastAssistantText: chatLastAssistantText(messages.slice(0, i + 1)) };
 
   const lastUser = lastRoleMessage(messages.slice(0, i + 1), "user");
@@ -188,18 +185,17 @@ function chatLastAssistantText(messages: unknown[]): string | undefined {
   return text || undefined;
 }
 
-function chatToolResults(trailing: unknown[], metaIds: ReadonlySet<string>): NonNullable<DurableTurn["toolResults"]> {
+function chatToolResults(trailing: unknown[]): NonNullable<DurableTurn["toolResults"]> {
   const results: NonNullable<DurableTurn["toolResults"]> = [];
   for (const message of trailing) {
     const item = asRecord(message);
     if (!item) continue;
     const name = typeof item.name === "string" ? item.name.trim() : "";
-    if (name && isHostMetaTool(name)) continue;
     const callId =
       typeof item.tool_call_id === "string" && item.tool_call_id.trim()
         ? item.tool_call_id.trim()
         : name;
-    if (!callId || metaIds.has(callId)) continue;
+    if (!callId) continue;
     const dumped: GatewayImage[] = [];
     const content = stripImagePlaceholders(contentToTextAndImages(item.content, dumped, false));
     results.push({ id: callId, content });
@@ -209,11 +205,10 @@ function chatToolResults(trailing: unknown[], metaIds: ReadonlySet<string>): Non
 
 function extractAnthropic(record: Record<string, unknown>): TurnBits {
   const messages = Array.isArray(record.messages) ? record.messages : [];
-  const metaIds = collectHostMetaCallIds(messages);
   const last = lastRoleMessage(messages, "user");
   if (!last) return {};
 
-  const toolResults = anthropicToolResults(last.content, metaIds);
+  const toolResults = anthropicToolResults(last.content);
   if (toolResults.length) return { toolResults, lastAssistantText: anthropicLastAssistantText(messages) };
 
   const images: GatewayImage[] = [];
@@ -230,14 +225,14 @@ function anthropicLastAssistantText(messages: unknown[]): string | undefined {
   return text || undefined;
 }
 
-function anthropicToolResults(content: unknown, metaIds: ReadonlySet<string>): NonNullable<DurableTurn["toolResults"]> {
+function anthropicToolResults(content: unknown): NonNullable<DurableTurn["toolResults"]> {
   if (!Array.isArray(content)) return [];
   const results: NonNullable<DurableTurn["toolResults"]> = [];
   for (const part of content) {
     const record = asRecord(part);
     if (!record || record.type !== "tool_result") continue;
     const id = typeof record.tool_use_id === "string" ? record.tool_use_id.trim() : "";
-    if (!id || metaIds.has(id)) continue;
+    if (!id) continue;
     const item: NonNullable<DurableTurn["toolResults"]>[number] = {
       id,
       content: toolResultText(record.content)
@@ -285,16 +280,10 @@ function extractResponses(record: Record<string, unknown>, previous?: DurablePre
   if (typeof input === "string") return { userText: input };
 
   const items = Array.isArray(input) ? input : [];
-  const metaIds = collectHostMetaCallIds([
-    ...items,
-    ...(Array.isArray(previous?.response?.output) ? previous.response.output : []),
-    ...(previous?.inputItems ?? [])
-  ]);
-
   let i = items.length - 1;
   while (i >= 0 && (isResponseToolOutput(items[i]) || isReasoningItem(items[i]))) i -= 1;
   const trailing = items.slice(i + 1).filter((item) => isResponseToolOutput(item));
-  const toolResults = responseToolResults(trailing, metaIds);
+  const toolResults = responseToolResults(trailing);
   if (toolResults.length) return { toolResults };
 
   const lastUser = lastResponseUserItem(items.slice(0, i + 1));
@@ -304,7 +293,7 @@ function extractResponses(record: Record<string, unknown>, previous?: DurablePre
   return responseUserBits(lastUser);
 }
 
-function responseToolResults(trailing: unknown[], metaIds: ReadonlySet<string>): NonNullable<DurableTurn["toolResults"]> {
+function responseToolResults(trailing: unknown[]): NonNullable<DurableTurn["toolResults"]> {
   const results: NonNullable<DurableTurn["toolResults"]> = [];
   for (const item of trailing) {
     const record = asRecord(item);
@@ -313,7 +302,7 @@ function responseToolResults(trailing: unknown[], metaIds: ReadonlySet<string>):
       (typeof record.call_id === "string" && record.call_id.trim()) ||
       (typeof record.tool_use_id === "string" && record.tool_use_id.trim()) ||
       "";
-    if (!id || metaIds.has(id)) continue;
+    if (!id) continue;
     const raw = record.output ?? record.content ?? "";
     results.push({
       id,

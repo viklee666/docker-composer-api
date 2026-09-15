@@ -813,6 +813,99 @@ test("护栏（tool_results 零交集）：本槽 path A 结果正常 resolve，
   await hub.dropAll();
 });
 
+test("护栏（已交付去重）：SDK 消息级事件重放旧 tool_use ⇒ 不重发 tool_call（快照 7d96afaa 场景）", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: Array<{ agent: ReplayToolAgent; durable: boolean }> = [];
+  const factory: AgentFactory = {
+    create: async (options) => {
+      const durable = created.length === 0;
+      const agent = new ReplayToolAgent();
+      if (durable) agent.attachCreateOptions(options);
+      created.push({ agent, durable });
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-issued-tool-dedup";
+
+  // HTTP1：模型发起 Read（call_read_1），停在挂起 execute，客户端拿到一次 tool_call。
+  const http1 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: userTurn("Read README.md")
+  }));
+  assert.equal(http1.toolCalls.length, 1, "HTTP1 交付一次 tool_call");
+  assert.equal(http1.toolCalls[0]?.id, "call_read_1");
+
+  // HTTP2：客户端回传结果；SDK 的消息级事件在续跑时整段重放 run 的 assistant 内容
+  // （含早前轮次的 tool_use，快照实锤形态）。不得把已交付的 call_read_1 再发一次。
+  const http2 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_read_1", content: "hello from README" }]
+    }
+  }));
+  assert.ok(http2.text.includes("final answer"), `续跑文本要交付：${http2.text.slice(0, 80)}`);
+  assert.equal(http2.toolCalls.length, 0, "重放的旧 tool_use 绝不能第二次交付给客户端（否则客户端重跑工具、结果触发 duplicate_tool_results、模型二次作答）");
+  await hub.dropAll();
+});
+
+/**
+ * 复现快照 7d96afaa 场景的假 agent：execute 挂起（path A），客户端回传结果后续跑时，
+ * 消息级 assistant 事件「整段重放」run 的内容——终稿消息里混入早前轮次的 tool_use
+ * （与真实 SDK 的累积消息事件同形）。
+ */
+class ReplayToolAgent implements AgentLike {
+  readonly agentId = "agent-replay";
+  disposed = false;
+  readonly sends: unknown[] = [];
+  private tools: Record<string, SDKCustomToolLike> | undefined;
+
+  attachCreateOptions(options: Record<string, unknown>): void {
+    const local = options.local as { customTools?: Record<string, SDKCustomToolLike> } | undefined;
+    this.tools = local?.customTools;
+  }
+
+  async send(message: unknown, options?: Record<string, unknown>): Promise<HeldFakeRun> {
+    if (options?.local !== undefined) this.attachCreateOptions(options);
+    this.sends.push(message);
+    const tools = this.tools;
+    const run = new HeldFakeRun();
+    run.attach(async function* () {
+      yield { type: "assistant", message: { content: [{ type: "text", text: "Checking." }] } };
+      if (!tools?.Read) throw new Error("ReplayToolAgent expected customTools.Read on create");
+      const pending = tools.Read.execute({ file_path: "README.md" }, { toolCallId: "call_read_1" }) as Promise<unknown>;
+      yield {
+        type: "tool_call",
+        toolCall: { id: "call_read_1", name: "Read", arguments: { file_path: "README.md" } }
+      };
+      await pending;
+      // 续跑：终稿 assistant 消息里混入早前轮次的 tool_use（SDK 累积消息事件重放形态）。
+      yield {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "final answer" },
+            { type: "tool_use", id: "call_read_1", name: "Read", input: { file_path: "README.md" } }
+          ]
+        }
+      };
+    });
+    return run;
+  }
+
+  close(): void {
+    this.disposed = true;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    this.disposed = true;
+  }
+}
+
 function durableRunner(hub: SessionHub, factory: AgentFactory, store: MemoryStateStore = new MemoryStateStore()): CursorSdkRunner {
   return new CursorSdkRunner(store, {
     defaultWorkingDirectory: "/workspace",

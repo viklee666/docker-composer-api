@@ -1122,6 +1122,19 @@ export class CursorSdkRunner implements CursorRunner {
       if (toolCalls.some((item) => item.id === normalized.id || sameToolInvocation(item, normalized))) {
         return undefined;
       }
+      // 已交付去重：SDK 消息级事件会整段重放 run 的 assistant 内容（含早前轮次的 tool_use），
+      // parkHeld / post-end 的兜底提取会把已交付过的 tool_call 再次发出——客户端重跑工具、
+      // 结果被 duplicate_tool_results 打回 stateless，模型二次作答（快照实锤：同一 tool id
+      // 出现在两个 assistant 轮）。该 id 仍挂在 pending（SDK 对新调用复用了同一 id）时必须
+      // 放行重发，否则那个 execute 会无人解决、挂到 hold TTL 把槽拖死。
+      if (
+        slot.issuedToolCallIds?.includes(normalized.id)
+        && !slot.pending.has(normalized.id)
+        && !slot.pending.has(responsesCallId(normalized.id))
+      ) {
+        console.error(`[durable] dropped already-issued tool call id=${normalized.id} name=${normalized.name} session=${sessionId.slice(0, 12)}`);
+        return undefined;
+      }
       pushToolCall(toolCalls, normalized);
       rememberCallAlias(slot, normalized.id, responseCallIds(normalized).callId);
       rememberCallAlias(slot, normalized.id, responsesCallId(normalized.id));

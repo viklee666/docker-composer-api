@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createSdkCustomTools,
-  filterHostMetaTools,
-  isHostMetaTool,
   matchesClientTool,
   normalizeToolCallForClient
 } from "../src/tool-compat.js";
+import { extractDurableTurn } from "../src/prompt-delta.js";
 import type { GatewayTool } from "../src/types.js";
+
+/**
+ * 宿主元工具直通（090d4a7 的剔除机制已拆除）：
+ * 当初的剔除治的是缓存错位造成的「仪式重演」，durable 上线后现象消失，剔除只剩副作用——
+ * cursor-byok 声明的 Task / MCP 发现工具被拦，子代理整个不可用。现在客户端声明的工具
+ * 全量注册、全量可转发、结果原样回流。
+ */
 
 const getMcpTools: GatewayTool = {
   name: "GetMcpTools",
@@ -18,7 +24,7 @@ const getMcpTools: GatewayTool = {
 const taskTool: GatewayTool = {
   name: "Task",
   description: "Launch a subagent",
-  inputSchema: { type: "object", properties: { prompt: { type: "string" } } }
+  inputSchema: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] }
 };
 
 const readTool: GatewayTool = {
@@ -31,29 +37,30 @@ const readTool: GatewayTool = {
   }
 };
 
-const clientToolsWithMeta: GatewayTool[] = [getMcpTools, readTool];
+const clientTools: GatewayTool[] = [getMcpTools, taskTool, readTool];
 
-test("isHostMetaTool is true for host MCP, subagent, skill, and ask tools regardless of case", () => {
-  for (const name of ["GetMcpTools", "getmcptools", "Task", "CallMcpTool", "Agent", "Skill", "AskUserQuestion"]) {
-    assert.equal(isHostMetaTool(name), true, name);
-  }
-});
-
-test("isHostMetaTool is false for client file tools and non-exact user-defined names", () => {
-  for (const name of ["Read", "Bash", "my_get_mcp_tools"]) {
-    assert.equal(isHostMetaTool(name), false, name);
-  }
-});
-
-test("filterHostMetaTools keeps Read and drops GetMcpTools and Task", () => {
-  const filtered = filterHostMetaTools([readTool, getMcpTools, taskTool]);
-  assert.deepEqual(filtered.map((tool) => tool.name), ["Read"]);
-});
-
-test("createSdkCustomTools registers only Read when GetMcpTools is also present", () => {
-  const customTools = createSdkCustomTools([getMcpTools, readTool], () => {});
+test("createSdkCustomTools registers client-declared host meta tools (Task / GetMcpTools)", () => {
+  const customTools = createSdkCustomTools(clientTools, () => {});
   assert.ok(customTools);
-  assert.deepEqual(Object.keys(customTools), ["Read"]);
+  assert.deepEqual(Object.keys(customTools), ["GetMcpTools", "Task", "Read"]);
+});
+
+test("createSdkCustomTools hold:true registers Task and drives its execute through onHold", async () => {
+  let held = false;
+  const release: Array<(value: unknown) => void> = [];
+  const customTools = createSdkCustomTools([taskTool, readTool], () => {}, {
+    hold: true,
+    onHold: (_id, resolve) => {
+      held = true;
+      release.push(resolve);
+    }
+  });
+  assert.ok(customTools);
+  const pending = customTools.Task!.execute({ prompt: "review the diff" }, { toolCallId: "call_task_1" });
+  assert.equal(held, true, "Task execute 必须经 onHold 挂起");
+  release[0]({ content: [{ type: "text", text: "subagent done" }] });
+  const result = (await pending) as { content: Array<{ text: string }> };
+  assert.equal(result.content[0].text, "subagent done");
 });
 
 const STATELESS_EXECUTE_COPY =
@@ -67,42 +74,36 @@ test("createSdkCustomTools hold:false returns the exact fake-success copy synchr
   assert.deepEqual(twoArgResult, {
     content: [{ type: "text", text: STATELESS_EXECUTE_COPY }]
   });
-
-  const explicit = createSdkCustomTools([readTool], () => {}, { hold: false });
-  assert.ok(explicit);
-  const explicitResult = explicit.Read.execute({ file_path: "src/index.ts" }, { toolCallId: "call_hold_false" });
-  assert.equal(explicitResult instanceof Promise, false);
-  assert.deepEqual(explicitResult, twoArgResult);
 });
 
-test("createSdkCustomTools hold:true still registers only Read when GetMcpTools is present", () => {
-  const customTools = createSdkCustomTools([getMcpTools, taskTool, readTool], () => {}, {
-    hold: true,
-    onHold: () => {}
-  });
-  assert.ok(customTools);
-  assert.deepEqual(Object.keys(customTools), ["Read"]);
-});
-
-test("matchesClientTool rejects GetMcpTools even when it is in the client tool list", () => {
-  // 清单里带着宿主元工具也不能转发，否则外层会再开 MCP 发现 / 子代理。
+test("matchesClientTool accepts client-declared Task and GetMcpTools", () => {
   assert.equal(
-    matchesClientTool({ id: "call_meta", name: "GetMcpTools", arguments: {} }, clientToolsWithMeta),
-    false
+    matchesClientTool({ id: "call_task", name: "Task", arguments: { prompt: "x" } }, clientTools),
+    true,
+    "客户端声明了 Task 就必须可转发（byok 靠它拉起子代理）"
   );
-});
-
-test("matchesClientTool accepts Read against the same client tool list", () => {
+  assert.equal(
+    matchesClientTool({ id: "call_meta", name: "GetMcpTools", arguments: {} }, clientTools),
+    true
+  );
   assert.equal(
     matchesClientTool(
       { id: "call_read", name: "Read", arguments: { file_path: "src/index.ts" } },
-      clientToolsWithMeta
+      clientTools
     ),
     true
   );
 });
 
-test("matchesClientTool rejects mcp-wrapped GetMcpTools even when it is in the client tool list", () => {
+test("matchesClientTool still rejects tools the client never declared", () => {
+  assert.equal(
+    matchesClientTool({ id: "c", name: "Task", arguments: {} }, [readTool]),
+    false,
+    "未声明的工具名自然匹配不上，无需宿主元名单"
+  );
+});
+
+test("matchesClientTool unwraps mcp-wrapped Task for a client that declared it", () => {
   assert.equal(
     matchesClientTool(
       {
@@ -110,17 +111,29 @@ test("matchesClientTool rejects mcp-wrapped GetMcpTools even when it is in the c
         name: "mcp",
         arguments: {
           providerIdentifier: "custom-user-tools",
-          toolName: "GetMcpTools",
-          args: {}
+          toolName: "Task",
+          args: { prompt: "explore" }
         }
       },
-      [
-        { name: "GetMcpTools", inputSchema: {} },
-        { name: "Read", inputSchema: { type: "object", properties: { file_path: { type: "string" } } } }
-      ]
+      clientTools
     ),
-    false
+    true
   );
+});
+
+test("extractDurableTurn passes Task tool results through as turn increments", () => {
+  // byok 执行完 Task 回传结果：必须作为 tool_results 增量发回上游 agent（挂起的 execute 等着它），
+  // 不得再被宿主元名单剥离成空轮。
+  const turn = extractDurableTurn("anthropic-messages", {
+    max_tokens: 64,
+    messages: [
+      { role: "user", content: "review the changes" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_task_9", name: "Task", input: { prompt: "review" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_task_9", content: "subagent report" }] }
+    ]
+  });
+  assert.equal(turn.kind, "tool_results");
+  assert.deepEqual(turn.toolResults, [{ id: "call_task_9", content: "subagent report" }]);
 });
 
 test("normalizeToolCallForClient still unwraps custom-user-tools MCP calls to Read", () => {
@@ -135,7 +148,7 @@ test("normalizeToolCallForClient still unwraps custom-user-tools MCP calls to Re
           args: { file_path: "src/index.ts" }
         }
       },
-      clientToolsWithMeta
+      clientTools
     ),
     { id: "call_mcp", name: "Read", arguments: { file_path: "src/index.ts" } }
   );

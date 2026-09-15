@@ -89,7 +89,7 @@ test("stripRitualAssistantText leaves earlier answer unchanged", () => {
   assert.equal(stripRitualAssistantText(EARLIER_ANSWER), EARLIER_ANSWER);
 });
 
-test("prepareAnthropicMessages TOOLS/REMINDER keep Read and drop GetMcpTools and Task", () => {
+test("prepareAnthropicMessages TOOLS/REMINDER keep Read, GetMcpTools, and Task", () => {
   const prepared = prepareAnthropicMessages({
     model: "composer-2.5",
     max_tokens: 1024,
@@ -107,8 +107,8 @@ test("prepareAnthropicMessages TOOLS/REMINDER keep Read and drop GetMcpTools and
   const section = toolsAndReminder(prepared.prompt);
   assert.ok(section.includes("TOOLS:"), "prompt must include a TOOLS section");
   assert.ok(section.includes("REMINDER:"), "prompt must include a REMINDER section");
-  assert.ok(!section.includes("GetMcpTools"), "TOOLS/REMINDER must not contain GetMcpTools");
-  assert.ok(!section.includes("Task"), "TOOLS/REMINDER must not contain Task");
+  assert.ok(section.includes("GetMcpTools"), "client-declared GetMcpTools stays in TOOLS (host-meta filter removed)");
+  assert.ok(section.includes("Task"), "client-declared Task stays in TOOLS (byok subagents depend on it)");
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
 });
 
@@ -153,7 +153,7 @@ test("prepareOpenAiChat drops ritual assistant content and keeps user schema men
   assert.ok(prompt.includes(USER_SCHEMA_MESSAGE), "user content mentioning schema must remain");
 });
 
-test("prepareOpenAiChat TOOLS/REMINDER keep Read and drop GetMcpTools and Task", () => {
+test("prepareOpenAiChat TOOLS/REMINDER keep Read, GetMcpTools, and Task", () => {
   const prepared = prepareOpenAiChat({
     model: "composer-2.5",
     messages: [{ role: "user", content: "Hello" }],
@@ -165,11 +165,11 @@ test("prepareOpenAiChat TOOLS/REMINDER keep Read and drop GetMcpTools and Task",
   });
   const section = toolsAndReminder(prepared.prompt);
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
-  assert.ok(!section.includes("GetMcpTools"), "TOOLS/REMINDER must not contain GetMcpTools");
-  assert.ok(!section.includes("Task"), "TOOLS/REMINDER must not contain Task");
+  assert.ok(section.includes("GetMcpTools"), "client-declared GetMcpTools stays");
+  assert.ok(section.includes("Task"), "client-declared Task stays");
 });
 
-test("prepareOpenAiChat drops host-meta tool_calls and their tool results from history", () => {
+test("prepareOpenAiChat keeps host-meta tool_calls and their tool results in history", () => {
   const prepared = prepareOpenAiChat({
     model: "composer-2.5",
     messages: [
@@ -188,13 +188,13 @@ test("prepareOpenAiChat drops host-meta tool_calls and their tool results from h
     tools: [READ_CHAT]
   });
   const prompt = prepared.prompt;
-  assert.ok(!prompt.includes("GetMcpTools"), "host-meta tool_calls must not be replayed");
-  assert.ok(!prompt.includes("schema-pack"), "host-meta tool results must not be replayed");
+  assert.ok(prompt.includes("GetMcpTools"), "host-meta tool_call now replays faithfully (filter removed)");
+  assert.ok(prompt.includes("schema-pack"), "host-meta tool result now replays faithfully");
   assert.ok(prompt.includes("Read"), "client Read tool_call stays");
   assert.ok(prompt.includes("file body"), "Read tool result stays");
 });
 
-test("prepareOpenAiResponses TOOLS/REMINDER keep Read and drop GetMcpTools and Task", () => {
+test("prepareOpenAiResponses TOOLS/REMINDER keep Read, GetMcpTools, and Task", () => {
   const prepared = prepareOpenAiResponses({
     model: "composer-2.5",
     input: "Hello",
@@ -206,11 +206,11 @@ test("prepareOpenAiResponses TOOLS/REMINDER keep Read and drop GetMcpTools and T
   });
   const section = toolsAndReminder(prepared.prompt);
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
-  assert.ok(!section.includes("GetMcpTools"), "TOOLS/REMINDER must not contain GetMcpTools");
-  assert.ok(!section.includes("Task"), "TOOLS/REMINDER must not contain Task");
+  assert.ok(section.includes("GetMcpTools"), "client-declared GetMcpTools stays");
+  assert.ok(section.includes("Task"), "client-declared Task stays");
 });
 
-test("prepareOpenAiResponses drops ritual assistant input and host-meta function_call items", () => {
+test("prepareOpenAiResponses drops ritual assistant input but keeps host-meta function_call items", () => {
   const prepared = prepareOpenAiResponses({
     model: "composer-2.5",
     input: [
@@ -226,8 +226,8 @@ test("prepareOpenAiResponses drops ritual assistant input and host-meta function
   });
   const prompt = prepared.prompt;
   assert.ok(!prompt.includes(RITUAL_HISTORY_SENTENCE), "ritual assistant input must not enter the prompt");
-  assert.ok(!prompt.includes("GetMcpTools"), "host-meta function_call must not be replayed");
-  assert.ok(!prompt.includes("schema-pack"), "host-meta function_call_output must not be replayed");
+  assert.ok(prompt.includes("GetMcpTools"), "host-meta function_call now replays faithfully");
+  assert.ok(prompt.includes("schema-pack"), "host-meta function_call_output now replays faithfully");
   assert.ok(prompt.includes(USER_SCHEMA_MESSAGE), "user schema mention stays");
   assert.ok(prompt.includes("Continue"), "user Continue stays");
   assert.ok(prompt.includes("Read"), "client Read function_call stays");
@@ -253,7 +253,7 @@ test("prepareOpenAiResponses sanitizes previous_response dump without mutating t
   const prompt = prepared.prompt;
   assert.ok(prompt.includes("PREVIOUS_RESPONSE:"), "previous snapshot still enters the prompt");
   assert.ok(!prompt.includes(RITUAL_HISTORY_SENTENCE), "ritual output_text must not enter PREVIOUS_RESPONSE dump");
-  assert.ok(!prompt.includes("GetMcpTools"), "host-meta tools/calls must not enter PREVIOUS_RESPONSE dump");
+  assert.ok(prompt.includes("GetMcpTools"), "host-meta tools/calls now stay in the dump (filter removed)");
   assert.ok(!prompt.includes("align schema internally"), "reasoning must not enter PREVIOUS_RESPONSE dump");
   assert.ok(prompt.includes(EARLIER_ANSWER), "regular assistant output stays in the dump");
   assert.ok(prompt.includes("Read"), "client Read tool stays in the dump");
@@ -274,7 +274,7 @@ test("a resent instructions is this turn's client system, not the previous turn'
   assert.ok(!prepared.prompt.includes(STALE_INSTRUCTIONS), prepared.prompt);
 });
 
-test("prepareAnthropicMessages drops host-meta tool_use and matching tool_result from history", () => {
+test("prepareAnthropicMessages keeps host-meta tool_use and matching tool_result in history", () => {
   const prepared = prepareAnthropicMessages({
     model: "composer-2.5",
     max_tokens: 1024,
@@ -298,8 +298,8 @@ test("prepareAnthropicMessages drops host-meta tool_use and matching tool_result
     ]
   });
   const prompt = prepared.prompt;
-  assert.ok(!prompt.includes("GetMcpTools"), "host-meta tool_use must not be replayed");
-  assert.ok(!prompt.includes("schema-pack"), "host-meta tool_result must not be replayed");
+  assert.ok(prompt.includes("GetMcpTools"), "host-meta tool_use now replays faithfully");
+  assert.ok(prompt.includes("schema-pack"), "host-meta tool_result now replays faithfully");
   assert.ok(prompt.includes("Read"), "client Read tool_use stays");
   assert.ok(prompt.includes("file body"), "Read tool_result stays");
 });
@@ -333,7 +333,7 @@ test("prepareAnthropicMessages ritual-only assistant turn does not invent ASSIST
   assert.ok(prompt.includes("Continue"), "user Continue must stay in the prompt");
 });
 
-test("prepareAnthropicMessages user-only GetMcpTools tool_result does not invent USER: [empty] or replay schema-pack", () => {
+test("prepareAnthropicMessages user-only GetMcpTools tool_result renders without inventing USER: [empty]", () => {
   const prepared = prepareAnthropicMessages({
     model: "composer-2.5",
     max_tokens: 1024,
@@ -349,11 +349,11 @@ test("prepareAnthropicMessages user-only GetMcpTools tool_result does not invent
     ]
   });
   const prompt = prepared.prompt;
-  assert.ok(!prompt.includes("USER: [empty]"), "meta-only user turn must not invent USER: [empty]");
-  assert.ok(!prompt.includes("schema-pack"), "host-meta tool_result must not be replayed");
+  assert.ok(!prompt.includes("USER: [empty]"), "tool-result-only user turn must not invent USER: [empty]");
+  assert.ok(prompt.includes("schema-pack"), "host-meta tool_result now replays faithfully");
 });
 
-test("prepareOpenAiResponses drops orphan previous GetMcpTools function_call_output from current input", () => {
+test("prepareOpenAiResponses keeps orphan previous GetMcpTools function_call_output in current input", () => {
   const prepared = prepareOpenAiResponses(
     {
       model: "composer-2.5",
@@ -366,7 +366,7 @@ test("prepareOpenAiResponses drops orphan previous GetMcpTools function_call_out
       inputItems: []
     }
   );
-  assert.ok(!prepared.prompt.includes("schema-pack"), "orphan host-meta function_call_output must not enter the prompt");
+  assert.ok(prepared.prompt.includes("schema-pack"), "orphan host-meta function_call_output now enters the prompt (filter removed)");
 });
 
 test("prepareOpenAiResponses skips reasoning items in input", () => {
@@ -395,7 +395,7 @@ test("prepareOpenAiResponses strips ritual assistant content with type text", ()
   assert.ok(prompt.includes(USER_SCHEMA_MESSAGE), "user schema mention stays");
 });
 
-test("prepareOpenAiChat drops host-meta tool result even when it appears before the matching tool_calls", () => {
+test("prepareOpenAiChat keeps host-meta tool result even when it appears before the matching tool_calls", () => {
   const prepared = prepareOpenAiChat({
     model: "composer-2.5",
     messages: [
@@ -412,7 +412,7 @@ test("prepareOpenAiChat drops host-meta tool result even when it appears before 
     tools: [READ_CHAT]
   });
   const prompt = prepared.prompt;
-  assert.ok(!prompt.includes("schema-pack"), "host-meta tool result before tool_calls must not be replayed");
-  assert.ok(!prompt.includes("GetMcpTools"), "host-meta tool_calls must not be replayed");
+  assert.ok(prompt.includes("schema-pack"), "host-meta tool result now replays regardless of ordering");
+  assert.ok(prompt.includes("GetMcpTools"), "host-meta tool_calls now replay");
   assert.ok(prompt.includes("Hello"), "user Hello stays");
 });

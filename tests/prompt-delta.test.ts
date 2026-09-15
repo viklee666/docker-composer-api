@@ -180,7 +180,7 @@ const ROWS: Row[] = [
     toolResults: [{ id: "call_weather", content: "via content field" }]
   },
   {
-    name: "6. GetMcpTools result discarded, not in toolResults",
+    name: "6. GetMcpTools result passes through (host-meta filter removed)",
     protocol: "openai-chat",
     body: {
       messages: [
@@ -199,13 +199,10 @@ const ROWS: Row[] = [
       tools: [GET_MCP_CHAT, READ_CHAT]
     },
     kind: "tool_results",
-    toolResults: [{ id: "call_read", content: "file body" }],
-    assertExtra: (turn) => {
-      assert.equal(
-        turn.toolResults?.some((item) => item.content.includes("schema-pack") || item.id === "call_meta"),
-        false
-      );
-    }
+    toolResults: [
+      { id: "call_meta", content: "schema-pack" },
+      { id: "call_read", content: "file body" }
+    ]
   },
   {
     name: "7. System text change vs slotHints → incompatible",
@@ -332,7 +329,7 @@ for (const row of ROWS) {
   });
 }
 
-test("Anthropic GetMcpTools tool_result is discarded", () => {
+test("Anthropic GetMcpTools tool_result passes through (host-meta filter removed)", () => {
   const turn = extractDurableTurn("anthropic-messages", {
     max_tokens: 1024,
     messages: [
@@ -355,10 +352,14 @@ test("Anthropic GetMcpTools tool_result is discarded", () => {
     tools: [READ_ANTHROPIC]
   });
   assert.equal(turn.kind, "tool_results");
-  assert.deepEqual(turn.toolResults, [{ id: "call_read", content: "file body" }]);
+  // 宿主元过滤已拆除：客户端声明并执行了的元工具结果原样回流（上游 agent 在等它）。
+  assert.deepEqual(turn.toolResults, [
+    { id: "call_meta", content: "schema-pack" },
+    { id: "call_read", content: "file body" }
+  ]);
 });
 
-test("Responses previous GetMcpTools function_call_output is discarded", () => {
+test("Responses previous GetMcpTools function_call_output passes through", () => {
   const turn = extractDurableTurn(
     "openai-responses",
     {
@@ -378,19 +379,27 @@ test("Responses previous GetMcpTools function_call_output is discarded", () => {
     }
   );
   assert.equal(turn.kind, "tool_results");
-  assert.deepEqual(turn.toolResults, [{ id: "call_read", content: "file body" }]);
+  assert.deepEqual(turn.toolResults, [
+    { id: "call_meta", content: "schema-pack" },
+    { id: "call_read", content: "file body" }
+  ]);
 });
 
-test("toolsFingerprint ignores GetMcpTools and is stable under reorder", () => {
+test("toolsFingerprint includes GetMcpTools and reordering does not change it", () => {
   const withMeta = extractDurableTurn("openai-chat", {
     messages: [{ role: "user", content: "hi" }],
     tools: [GET_MCP_CHAT, READ_CHAT, LOOKUP_CHAT]
   });
   const reordered = extractDurableTurn("openai-chat", {
     messages: [{ role: "user", content: "hi" }],
+    tools: [LOOKUP_CHAT, READ_CHAT, GET_MCP_CHAT]
+  });
+  assert.equal(withMeta.toolsFingerprint, reordered.toolsFingerprint, "排序稳定性不依赖元过滤");
+  const withoutMeta = extractDurableTurn("openai-chat", {
+    messages: [{ role: "user", content: "hi" }],
     tools: [LOOKUP_CHAT, READ_CHAT]
   });
-  assert.equal(withMeta.toolsFingerprint, reordered.toolsFingerprint);
+  assert.notEqual(withMeta.toolsFingerprint, withoutMeta.toolsFingerprint, "声明了 GetMcpTools 就要进指纹");
   assert.equal(withMeta.kind, "new_user");
 });
 
@@ -490,7 +499,7 @@ test("fingerprintTools sorts by name and includes inputSchema", () => {
   assert.notEqual(a, c);
 });
 
-test("GetMcpTools-only trailing results become empty when lastUserText matches", () => {
+test("GetMcpTools-only trailing results stay tool_results (host-meta filter removed)", () => {
   const first = extractDurableTurn("openai-chat", {
     messages: [{ role: "user", content: "Hello" }]
   });
@@ -513,8 +522,8 @@ test("GetMcpTools-only trailing results become empty when lastUserText matches",
       toolsFingerprint: first.toolsFingerprint
     }
   );
-  assert.equal(second.kind, "empty");
-  assert.equal(second.toolResults, undefined);
+  assert.equal(second.kind, "tool_results");
+  assert.deepEqual(second.toolResults, [{ id: "call_meta", content: "schema-pack" }]);
 });
 
 test("gateway SYSTEM_PROMPT append is in durable systemText and fingerprint", () => {

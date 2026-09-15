@@ -9,7 +9,6 @@ import {
 } from "./model-params.js";
 import { normalizeModel } from "./models.js";
 import { resolveSystemText, systemPromptActive } from "./system-prompt.js";
-import { filterHostMetaTools, isHostMetaTool } from "./tool-compat.js";
 import type { AgentMode, AuthContext, CursorRunRequest, CursorRunResult, GatewayImage, GatewayTool, GatewayToolCall, KeyUsageRef, RequestUsage, SystemPromptSettings } from "./types.js";
 
 export interface PreparedRequest {
@@ -94,18 +93,14 @@ export function prepareOpenAiChat(body: unknown, options?: PrepareOptions): Prep
   const clientSystemParts: string[] = [];
   transcript.push("", "Conversation:");
   const images: GatewayImage[] = [];
-  // 先扫完全部 tool_calls / 旧版 function_call，result 出现在 call 前面时也能丢掉元工具输出。
-  const metaCallIds = collectHostMetaCallIds(messages);
   for (const message of messages) {
     const item = asRecord(message, "messages[]");
     const role = stringField(item, "role", "user");
     if (role === "tool" || role === "function") {
       const name = typeof item.name === "string" ? item.name.trim() : "";
-      if (name && isHostMetaTool(name)) continue;
       const callId = typeof item.tool_call_id === "string" && item.tool_call_id.trim()
         ? item.tool_call_id.trim()
         : name || "unknown";
-      if (metaCallIds.has(callId)) continue;
       const content = contentToTextAndImages(item.content, images, false);
       transcript.push(`TOOL RESULT (${callId}): ${content || "[empty]"}`);
       continue;
@@ -117,14 +112,10 @@ export function prepareOpenAiChat(body: unknown, options?: PrepareOptions): Prep
       continue;
     }
     const calls = Array.isArray(item.tool_calls) ? item.tool_calls : item.function_call !== undefined && item.function_call !== null ? [item.function_call] : [];
-    const kept = calls.filter((call) => {
-      const name = chatToolCallName(call);
-      return !name || !isHostMetaTool(name);
-    });
-    // strip 后既无正文也无保留工具则整轮不写，避免发明 [empty] 回灌。
-    if (!content && !kept.length) continue;
+    // strip 后既无正文也无工具调用则整轮不写，避免发明 [empty] 回灌。
+    if (!content && !calls.length) continue;
     if (content) transcript.push(`${role.toUpperCase()}: ${content}`);
-    if (kept.length) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(kept)}`);
+    if (calls.length) transcript.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(calls)}`);
   }
   if (hoistSystem) {
     // 多条 system/developer 之间也按空行分隔，与 append 的拼接口径一致。
@@ -158,13 +149,8 @@ export function prepareOpenAiResponses(body: unknown, previous?: { response?: Re
   }
   transcript.push("", "INPUT:");
   const inputItems = normalizedResponseInput(record.input);
-  // previous.output 里的元工具 call_id 要能对上本轮只带 function_call_output 的续请求。
-  const priorMetaIds = collectHostMetaCallIds([
-    ...(Array.isArray(previous?.response?.output) ? previous.response.output : []),
-    ...(previous?.inputItems ?? [])
-  ]);
   const hoisted: string[] = [];
-  transcript.push(responseInputToTextAndImages(record.input, images, priorMetaIds, hoistSystem ? hoisted : undefined));
+  transcript.push(responseInputToTextAndImages(record.input, images, hoistSystem ? hoisted : undefined));
   // 顺序即客户端书写顺序：instructions 在前、input[] 里的 system 在后，append 才能保证网关正文收尾。
   const clientSystem = [instructionsText(record.instructions).trim(), ...hoisted].filter(Boolean).join("\n\n");
   // 网关正文注入这里，回显仍用未加工的 rawInstructions。
@@ -208,11 +194,10 @@ export function prepareAnthropicMessages(body: unknown, options?: PrepareAnthrop
   const system = resolveSystemText(anthropicSystemText(record.system, images), options?.systemPrompt);
   if (system) transcript.push("", `SYSTEM:\n${system}`);
   transcript.push("", "Conversation:");
-  const metaToolUseIds = collectHostMetaCallIds(messages);
   for (const message of messages) {
     const item = asRecord(message, "messages[]");
     const role = stringField(item, "role", "user");
-    const text = anthropicContentToTextAndImages(item.content, images, role === "assistant", metaToolUseIds);
+    const text = anthropicContentToTextAndImages(item.content, images, role === "assistant");
     if (!text) continue;
     transcript.push(`${role.toUpperCase()}: ${text}`);
   }
@@ -859,13 +844,13 @@ function appendToolReminder(transcript: string[], tools: GatewayTool[]): void {
 export function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
-  return filterHostMetaTools(value.flatMap((item) => {
+  return value.flatMap((item) => {
     const record = asOptionalRecord(item);
     const fn = asOptionalRecord(record?.function);
     const name = typeof fn?.name === "string" ? fn.name.trim() : "";
     if (!name) return [];
     return [{ name, description: typeof fn?.description === "string" ? fn.description : undefined, inputSchema: fn?.parameters }];
-  }));
+  });
 }
 
 /**
@@ -876,7 +861,7 @@ export function parseOpenAiTools(value: unknown, toolChoice: unknown): GatewayTo
 export function parseResponsesTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (toolChoice === "none") return [];
   if (!Array.isArray(value)) return [];
-  return filterHostMetaTools(value.flatMap((item) => {
+  return value.flatMap((item) => {
     const record = asOptionalRecord(item);
     if (!record) return [];
     // 先按 type 分流：内置工具（web_search 等）即使带 function 字段也不能当成客户端函数工具。
@@ -896,7 +881,7 @@ export function parseResponsesTools(value: unknown, toolChoice: unknown): Gatewa
     }
     logOnce("responses-unnamed-tool", "[responses] a function tool without a usable name was ignored.");
     return [];
-  }));
+  });
 }
 
 /**
@@ -946,12 +931,12 @@ function logOnce(key: string, message: string): void {
 export function parseAnthropicTools(value: unknown, toolChoice: unknown): GatewayTool[] {
   if (asOptionalRecord(toolChoice)?.type === "none") return [];
   if (!Array.isArray(value)) return [];
-  return filterHostMetaTools(value.flatMap((item) => {
+  return value.flatMap((item) => {
     const record = asOptionalRecord(item);
     const name = typeof record?.name === "string" ? record.name.trim() : "";
     if (!name) return [];
     return [{ name, description: typeof record?.description === "string" ? record.description : undefined, inputSchema: record?.input_schema }];
-  }));
+  });
 }
 
 /** 历史短仪式句（拉齐 schema / GetMcpTools 等）不进合成 prompt；只判整段且 ≤200 字，避免误删讨论 schema 的长回复。 */
@@ -979,49 +964,6 @@ function chatToolCallId(value: unknown): string {
   return typeof record?.id === "string" ? record.id.trim() : "";
 }
 
-/** 从 function_call / tool_use 收集宿主元工具 call_id，让另包或后到的 function_call_output 也能丢掉。 */
-export function collectHostMetaCallIds(items: unknown[]): Set<string> {
-  const ids = new Set<string>();
-  walkHostMetaCallIds(items, ids);
-  return ids;
-}
-
-function walkHostMetaCallIds(value: unknown, ids: Set<string>): void {
-  if (Array.isArray(value)) {
-    for (const item of value) walkHostMetaCallIds(item, ids);
-    return;
-  }
-  const record = asOptionalRecord(value);
-  if (!record) return;
-  if (record.type === "function_call" || record.type === "tool_use") {
-    const name = typeof record.name === "string" ? record.name.trim() : "";
-    if (name && isHostMetaTool(name)) {
-      if (typeof record.call_id === "string" && record.call_id.trim()) ids.add(record.call_id.trim());
-      if (typeof record.id === "string" && record.id.trim()) ids.add(record.id.trim());
-    }
-  }
-  if (Array.isArray(record.tool_calls)) {
-    for (const call of record.tool_calls) {
-      const name = chatToolCallName(call);
-      const id = chatToolCallId(call);
-      if (name && isHostMetaTool(name) && id) ids.add(id);
-    }
-  }
-  const fc = asOptionalRecord(record.function_call);
-  if (fc) {
-    const name = typeof fc.name === "string" ? fc.name.trim() : "";
-    if (name && isHostMetaTool(name) && typeof fc.id === "string" && fc.id.trim()) ids.add(fc.id.trim());
-  }
-  if (record.role === "function") {
-    const name = typeof record.name === "string" ? record.name.trim() : "";
-    if (name && isHostMetaTool(name)) {
-      ids.add(name);
-      if (typeof record.tool_call_id === "string" && record.tool_call_id.trim()) ids.add(record.tool_call_id.trim());
-    }
-  }
-  if (Array.isArray(record.content)) walkHostMetaCallIds(record.content, ids);
-}
-
 /** 只清洗写入合成 prompt 的副本，不改客户端取回的已存 Response。 */
 function sanitizePreviousResponseForPrompt(response: Record<string, unknown>): Record<string, unknown> {
   const copy = JSON.parse(JSON.stringify(response)) as Record<string, unknown>;
@@ -1031,22 +973,11 @@ function sanitizePreviousResponseForPrompt(response: Record<string, unknown>): R
    * 系统级指令并存甚至打架——本轮该守什么规矩，只由本轮请求决定。
    */
   delete copy.instructions;
-  if (Array.isArray(copy.tools)) {
-    copy.tools = copy.tools.filter((item) => {
-      const record = asOptionalRecord(item);
-      const nested = asOptionalRecord(record?.function);
-      const name = typeof record?.name === "string" ? record.name : typeof nested?.name === "string" ? nested.name : "";
-      return !name || !isHostMetaTool(name);
-    });
-  }
   if (!Array.isArray(copy.output)) return copy;
-  const metaCallIds = collectHostMetaCallIds(copy.output);
   copy.output = copy.output.flatMap((item) => {
     const record = asOptionalRecord(item);
     if (!record) return [];
     if (record.type === "reasoning") return [];
-    if (record.type === "function_call" && typeof record.name === "string" && isHostMetaTool(record.name)) return [];
-    if ((record.type === "function_call_output" || record.type === "tool_result") && typeof record.call_id === "string" && metaCallIds.has(record.call_id.trim())) return [];
     if (record.type === "message" && typeof record.content === "string") {
       const text = stripRitualAssistantText(record.content);
       if (!text) return [];
@@ -1101,11 +1032,9 @@ export function contentToTextAndImages(value: unknown, images: GatewayImage[], s
  * @param hoistedSystem 传数组即表示「system/developer 条目改由 INSTRUCTIONS 块承载」：
  *   正文收进该数组、不写进 INPUT:，图片副作用照常收集。不传则一切就地渲染（未注入时的原行为）。
  */
-function responseInputToTextAndImages(value: unknown, images: GatewayImage[], priorMetaIds?: ReadonlySet<string>, hoistedSystem?: string[]): string {
+function responseInputToTextAndImages(value: unknown, images: GatewayImage[], hoistedSystem?: string[]): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
-  const metaCallIds = new Set(priorMetaIds);
-  for (const id of collectHostMetaCallIds(value)) metaCallIds.add(id);
   const parts: string[] = [];
   for (const item of value) {
     const record = asOptionalRecord(item);
@@ -1130,12 +1059,9 @@ function responseInputToTextAndImages(value: unknown, images: GatewayImage[], pr
       if (data) images.push({ type: "image", source: "base64", data, mediaType: typeof record.media_type === "string" ? record.media_type : undefined });
       parts.push("[image:attached]");
     } else if (record.type === "function_call") {
-      const name = typeof record.name === "string" ? record.name : "";
-      if (name && isHostMetaTool(name)) continue;
       parts.push(JSON.stringify(record));
     } else if (record.type === "function_call_output" || record.type === "tool_result") {
       const callId = stringField(record, "call_id", "unknown");
-      if (metaCallIds.has(callId)) continue;
       // output 已是字符串时直接用：再 JSON.stringify 一次会把工具结果变成带转义的引号串。
       const raw = record.output ?? record.content ?? "";
       parts.push(`TOOL RESULT (${callId}): ${typeof raw === "string" ? raw : JSON.stringify(raw)}`);
@@ -1179,7 +1105,7 @@ function anthropicSystemText(value: unknown, images: GatewayImage[]): string {
   return value === undefined ? "" : JSON.stringify(value);
 }
 
-function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false, metaToolUseIds?: Set<string>): string {
+function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[], stripRitual = false): string {
   if (typeof value === "string") return stripRitual ? stripRitualAssistantText(value) : value;
   if (!Array.isArray(value)) return value === undefined ? "" : JSON.stringify(value);
   const parts: string[] = [];
@@ -1205,16 +1131,9 @@ function anthropicContentToTextAndImages(value: unknown, images: GatewayImage[],
     } else if (record.type === "thinking" || record.type === "redacted_thinking") {
       // 客户端回传的历史思考块（含网关的占位签名）不进入合成 prompt：纯内部推理，原样注入只会污染提示词、浪费 token。
     } else if (record.type === "tool_use") {
-      const name = typeof record.name === "string" ? record.name : "";
-      const id = typeof record.id === "string" ? record.id : "";
-      if (name && isHostMetaTool(name)) {
-        if (id && metaToolUseIds) metaToolUseIds.add(id);
-        continue;
-      }
       parts.push(`ASSISTANT TOOL_USE: ${JSON.stringify(record)}`);
     } else if (record.type === "tool_result") {
       const toolUseId = stringField(record, "tool_use_id", "unknown");
-      if (metaToolUseIds?.has(toolUseId)) continue;
       parts.push(`TOOL RESULT (${toolUseId}): ${JSON.stringify(record.content ?? "")}`);
     } else if (record.type === "document") {
       throw new ApiError(
