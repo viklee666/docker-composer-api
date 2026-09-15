@@ -105,6 +105,8 @@ export interface DebugSnapshot {
   };
   durable?: {
     sessionId?: string;
+    /** 身份瀑布命中层级（header / body-field / derived-L3 / none）：核对内容推导碰撞用。 */
+    identitySource?: string;
     reuseDurableAgent?: boolean;
     turnKind?: string;
     turnUserText?: string;

@@ -100,6 +100,12 @@ export interface GatewayConfig {
    * 关掉即恢复旧行为：占位符正文仍按 `new_user` 发给上游。
    */
   dropEmptyDurableTurns?: boolean;
+  /**
+   * 严格模式：内容推导身份（derived-L3，无显式会话 id 的客户端）不进 durable Hub，一律
+   * stateless。默认关。开着时这类客户端零 durable 缓存但零串扰；带显式 id 的客户端不受影响。
+   * env: DURABLE_REQUIRE_EXPLICIT_ID。
+   */
+  durableRequireExplicitId?: boolean;
 
   /* ------------------------------- Cursor Bot 路线（aiserver.v1.InferenceService/Stream） */
 
@@ -424,6 +430,14 @@ export interface CursorRunRequest {
    * durable 路径的本轮增量。由 server 从入站 body 算出后传入；rawBody 本身不进 runner。
    */
   durableTurn?: DurableTurn;
+  /**
+   * 会话身份的推导层级（server noteDurableIdentity 产出）。`derived-L3` = 纯内容推导
+   * （客户端没带任何显式会话 id），没有会话边界保证：同仓库 + 同模板 prompt 的并发会话
+   * 会推导出同一个 Hub 键。durable 的两个防串扰护栏（新鲜会话 / tool_results 零交集）
+   * 只对这一层身份生效——显式 id（header / body-field）的会话不可能碰撞，不需要护栏
+   * 兜底，护栏反而会误伤只发增量的合法有状态客户端。
+   */
+  identitySource?: "header" | "body-field" | "derived-L3" | "none";
   /**
    * 仅本请求强制走 stateless（跳过 Hub、旧 resume 的 getSession/saveSession，create+全文+cancel+dispose）。
    * 不改进程级 kill switch。Admin 联通性测试使用，避免粘到用户会话或旧 agent。

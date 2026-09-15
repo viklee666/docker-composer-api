@@ -10,6 +10,7 @@ import {
   createSessionSlot,
   durableSlotReplaceReason,
   inboundAssistantTextMismatch,
+  inboundFreshSessionOnDeliveredSlot,
   markTurnDelivered,
   recordAssistantDigest,
   recordIssuedToolCalls,
@@ -406,6 +407,36 @@ export class CursorSdkRunner implements CursorRunner {
     };
 
     if (turn?.kind === "tool_results") {
+      // tool_results 零交集护栏（只对 derived-L3 内容推导身份生效）：全部结果 id 与本槽
+      // 发过的 tool_call（含 pending execute）零交集 = 另一个会话的工具结果撞进了同一个
+      // Hub 键。必须先于 resolvePending / abortHung 检查：外来结果既不该 resolve 任何东西，
+      // 更不能 abort 本槽挂起的 execute（那可能是对方会话正在等待的工具轮）。
+      // 显式 id 的会话不会碰撞；同一会话内客户端发错 id 属于客户端 bug，走既有
+      // unmatched-abort 路径处理（下同），本护栏不掺和。
+      if (
+        input.identitySource === "derived-L3"
+        && toolResultsForeignToSlot(liveSlot, turn.toolResults ?? [])
+      ) {
+        console.error(`[durable] foreign tool_results; stateless fallback session=${sessionId.slice(0, 12)}`);
+        recordDurableDecision({
+          decision: "fallback",
+          reason: "foreign_tool_results",
+          session: sessionId.slice(0, 12),
+          kind: turn.kind,
+          liveSessions: hub.size
+        });
+        try {
+          input.debugRef?.noteUpstreamTurn("sdk", {
+            kind: turn.kind,
+            blocked: "foreign_tool_results",
+            remark: "none of the inbound tool result ids match tool calls issued by this slot's agent"
+          });
+        } catch {
+          // 观测路径不得影响主流程。
+        }
+        yield* this.streamStatelessFallback(input, signal);
+        return;
+      }
       let resolvedAny = false;
       const consumedExecutes = this.durableConsumedExecutes.get(sessionId) ?? new Set<string>();
       const newlyResolved: string[] = [];
@@ -586,6 +617,39 @@ export class CursorSdkRunner implements CursorRunner {
       && inboundAssistantTextMismatch(slot, turn?.assistantDigest)
     ) {
       console.error(`[durable] history mismatch; stateless fallback session=${sessionId.slice(0, 12)}`);
+      return undefined;
+    }
+    // 新鲜会话护栏（只对 derived-L3 内容推导身份生效）：入站 transcript 零 assistant 轮
+    // （digest 缺号）而槽已交付过输出——derived-L3 没有会话边界，同仓库并发的新会话会撞进
+    // 同一个槽；正常续聊总会带着之前的 assistant 回复，零 assistant 只可能是会话 B 的第一轮。
+    // 显式 id（header / body-field）的会话不可能碰撞，不进本护栏：只发增量的合法有状态客户端
+    // （协议不回传 assistant 轮）会被误伤。Responses 协议豁免：其历史走 previous_response_id、
+    // input 恒缺 assistant 文本（digest 天然缺号），且续聊身份靠落库 seed 继承、也会被归到
+    // derived-L3 档，不豁免会把每轮 Responses 续聊都打回 stateless。
+    if (
+      slot
+      && turn?.kind === "new_user"
+      && input.identitySource === "derived-L3"
+      && input.protocol !== "openai-responses"
+      && inboundFreshSessionOnDeliveredSlot(slot, turn?.assistantDigest)
+    ) {
+      console.error(`[durable] fresh session on delivered slot; stateless fallback session=${sessionId.slice(0, 12)}`);
+      recordDurableDecision({
+        decision: "fallback",
+        reason: "fresh_session",
+        session: sessionId.slice(0, 12),
+        kind: turn?.kind,
+        liveSessions: hub.size
+      });
+      try {
+        input.debugRef?.noteUpstreamTurn("sdk", {
+          kind: turn.kind,
+          blocked: "fresh_session",
+          remark: "inbound transcript has no assistant turn while the slot already delivered output to another client"
+        });
+      } catch {
+        // 观测路径不得影响主流程。
+      }
       return undefined;
     }
     const replaceReason = durableSlotReplaceReason(slot, {
@@ -2339,6 +2403,36 @@ function issuedIdsWithAliases(slot: SessionSlot, toolCalls: GatewayToolCall[]): 
     rememberCallAlias(slot, toolCall.id, responseCallIds(toolCall).callId);
   }
   return ids;
+}
+
+/**
+ * tool_results 零交集护栏（纯函数）：本轮全部工具结果 id 与槽里已发过的 tool_call id
+ * （含 Responses / Chat 别名归一）零交集 = 这批结果是**另一个会话的 agent** 发起的调用，
+ * 不是本槽的续聊。正常路径都有交集：path A（held execute，id 在 pending）；path B
+ * （上一轮已交付的 tool_call，id 在 issued）。零交集时调用方必须退 stateless，
+ * 绝不能 abort 本槽挂起的 execute（那是对方会话正在等待的工具轮）再 send 进来。
+ */
+export function toolResultsForeignToSlot(
+  slot: SessionSlot,
+  toolResults: Array<{ id: string }>
+): boolean {
+  if (!toolResults.length) return false;
+  // 两侧都剥掉 call_ 前缀后比对（与 canonicalHoldId 的 responsesCallId 口径同源）：
+  // Responses 会把 execute id 重写成 call_ 别名、Chat/Anthropic 原样回显，
+  // 裸后缀是唯一稳定可比的形态。
+  const known = new Set<string>();
+  const addKnown = (id: string): void => {
+    const suffix = id.trim().replace(/^call_/, "");
+    if (suffix) known.add(suffix);
+  };
+  for (const id of slot.issuedToolCallIds ?? []) addKnown(id);
+  for (const id of slot.pending.keys()) addKnown(id);
+  if (!known.size) return false;
+  return toolResults.every((result) => {
+    if (!result.id) return true;
+    const suffix = result.id.trim().replace(/^call_/, "");
+    return !suffix || !known.has(suffix);
+  });
 }
 
 function pendingCapturedToolCalls(captured: GatewayToolCall[], emitted: GatewayToolCall[]): GatewayToolCall[] {

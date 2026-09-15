@@ -64,6 +64,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     systemPrompt: optionalString(env.SYSTEM_PROMPT),
     // 默认开：Cursor 空轮次（(no content) 占位）不再打到上游。对照需要关时 .env 写 false。
     dropEmptyDurableTurns: booleanValue(env.DROP_EMPTY_DURABLE_TURNS, true),
+    /**
+     * 严格模式：内容推导身份（derived-L3）不进 durable Hub，一律 stateless。
+     * 默认关（推导身份照常复用槽）。无显式会话 id 的客户端（如 cursor-byok）没有会话边界
+     * 保证，同仓库 + 同模板 prompt 的并发会话会推导出同一个 Hub 键互串内容；开着本开关
+     * 即牺牲这类客户端的 durable 缓存换零串扰，带显式 id 的客户端不受影响。
+     * env: DURABLE_REQUIRE_EXPLICIT_ID。
+     */
+    durableRequireExplicitId: booleanValue(env.DURABLE_REQUIRE_EXPLICIT_ID, false),
 
     // Cursor Bot 路线。默认全关 / 全保守：这条路线还没跑过真实流量，
     // 默认接管流量或默认开工具都会让一次配置失误直接打到生产请求上。

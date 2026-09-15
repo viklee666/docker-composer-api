@@ -300,7 +300,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const prepared = prepareOpenAiChat(request.body, { systemPrompt: promptSettings });
     // slotHints 要等选 key 之后才能算 durableSessionId；指纹 / lastUserText 由 runner 对齐。
     const durableTurn = extractDurableTurn("openai-chat", request.body, undefined, undefined, promptSettings, deps.config.dropEmptyDurableTurns);
-    const seed = noteDurableIdentity(request, request.body, "openai-chat", auth.ownerHash);
+    const identityInfo = noteDurableIdentity(request, request.body, "openai-chat", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `chatcmpl_${compactId()}`;
     const created = nowSeconds();
@@ -311,7 +311,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       auth,
       identity,
       sessionKey: sessionAffinity(request, auth.ownerHash),
-      conversationSeed: seed,
+      conversationSeed: identityInfo.seed,
+      identitySource: identityInfo.source,
       durableTurn,
       request
     });
@@ -362,7 +363,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       auth,
       identity,
       sessionKey: sessionAffinity(request, previousResponseId ?? auth.ownerHash),
-      conversationSeed: seed,
+      conversationSeed: seed.seed,
+      identitySource: seed.source,
       durableTurn,
       request
     });
@@ -370,7 +372,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
       // 归因（包 C）：同 chat 端点，attribution.abortReason 在触发那一刻写进 log 与 Debug 快照。
       const abort = streamAbort(request, providerRequestTimeoutMs(deps.config, run.provider), noteStreamAbort(log));
       const events = deferRunnerStream(deps, run, abort.signal);
-      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, conversationSeed: seed, auth, events, deps, log, signal: abort.signal, socketAlive: () => isClientSocketAlive(request) }))));
+      return sendSse(reply, withStreamAbort(abort, withStreamLog(deps, log, responsesStream({ id, created, prepared, previousResponseId, conversationSeed: seed.seed, auth, events, deps, log, signal: abort.signal, socketAlive: () => isClientSocketAlive(request) }))));
     }
     const output = await runLogged(deps, log, run, (result) => {
       const outputChars = responseCompletionChars(result);
@@ -383,7 +385,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     });
     const response = responseObject({ id, created, prepared, output, previousResponseId, usage: log.telemetryRef.usage });
     // store:false 是数据保留契约：不落库，后续 GET/DELETE 自然 404。
-    if (prepared.store) await saveResponse(deps, auth, id, response, prepared.inputItems, seed);
+    if (prepared.store) await saveResponse(deps, auth, id, response, prepared.inputItems, seed.seed);
     return response;
   });
 
@@ -439,7 +441,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     const promptSettings = gatewaySystemPrompt(deps.config);
     const prepared = prepareAnthropicMessages(request.body, { systemPrompt: promptSettings });
     const durableTurn = extractDurableTurn("anthropic-messages", request.body, undefined, undefined, promptSettings, deps.config.dropEmptyDurableTurns);
-    const seed = noteDurableIdentity(request, request.body, "anthropic-messages", auth.ownerHash);
+    const identityInfo = noteDurableIdentity(request, request.body, "anthropic-messages", auth.ownerHash);
     const identity = await scopedModelIdentity(deps, auth, prepared.model);
     const id = `msg_${compactId()}`;
     const log = beginLog(deps, "/v1/messages", auth, prepared, request);
@@ -449,7 +451,8 @@ export function createApp(deps: AppDeps): FastifyInstance {
       auth,
       identity,
       sessionKey: sessionAffinity(request, auth.ownerHash),
-      conversationSeed: seed,
+      conversationSeed: identityInfo.seed,
+      identitySource: identityInfo.source,
       durableTurn,
       request
     });
@@ -783,7 +786,7 @@ function noteDurableIdentity(
   protocol: "openai-chat" | "openai-responses" | "anthropic-messages",
   ownerHash: string,
   inherited?: string
-): string | undefined {
+): { seed?: string; source: "header" | "body-field" | "derived-L3" | "none" } {
   const seed = durableIdentity({
     headers: request.headers,
     body,
@@ -793,20 +796,24 @@ function noteDurableIdentity(
   });
   if (explicitSessionIdFromHeaders(request.headers)) {
     recordIdentitySource("header");
-    return seed;
+    return { seed, source: "header" };
   }
   if (!seed) {
     recordIdentitySource("none");
-    return seed;
+    return { seed, source: "none" };
   }
   const fromBody = durableIdentity({ body, protocol, ownerHash });
   const derived = conversationSeed(body, protocol, ownerHash);
   if (fromBody && !(derived && identityStem(fromBody) === derived)) {
     recordIdentitySource("body-field");
-    return seed;
+    return { seed, source: "body-field" };
   }
   recordIdentitySource("derived-L3");
-  return seed;
+  // 内容推导身份（无显式 id 客户端，如 cursor-byok）没有会话边界保证：同仓库 + 同模板
+  // prompt + 同分钟的并发会话会推导出同一个 seed，落进同一个 durable 槽互相串内容。
+  // 每次命中都打一行指纹：并发复现时两条请求 seed 前 12 位相同即实锤碰撞，无需 debug 快照。
+  console.error(`[durable-identity] source=derived-L3 seed=${seed.slice(0, 12)} protocol=${protocol}`);
+  return { seed, source: "derived-L3" };
 }
 
 function identityStem(identity: string): string {
@@ -998,6 +1005,8 @@ function loggedRunRequest(
     sessionKey: string;
     /** 调用方已经确定的会话身份（Responses 续聊沿用上一轮落库的种子）；不传就按请求体现算。 */
     conversationSeed?: string;
+    /** 身份瀑布命中层级（noteDurableIdentity 产出）：进 debug 快照，供核对 derived-L3 碰撞。 */
+    identitySource?: "header" | "body-field" | "derived-L3" | "none";
     durableTurn?: CursorRunRequest["durableTurn"];
     request: FastifyRequest;
   }
@@ -1028,7 +1037,14 @@ function loggedRunRequest(
     ...(input.auth.modelScope ? { gatewayModelScope: input.auth.modelScope } : {}),
     ...(stickyKey ? { stickyKey } : {}),
     ...(input.conversationSeed ? { conversationSeed: input.conversationSeed } : {}),
-    reuseDurableAgent: canReuseDurableAgent(input.conversationSeed),
+    ...(input.identitySource ? { identitySource: input.identitySource } : {}),
+    // 严格模式（DURABLE_REQUIRE_EXPLICIT_ID）：内容推导身份没有会话边界，同仓库并发会话会
+    // 撞进同一个 durable 槽互串内容。开着时这类请求不进 Hub（reuse=false → stateless），
+    // 只牺牲无 id 客户端的缓存；带显式 id（header / body-field）的客户端不受影响。
+    reuseDurableAgent: canReuseDurableAgent(
+      input.conversationSeed,
+      input.identitySource === "derived-L3" ? deps.config.durableRequireExplicitId === true : false
+    ),
     ...(input.durableTurn ? { durableTurn: input.durableTurn } : {}),
     ownerHash: input.auth.ownerHash,
     provider: selection.provider,
@@ -1048,6 +1064,7 @@ function loggedRunRequest(
   log.debug?.noteRouting({ provider: selection.provider, model: selection.model, reason: selection.reason });
   log.debug?.noteDurable({
     ...(input.conversationSeed ? { sessionId: input.conversationSeed } : {}),
+    ...(input.identitySource ? { identitySource: input.identitySource } : {}),
     reuseDurableAgent: run.reuseDurableAgent,
     ...(run.durableTurn
       ? {
@@ -1087,8 +1104,10 @@ function stickyKeyFor(request: FastifyRequest, auth: AuthContext, seed?: string)
 
 /**
  * 有瀑布 identity 进 Hub；重叠由 Hub tryAcquire 改 stateless，不再靠「Chat 无头永不进 Hub」止血。
+ * 严格模式下 derived-L3（内容推导）身份不进 Hub：第二个参数为 true 时按无可复用身份处理。
  */
-function canReuseDurableAgent(seed?: string): boolean {
+function canReuseDurableAgent(seed?: string, requireExplicitId = false): boolean {
+  if (requireExplicitId) return false;
   return Boolean(seed);
 }
 

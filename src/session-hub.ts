@@ -267,6 +267,21 @@ export function inboundAssistantTextMismatch(
     && assistantDigest !== slot.lastAssistantDigest;
 }
 
+/**
+ * 新鲜会话护栏：入站 transcript 一条 assistant 轮都没有（digest 缺号），而槽已经向
+ * **另一个**客户端交付过语义输出（deliveredUserText 有值）——正常续聊的客户端会把
+ * 历史（含之前的 assistant 回复）带回来，零 assistant 入站只可能是新会话的第一轮。
+ * 内容推导身份（derived-L3）没有会话边界：同仓库 + 同模板 prompt 的并发新会话会推导出
+ * 同一个 Hub 键，这条护栏挡住「会话 B 的第一轮直接 send 进带着 A 全部历史的 agent」。
+ * 调用方据此退 stateless（与 history_mismatch 同口径），绝不 drop 槽。
+ */
+export function inboundFreshSessionOnDeliveredSlot(
+  slot: SessionSlot,
+  assistantDigest: string | undefined
+): boolean {
+  return assistantDigest === undefined && slot.deliveredUserText !== undefined;
+}
+
 export type DurableReplaceReason =
   | "incompatible"
   | "model"

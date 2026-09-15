@@ -979,6 +979,60 @@ const RESPONSES_HEADERS = { authorization: "Bearer gateway-key" };
 const FIRST_TURN = { model: "composer-2.5", instructions: "You are helpful.", input: "Explain closures." };
 const SECOND_TURN = { model: "composer-2.5", input: "Now show me an example." };
 
+test("strict mode keeps derived-L3 identities out of the durable hub but leaves explicit ids alone", async () => {
+  // 严格模式开：无显式会话 id 的请求（身份只能靠内容推导）不进 durable Hub。
+  const strictRunner = new FakeRunner({ text: "ok" });
+  const strict = await createTestApp({
+    runner: strictRunner,
+    config: { sessionAffinity: true, durableRequireExplicitId: true }
+  });
+  await strict.app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hello from an id-less client" }]
+    }
+  });
+  assert.equal(strictRunner.lastInput?.identitySource, "derived-L3");
+  assert.equal(strictRunner.lastInput?.reuseDurableAgent, false, "严格模式必须把 derived-L3 挡在 Hub 外");
+
+  // 显式 id（session 头）不受严格模式影响。
+  await strict.app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { authorization: "Bearer gateway-key", "x-session-id": "session-explicit-1" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hello with an explicit session" }]
+    }
+  });
+  assert.equal(strictRunner.lastInput?.identitySource, "header");
+  assert.equal(strictRunner.lastInput?.reuseDurableAgent, true, "显式 id 的 durable 复用不受严格模式影响");
+
+  // 默认（严格模式关）：derived-L3 照常进 Hub。
+  const laxRunner = new FakeRunner({ text: "ok" });
+  const lax = await createTestApp({
+    runner: laxRunner,
+    config: { sessionAffinity: true }
+  });
+  await lax.app.inject({
+    method: "POST",
+    url: "/v1/messages",
+    headers: { authorization: "Bearer gateway-key" },
+    payload: {
+      model: "composer-2.5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hello from an id-less client" }]
+    }
+  });
+  assert.equal(laxRunner.lastInput?.identitySource, "derived-L3");
+  assert.equal(laxRunner.lastInput?.reuseDurableAgent, true, "默认关着时 derived-L3 照常进 Hub");
+});
+
 /** baseConfig 把粘性关着，这一组用例必须自己开，否则测的是「绑定压根没写」。 */
 function stickyResponsesApp(runner: FakeRunner, config: Partial<GatewayConfig> = {}, keys?: string[]) {
   return createTestApp({ runner, ...(keys ? { keys } : {}), config: { sessionAffinity: true, ...config } });

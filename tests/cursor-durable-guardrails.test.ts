@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CursorSdkRunner, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
+import { CursorSdkRunner, toolResultsForeignToSlot, type AgentFactory, type AgentLike } from "../src/cursor-runner.js";
 import { durableSessionId } from "../src/durable-id.js";
 import {
   SessionHub,
   assistantTextDigest,
   createSessionSlot,
   inboundAssistantTextMismatch,
+  inboundFreshSessionOnDeliveredSlot,
   inboundHistoryIncompatible,
   markTurnDelivered,
   recordAssistantDigest,
+  recordIssuedToolCalls,
   type HubAgent
 } from "../src/session-hub.js";
 import { extractDurableTurn } from "../src/prompt-delta.js";
@@ -590,6 +592,224 @@ test("空轮次收口：debug 快照记 empty_turn_noop（对照 empty.json 的 
   assert.ok(blocked, "debug 快照必须能看出空轮被 empty_turn_noop 拦下");
   const payload = blocked!.payload as { kind?: string };
   assert.equal(payload.kind, "empty");
+  await hub.dropAll();
+});
+
+test("护栏（新鲜会话纯函数）：零 assistant 入站 + 已交付槽 ⇒ 判定外来会话", () => {
+  const slot = createSessionSlot({ agent: dummyAgent(), agentId: "a", apiKey: "k", model: "m" });
+  // 未交付过的槽（deliveredUserText 缺号）：新会话第一轮落进来是合法的（同 seed 复用），放行。
+  assert.equal(inboundFreshSessionOnDeliveredSlot(slot, undefined), false);
+  slot.lastUserText = "hello";
+  markTurnDelivered(slot);
+  // 已交付 + digest 缺号 = 会话 B 的第一轮撞进已交付槽。
+  assert.equal(inboundFreshSessionOnDeliveredSlot(slot, undefined), true);
+  // 入站带 assistant 摘要的续聊（哪怕分叉）由 digest 比对护栏负责，本护栏不掺和。
+  assert.equal(inboundFreshSessionOnDeliveredSlot(slot, assistantTextDigest("any")), false);
+});
+
+test("护栏（新鲜会话）：会话 B 首轮撞进已交付槽 ⇒ stateless，槽不动、不串 send", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: TrackingAgent[] = [];
+  const factory: AgentFactory = {
+    create: async () => {
+      const agent = new TrackingAgent(`agent-fresh-${created.length + 1}`);
+      created.push(agent);
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-fresh-session-collision";
+  const sessionId = sessionHash(seed);
+  resetDurableTelemetry();
+
+  // 会话 A 第一轮：正常 durable，交付 "reply 1"。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    durableTurn: userTurn("hello from session A")
+  }));
+  assert.equal(created.length, 1);
+
+  // 会话 B 第一轮（同 seed 碰撞、零 assistant 历史）：不得 send 进 A 的 agent，退 stateless。
+  const result = await runner.run(baseRun({
+    conversationSeed: seed,
+    prompt: "USER: fresh question from session B",
+    identitySource: "derived-L3",
+    durableTurn: userTurn("fresh question from session B")
+  }));
+  assert.equal(created.length, 2, "碰撞轮必须走 stateless 新 agent");
+  assert.equal(created[0].sends.length, 1, "会话 A 的 durable agent 不得收到 B 的第一轮");
+  assert.equal(result.text, "reply 1");
+  const slot = hub.get(sessionId);
+  assert.ok(slot, "新鲜会话护栏不得销毁槽");
+  assert.equal(slot.agent, created[0].agent);
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok(
+    (snapshot.decisions["fallback:fresh_session"] ?? 0) >= 1,
+    "必须留下 fresh_session 打点"
+  );
+
+  // 显式 id（header / body-field）的会话不可能碰撞，同形状请求（digest 缺号续聊）不受护栏影响。
+  const explicit = await runner.run(baseRun({
+    conversationSeed: seed,
+    identitySource: "header",
+    durableTurn: userTurn("follow up from the same explicit-id client")
+  }));
+  assert.equal(created.length, 2, "显式 id 的 digest 缺号续聊不得被误伤");
+  assert.equal(created[0].sends.length, 2, "显式 id 续聊照常走 durable 增量 send");
+  assert.equal(explicit.text, "reply 2");
+  await hub.dropAll();
+});
+
+test("护栏（新鲜会话）：Responses 协议 digest 恒缺号，不受本护栏影响", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const agent = new TrackingAgent("agent-responses-exempt");
+  const factory: AgentFactory = { create: async () => agent };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-responses-exempt";
+  const sessionId = sessionHash(seed);
+
+  // 第一轮：Responses 形状（无 assistantDigest）正常 durable。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    protocol: "openai-responses",
+    identitySource: "derived-L3",
+    durableTurn: userTurn("hello")
+  }));
+  // 第二轮：Responses 续聊 input 不带 assistant 文本（digest 缺号）。Responses 的身份
+  // 走显式 seed 继承，实际不会是 derived-L3；此处用 derived-L3 + 该协议组合验证最坏
+  // 情况下也不误伤——协议恒缺 digest，护栏若不豁免该协议会把每轮续聊都打回 stateless。
+  const next = await runner.run(baseRun({
+    conversationSeed: seed,
+    protocol: "openai-responses",
+    identitySource: "derived-L3",
+    durableTurn: userTurn("follow up")
+  }));
+  assert.equal(agent.sends.length, 2, "Responses 续聊不得被新鲜会话护栏误伤");
+  assert.equal(next.text, "reply 2");
+  assert.ok(hub.get(sessionId));
+  await hub.dropAll();
+});
+
+test("护栏（tool_results 零交集纯函数）：外来 id 全部对不上 ⇒ foreign", () => {
+  const slot = createSessionSlot({ agent: dummyAgent(), agentId: "a", apiKey: "k", model: "m" });
+  // 槽没发过任何 tool_call（issued/pending 全空）⇒ 无从判定，放行（走既有 400 路径）。
+  assert.equal(toolResultsForeignToSlot(slot, [{ id: "call_x" }]), false);
+  recordIssuedToolCalls(slot, ["call_mine"]);
+  // path B：结果 id 是本槽上一轮发过的（Responses 的 call_ 前缀别名剥掉后同后缀）。
+  assert.equal(toolResultsForeignToSlot(slot, [{ id: "call_mine" }]), false);
+  assert.equal(toolResultsForeignToSlot(slot, [{ id: "mine" }]), false, "剥 call_ 前缀后同后缀必须命中");
+  // 全部外来 ⇒ foreign。
+  assert.equal(toolResultsForeignToSlot(slot, [{ id: "call_foreign_1" }, { id: "call_foreign_2" }]), true);
+  // 混合（任一命中）⇒ 不是 foreign。
+  assert.equal(toolResultsForeignToSlot(slot, [{ id: "call_foreign_1" }, { id: "call_mine" }]), false);
+  // 空结果列表不算 foreign（由 empty/duplicate 路径处理）。
+  assert.equal(toolResultsForeignToSlot(slot, []), false);
+});
+
+test("护栏（tool_results 零交集）：外来工具结果撞进挂起槽 ⇒ stateless 且不 abort 挂起 execute", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: Array<{ agent: HeldToolAgent; durable: boolean }> = [];
+  const factory: AgentFactory = {
+    create: async (options) => {
+      const durable = created.length === 0;
+      const agent = new HeldToolAgent(durable);
+      if (durable) agent.attachCreateOptions(options);
+      created.push({ agent, durable });
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-foreign-tool-results";
+  const sessionId = sessionHash(seed);
+  resetDurableTelemetry();
+
+  // 会话 A 停在挂起 execute（call_read_1 等结果）。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    identitySource: "derived-L3",
+    durableTurn: userTurn("Read README.md")
+  }));
+  const slot = hub.get(sessionId);
+  assert.ok(slot);
+  assert.equal(slot.pending.has("call_read_1"), true);
+  const durableAgent = created[0].agent;
+  const heldRun = durableAgent.runs[0];
+  assert.ok(heldRun);
+
+  // 会话 B 的工具结果（id 全部外来）撞进同一个槽：不得 abort 挂起 execute、不得 send。
+  const result = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    identitySource: "derived-L3",
+    prompt: "Conversation:\nUSER: Read README.md",
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_from_other_session", content: "other session output" }]
+    }
+  }));
+  assert.equal(heldRun.cancelled, false, "外来工具结果不得 cancel 会话 A 挂起的 run");
+  assert.equal(durableAgent.sends.length, 1, "外来工具结果不得触发 durable send");
+  const liveSlot = hub.get(sessionId);
+  assert.ok(liveSlot, "零交集护栏不得销毁槽");
+  assert.equal(liveSlot.pending.has("call_read_1"), true, "挂起 execute 原样保留");
+  assert.ok(result.text.length > 0, "stateless 退回也要有完整产出");
+  const snapshot = durableTelemetrySnapshot();
+  assert.ok(
+    (snapshot.decisions["fallback:foreign_tool_results"] ?? 0) >= 1,
+    "必须留下 foreign_tool_results 打点"
+  );
+
+  // 显式 id 会话的 unmatched tool_results（客户端自身 bug）：不受零交集护栏保护，
+  // 走既有 unmatched-abort 路径（行为与改动前一致）。
+  const explicitBuggy = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    identitySource: "header",
+    prompt: "Conversation:\nUSER: Read README.md",
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_buggy_client", content: "client bug result" }]
+    }
+  }));
+  assert.ok(explicitBuggy.text.length > 0, "显式 id 的 unmatched 路径照常工作");
+  await hub.dropAll();
+});
+
+test("护栏（tool_results 零交集）：本槽 path A 结果正常 resolve，不被误伤", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const created: Array<{ agent: HeldToolAgent; durable: boolean }> = [];
+  const factory: AgentFactory = {
+    create: async (options) => {
+      const durable = created.length === 0;
+      const agent = new HeldToolAgent(durable);
+      if (durable) agent.attachCreateOptions(options);
+      created.push({ agent, durable });
+      return agent;
+    }
+  };
+  const runner = durableRunner(hub, factory);
+  const seed = "seed-own-tool-results";
+
+  // path A 全链路：挂起 execute → 结果 id 命中 pending → 同一 Run 继续。
+  await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: userTurn("Read README.md")
+  }));
+  const http2 = await runner.run(baseRun({
+    conversationSeed: seed,
+    tools: [readTool],
+    durableTurn: {
+      kind: "tool_results",
+      ...FP,
+      toolResults: [{ id: "call_read_1", content: "hello from README" }]
+    }
+  }));
+  assert.match(http2.text, /hello from README/);
+  assert.equal(created[0].agent.sends.length, 1, "path A 不触发第二次 send（execute resolve 续跑）");
   await hub.dropAll();
 });
 
