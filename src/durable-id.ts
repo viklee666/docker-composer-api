@@ -48,16 +48,97 @@ export function durableAgentId(input: { ownerHash: string; identity: string; mod
  * 父请求不带该头则身份不变。explicitSessionIdFromHeaders 不认该头。
  */
 export function durableIdentity(input: DurableSessionIdInput): string | undefined {
+  // x-claude-code-session-id 降权（计划 v2 §2.2）：CPA 在 claude-api-key 链路上会给没带
+  // session 头的客户端按 key 盖一个常量头，L1 无条件采信它会让同一把 key 后面的所有会话
+  // 共享同一个 durableAgentId（串会话）。头与 body 的 metadata.user_id 配不上（或 user_id
+  // 缺失/legacy）时不可信：忽略该头，并把这个 body 的 metadata 一并从身份推导中剥离——
+  // legacy 随机 user_id 若留在 L2 会给出每请求都变的身份，durable 直接失效。
+  const demoted = claudeSessionHeaderDemoted(input.headers, input.body);
+  const headers = demoted ? withoutClaudeSessionHeader(input.headers) : input.headers;
+  const body = demoted ? withoutBodyMetadata(input.body) : input.body;
   const sticky = nonempty(input.stickyKey);
   const identity =
-    nonempty(explicitSessionIdFromHeaders(input.headers)) ??
-    nonempty(explicitSessionIdFromBody(input.body)) ??
+    nonempty(explicitSessionIdFromHeaders(headers)) ??
+    nonempty(explicitSessionIdFromBody(body)) ??
     nonempty(input.conversationSeed) ??
-    nonempty(conversationSeed(input.body, input.protocol, input.ownerHash)) ??
+    nonempty(conversationSeed(body, input.protocol, input.ownerHash)) ??
     (sticky && sticky !== input.ownerHash ? sticky : undefined);
   if (!identity) return undefined;
-  const agent = input.headers ? headerValue(input.headers, "x-claude-code-agent-id") : undefined;
+  const agent = headers ? headerValue(headers, "x-claude-code-agent-id") : undefined;
   return agent ? `${identity}\0agent:${agent}` : identity;
+}
+
+/**
+ * x-claude-code-session-id 头是否被 body 的 metadata.user_id 佐证（计划 v2 §2.1）。
+ * 采信条件：user_id 为 JSON 形态（对象或 JSON 字符串，真 claude-cli ≥2.1.78 的形态），
+ * 且提取出的 session_id 与头值（两侧都过 normalizeExplicitId）逐字相等。
+ * legacy 串一律不采信——包括尾段恰好与头一致：新 CPA cloak（injectFakeUserID +
+ * cache-user-id）会生成 session 段 = per-key 头值的 user_id，采信即把洞重新打开。
+ */
+export function claudeSessionHeaderTrusted(
+  headers: DurableSessionHeaders | undefined,
+  body: unknown
+): boolean {
+  const headerSession = headers ? headerValue(headers, "x-claude-code-session-id") : undefined;
+  if (!headerSession) return false;
+  const metadataSession = jsonSessionIdFromMetadata(asRecord(body)?.metadata);
+  return metadataSession !== undefined && metadataSession === headerSession;
+}
+
+/** 降权是否成立：头存在且未通过 claudeSessionHeaderTrusted 验证。 */
+export function claudeSessionHeaderDemoted(
+  headers: DurableSessionHeaders | undefined,
+  body: unknown
+): boolean {
+  if (!headers || !headerValue(headers, "x-claude-code-session-id")) return false;
+  return !claudeSessionHeaderTrusted(headers, body);
+}
+
+/** 剥掉 x-claude-code-session-id 头（大小写不敏感），供 L1 候选剔除；其余头原样保留。 */
+export function withoutClaudeSessionHeader(
+  headers: DurableSessionHeaders | undefined
+): DurableSessionHeaders | undefined {
+  if (!headers) return undefined;
+  const copy: DurableSessionHeaders = {};
+  let changed = false;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === "x-claude-code-session-id") {
+      changed = true;
+      continue;
+    }
+    copy[key] = value;
+  }
+  return changed ? copy : headers;
+}
+
+/** 剥掉 body 顶层 metadata 字段（浅拷贝），供 L2 的 user_id 剥离；其余字段原样保留。 */
+export function withoutBodyMetadata(body: unknown): unknown {
+  const record = asRecord(body);
+  if (!record || !("metadata" in record)) return body;
+  const copy: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (key !== "metadata") copy[key] = value;
+  }
+  return copy;
+}
+
+/**
+ * 只从 JSON 形态的 metadata.user_id 提取 session_id（对象形态或 "{" 开头的 JSON 字符串）。
+ * legacy 串（user_…_session_<uuid>）刻意返回 undefined：它做不了交叉验证的正面证据。
+ */
+function jsonSessionIdFromMetadata(metadata: unknown): string | undefined {
+  const record = asRecord(metadata);
+  if (!record) return undefined;
+  const userId = record.user_id;
+  const nested = asRecord(userId);
+  if (nested) return explicitString(nested.session_id);
+  if (typeof userId !== "string" || !userId.startsWith("{")) return undefined;
+  try {
+    const parsed = asRecord(JSON.parse(userId));
+    return parsed ? explicitString(parsed.session_id) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export const resolveConversationIdentity = durableIdentity;

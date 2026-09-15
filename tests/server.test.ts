@@ -1033,6 +1033,56 @@ test("strict mode keeps derived-L3 identities out of the durable hub but leaves 
   assert.equal(laxRunner.lastInput?.reuseDurableAgent, true, "默认关着时 derived-L3 照常进 Hub");
 });
 
+test("demoted claude session header: CPA-style header with random user_id falls to derived-L3; real CLI stays header", async () => {
+  // byok + CPA 链路形态（plans/debug 快照）：x-claude-code-session-id 恒定（CPA 按 key 盖的常量），
+  // metadata.user_id 是 legacy 串且每请求随机 → 头不可信，身份必须落到内容推导，护栏才激活。
+  const runner = new FakeRunner({ text: "ok" });
+  const { app } = await createTestApp({ runner, config: { sessionAffinity: true } });
+
+  const post = async (headers: Record<string, string>, metadataUserId: string) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { authorization: "Bearer gateway-key", ...headers },
+      payload: {
+        model: "composer-2.5",
+        max_tokens: 64,
+        stream: false,
+        metadata: { user_id: metadataUserId },
+        messages: [{ role: "user", content: "Explain closures." }]
+      }
+    });
+    assert.equal(response.statusCode, 200, response.body);
+  };
+
+  // 两个「会话」：同一个 CPA 常量头，两个随机 user_id（快照实测形态）。
+  await post(
+    { "x-claude-code-session-id": "0d349c18-69c3-418c-9623-bfc7acfe9baf" },
+    "user_1111111111111111111111111111111111111111111111111111111111111111_account_11111111-1111-4111-8111-111111111111_session_11111111-1111-4111-8111-111111111111"
+  );
+  assert.equal(runner.lastInput?.identitySource, "derived-L3", "伪装头必须降权到 derived-L3（否则护栏永不激活）");
+  const firstSeed = runner.lastInput?.conversationSeed;
+  assert.ok(firstSeed);
+  assert.ok(!firstSeed.includes("0d349c18"), "身份不得包含被降权的头值");
+
+  await post(
+    { "x-claude-code-session-id": "0d349c18-69c3-418c-9623-bfc7acfe9baf" },
+    "user_2222222222222222222222222222222222222222222222222222222222222222_account_22222222-2222-4222-8222-222222222222_session_22222222-2222-4222-8222-222222222222"
+  );
+  // 同 body（同首条 user）→ 同 L3 seed：这两个请求在修复前会因同头串进同一个 agent，
+  // 现在落 derived-L3 后由 fresh_session 护栏兜底。
+  assert.equal(runner.lastInput?.conversationSeed, firstSeed);
+  assert.equal(runner.lastInput?.identitySource, "derived-L3");
+
+  // 真 claude-cli 形态：头 + JSON user_id 与头一致 → 仍走 header，durable 精度不变。
+  await post(
+    { "x-claude-code-session-id": "0d349c18-69c3-418c-9623-bfc7acfe9baf" },
+    JSON.stringify({ device_id: "a".repeat(64), account_uuid: "", session_id: "0d349c18-69c3-418c-9623-bfc7acfe9baf" })
+  );
+  assert.equal(runner.lastInput?.identitySource, "header", "真 claude-cli 的配对头必须保持 header 身份");
+  assert.equal(runner.lastInput?.conversationSeed, "0d349c18-69c3-418c-9623-bfc7acfe9baf");
+});
+
 /** baseConfig 把粘性关着，这一组用例必须自己开，否则测的是「绑定压根没写」。 */
 function stickyResponsesApp(runner: FakeRunner, config: Partial<GatewayConfig> = {}, keys?: string[]) {
   return createTestApp({ runner, ...(keys ? { keys } : {}), config: { sessionAffinity: true, ...config } });

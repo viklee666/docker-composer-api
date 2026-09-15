@@ -8,12 +8,16 @@ import {
   shouldUseDurableHub
 } from "../src/config.js";
 import {
+  claudeSessionHeaderDemoted,
+  claudeSessionHeaderTrusted,
   durableAgentId,
   durableIdentity,
   durableSessionId,
   normalizeExplicitId,
   resolveConversationIdentity,
-  stableUuid
+  stableUuid,
+  withoutBodyMetadata,
+  withoutClaudeSessionHeader
 } from "../src/durable-id.js";
 
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -231,27 +235,31 @@ test("same x-claude-code-session-id with different x-claude-code-agent-id splits
   const parentHeaders = { "x-claude-code-session-id": session };
   const subA = { ...parentHeaders, "x-claude-code-agent-id": "sub-agent-a" };
   const subB = { ...parentHeaders, "x-claude-code-agent-id": "sub-agent-b" };
-  const parentIdentity = durableIdentity({ headers: parentHeaders });
-  const identityA = durableIdentity({ headers: subA });
-  const identityB = durableIdentity({ headers: subB });
+  // 真 claude-cli 的头总是与 JSON user_id 成对出现；降权判据要求两者配对才采信头。
+  const body = { metadata: { user_id: JSON.stringify({ session_id: session }) } };
+  const parentIdentity = durableIdentity({ headers: parentHeaders, body });
+  const identityA = durableIdentity({ headers: subA, body });
+  const identityB = durableIdentity({ headers: subB, body });
   assert.ok(parentIdentity && identityA && identityB);
   assert.equal(parentIdentity.includes("\0agent:"), false);
   assert.notEqual(identityA, identityB);
   assert.notEqual(identityA, parentIdentity);
   assert.ok(identityA.includes("\0agent:sub-agent-a"));
   assert.ok(identityB.includes("\0agent:sub-agent-b"));
-  const idA = durableSessionId({ headers: subA, ownerHash, model });
-  const idB = durableSessionId({ headers: subB, ownerHash, model });
+  const idA = durableSessionId({ headers: subA, body, ownerHash, model });
+  const idB = durableSessionId({ headers: subB, body, ownerHash, model });
   assert.ok(idA && idB);
   assert.notEqual(idA, idB);
 });
 
 test("parent session-id header without agent-id does not contain the agent suffix", () => {
   const identity = durableIdentity({
-    headers: { "x-claude-code-session-id": "parent-only" }
+    headers: { "x-claude-code-session-id": "parent-only" },
+    body: { metadata: { user_id: JSON.stringify({ session_id: "parent-only" }) } }
   });
   assert.ok(identity);
   assert.equal(identity.includes("\0agent:"), false);
+  // agent-id 头单独出现仍不构成身份（无头无 body → undefined，语义与改造前一致）。
   assert.equal(durableIdentity({ headers: { "x-claude-code-agent-id": "orphan-sub" } }), undefined);
 });
 
@@ -292,7 +300,10 @@ test("durableSessionId accepts the expanded explicit session headers", () => {
     model: "composer-2.5"
   };
   const rows = [
-    { headers: { "x-claude-code-session-id": "claude-code-sess-1" } },
+    {
+      headers: { "x-claude-code-session-id": "claude-code-sess-1" },
+      body: { metadata: { user_id: JSON.stringify({ session_id: "claude-code-sess-1" }) } }
+    },
     { headers: { "x-session-id": "x-session-id-value-1" } },
     { headers: { "session-id": "session-id-value-1" } },
     { headers: { session_id: "session_id-value-1" } },
@@ -301,7 +312,7 @@ test("durableSessionId accepts the expanded explicit session headers", () => {
     { headers: { "x-codex-turn-metadata": JSON.stringify({ prompt_cache_key: "codex-pck-1" }) } },
     { headers: { "x-codex-turn-metadata": JSON.stringify({ window_id: "codex-meta-window-1" }) } }
   ];
-  const ids = rows.map((row) => durableSessionId({ ...keys, headers: row.headers }));
+  const ids = rows.map((row) => durableSessionId({ ...keys, headers: row.headers, body: row.body }));
   for (const [index, id] of ids.entries()) {
     assert.ok(id, `header row ${index}`);
   }
@@ -400,4 +411,132 @@ test("resolveConversationIdentity matches durableIdentity for the same input", (
   for (const input of inputs) {
     assert.equal(resolveConversationIdentity(input), durableIdentity(input));
   }
+});
+
+/* ---------------------- x-claude-code-session-id 降权（计划 v2） ---------------------- */
+
+const CPA_HEADER = { "x-claude-code-session-id": "0d349c18-69c3-418c-9623-bfc7acfe9baf" };
+
+test("claudeSessionHeaderTrusted: JSON user_id 与头一致才采信；legacy 一律不信", () => {
+  const jsonBody = {
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: "93ab134c9e8236f7678147751d642ba1846b25216dfb76659f00adefbd5a689c",
+        account_uuid: "",
+        session_id: "0d349c18-69c3-418c-9623-bfc7acfe9baf"
+      })
+    }
+  };
+  const jsonObjectBody = { metadata: { user_id: { session_id: "0d349c18-69c3-418c-9623-bfc7acfe9baf" } } };
+  const mismatchBody = { metadata: { user_id: JSON.stringify({ session_id: "11111111-1111-4111-8111-111111111111" }) } };
+  const legacyMatchBody = {
+    metadata: {
+      user_id: `user_58f2306017dd5a3767e8c494bda78ba73acae18f2aeee4d759b4a7bb08b68d9b_account_750e3a68-3c4a-4184-873f-708173b1dc9a_session_0d349c18-69c3-418c-9623-bfc7acfe9baf`
+    }
+  };
+  const legacyRandomBody = {
+    metadata: {
+      user_id: `user_c231a63f30e019208334e1a9af47aae3fdd2997ceb821cb21028de8ad0e2fc2c_account_1892a561-dfa1-4b37-a921-31a5d6a953cc_session_3318187c-21d2-4e5f-a9d0-1f3a2b4c5d6e`
+    }
+  };
+
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, jsonBody), true, "JSON 字符串 + 一致 → 采信");
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, jsonObjectBody), true, "JSON 对象形态 + 一致 → 采信");
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, mismatchBody), false, "JSON + 不一致 → 降权");
+  assert.equal(
+    claudeSessionHeaderTrusted(CPA_HEADER, legacyMatchBody),
+    false,
+    "legacy 即使尾段与头一致也不采信（v1 漏洞：新 CPA cloak 会造出这种一致）"
+  );
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, legacyRandomBody), false, "legacy 随机 → 降权（线上快照形态）");
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, {}), false, "头孤证（无 metadata）→ 降权");
+  assert.equal(claudeSessionHeaderTrusted(CPA_HEADER, undefined), false);
+  assert.equal(claudeSessionHeaderTrusted({}, jsonBody), false, "无头谈不上信任");
+  assert.equal(claudeSessionHeaderTrusted(undefined, jsonBody), false);
+  assert.equal(claudeSessionHeaderDemoted(CPA_HEADER, legacyRandomBody), true);
+  assert.equal(claudeSessionHeaderDemoted(CPA_HEADER, jsonBody), false);
+  assert.equal(claudeSessionHeaderDemoted({}, jsonBody), false, "没有该头就没有降权");
+});
+
+test("durableIdentity 降权：CPA per-key 头 + 随机 user_id → 落 L3，会话按内容区分（修复前同头必串）", () => {
+  const ownerHash = "owner-byok-chain";
+  const protocol = "anthropic-messages" as const;
+  const cpaHeader = { "x-claude-code-session-id": "per-key-constant-from-cpa" };
+  const legacyUserA = { user_id: "user_1111111111111111111111111111111111111111111111111111111111111111_account_11111111-1111-4111-8111-111111111111_session_11111111-1111-4111-8111-111111111111" };
+  const legacyUserB = { user_id: "user_2222222222222222222222222222222222222222222222222222222222222222_account_22222222-2222-4222-8222-222222222222_session_22222222-2222-4222-8222-222222222222" };
+  const bodyA = {
+    system: "You are an AI coding assistant, powered by composer2.5.",
+    messages: [{ role: "user", content: "workspace request-context + question A" }],
+    metadata: legacyUserA
+  };
+  const bodyB = {
+    system: "You are an AI coding assistant, powered by composer2.5.",
+    messages: [{ role: "user", content: "workspace request-context + question B" }],
+    metadata: legacyUserB
+  };
+
+  // 降权后，身份与「无头无 metadata」的同一请求完全一致（头与 user_id 都不参与）。
+  const demotedA = durableIdentity({ headers: cpaHeader, body: bodyA, protocol, ownerHash });
+  const bareA = durableIdentity({ headers: {}, body: withoutBodyMetadata(bodyA), protocol, ownerHash });
+  assert.ok(demotedA);
+  assert.equal(demotedA, bareA, "伪装头与随机 user_id 不得影响身份");
+
+  // 两个不同会话（首条 user 不同）→ 不同身份；修复前它们因同头共享同一个 durableAgentId。
+  const demotedB = durableIdentity({ headers: cpaHeader, body: bodyB, protocol, ownerHash });
+  assert.notEqual(demotedA, demotedB, "不同会话必须分出不同身份");
+
+  // 同一会话续聊（首条 user 不变、追加轮次、user_id 又随机变了一个）→ 身份稳定，durable 保持。
+  const bodyA2 = {
+    system: bodyA.system,
+    messages: [
+      { role: "user", content: "workspace request-context + question A" },
+      { role: "assistant", content: "answer A" },
+      { role: "user", content: "follow up" }
+    ],
+    metadata: { user_id: "user_3333333333333333333333333333333333333333333333333333333333333333_account_33333333-3333-4333-8333-333333333333_session_33333333-3333-4333-8333-333333333333" }
+  };
+  assert.equal(durableIdentity({ headers: cpaHeader, body: bodyA2, protocol, ownerHash }), demotedA);
+});
+
+test("durableIdentity 采信：真 claude-cli（JSON user_id 与头一致）身份 = 头值，行为不变", () => {
+  const session = "0d349c18-69c3-418c-9623-bfc7acfe9baf";
+  const body = {
+    system: "You are Claude Code.",
+    messages: [{ role: "user", content: "hello" }],
+    metadata: { user_id: JSON.stringify({ device_id: "a".repeat(64), account_uuid: "", session_id: session }) }
+  };
+  const identity = durableIdentity({ headers: CPA_HEADER, body, protocol: "anthropic-messages" });
+  assert.equal(identity, session);
+  assert.equal(claudeSessionHeaderDemoted(CPA_HEADER, body), false);
+});
+
+test("durableIdentity 降权不影响其他显式头：x-session-id 照常命中", () => {
+  const headers = { ...CPA_HEADER, "x-session-id": "opencode-session-1" };
+  const body = {
+    messages: [{ role: "user", content: "hello" }],
+    metadata: { user_id: "user_legacy_random_session_11111111-1111-4111-8111-111111111111" }
+  };
+  const identity = durableIdentity({ headers, body, protocol: "anthropic-messages" });
+  assert.equal(identity, "opencode-session-1");
+});
+
+test("withoutClaudeSessionHeader / withoutBodyMetadata 只剥自己的目标，其余原样保留", () => {
+  const headers = { "x-claude-code-session-id": "s", "X-Claude-Code-Session-Id": "s2", "x-session-id": "keep", authorization: "Bearer x" };
+  const stripped = withoutClaudeSessionHeader(headers);
+  assert.ok(stripped);
+  assert.equal("x-claude-code-session-id" in stripped, false);
+  assert.equal("X-Claude-Code-Session-Id" in stripped, false, "大小写不敏感剥离");
+  assert.equal(stripped["x-session-id"], "keep");
+  assert.equal(stripped.authorization, "Bearer x");
+  const untouched = withoutClaudeSessionHeader({ "x-session-id": "only" });
+  assert.ok(untouched);
+  assert.equal(untouched["x-session-id"], "only", "无目标头时原样返回");
+
+  const body = { model: "m", messages: [], metadata: { user_id: "x" }, session_id: "keep-me" };
+  const bodyStripped = withoutBodyMetadata(body) as Record<string, unknown>;
+  assert.equal("metadata" in bodyStripped, false);
+  assert.equal(bodyStripped.session_id, "keep-me");
+  assert.equal(bodyStripped.model, "m");
+  const noMeta = { messages: [] };
+  assert.equal(withoutBodyMetadata(noMeta), noMeta, "无 metadata 时原样返回（同一引用）");
 });

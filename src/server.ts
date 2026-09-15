@@ -18,7 +18,13 @@ import {
   type DebugRecorderSettings,
   type DebugSession
 } from "./debug-recorder.js";
-import { durableIdentity, explicitSessionIdFromHeaders } from "./durable-id.js";
+import {
+  claudeSessionHeaderDemoted,
+  durableIdentity,
+  explicitSessionIdFromHeaders,
+  withoutBodyMetadata,
+  withoutClaudeSessionHeader
+} from "./durable-id.js";
 import {
   recordDurableCache,
   recordIdentitySource,
@@ -787,14 +793,22 @@ function noteDurableIdentity(
   ownerHash: string,
   inherited?: string
 ): { seed?: string; source: "header" | "body-field" | "derived-L3" | "none" } {
+  // x-claude-code-session-id 降权（计划 v2 §2.3）：CPA 按 key 盖的常量头不可作为会话身份，
+  // 归档与身份推导必须用同一套降权逻辑——否则会出现「seed 已是 L3、source 仍是 header」，
+  // derived-L3 的三个护栏永远不激活。durableIdentity 内部也做同样降权（幂等）。
+  const demoted = claudeSessionHeaderDemoted(request.headers as Record<string, string | string[] | undefined>, body);
+  const effectiveHeaders = demoted
+    ? withoutClaudeSessionHeader(request.headers as Record<string, string | string[] | undefined>)
+    : request.headers;
+  const effectiveBody = demoted ? withoutBodyMetadata(body) : body;
   const seed = durableIdentity({
-    headers: request.headers,
-    body,
+    headers: effectiveHeaders,
+    body: effectiveBody,
     protocol,
     ownerHash,
     ...(inherited ? { conversationSeed: inherited } : {})
   });
-  if (explicitSessionIdFromHeaders(request.headers)) {
+  if (explicitSessionIdFromHeaders(effectiveHeaders)) {
     recordIdentitySource("header");
     return { seed, source: "header" };
   }
@@ -802,8 +816,8 @@ function noteDurableIdentity(
     recordIdentitySource("none");
     return { seed, source: "none" };
   }
-  const fromBody = durableIdentity({ body, protocol, ownerHash });
-  const derived = conversationSeed(body, protocol, ownerHash);
+  const fromBody = durableIdentity({ body: effectiveBody, protocol, ownerHash });
+  const derived = conversationSeed(effectiveBody, protocol, ownerHash);
   if (fromBody && !(derived && identityStem(fromBody) === derived)) {
     recordIdentitySource("body-field");
     return { seed, source: "body-field" };
@@ -812,7 +826,10 @@ function noteDurableIdentity(
   // 内容推导身份（无显式 id 客户端，如 cursor-byok）没有会话边界保证：同仓库 + 同模板
   // prompt + 同分钟的并发会话会推导出同一个 seed，落进同一个 durable 槽互相串内容。
   // 每次命中都打一行指纹：并发复现时两条请求 seed 前 12 位相同即实锤碰撞，无需 debug 快照。
-  console.error(`[durable-identity] source=derived-L3 seed=${seed.slice(0, 12)} protocol=${protocol}`);
+  // demoted 时额外标注降权来源，线上可据此确认 CPA 伪装链路已被导入护栏管辖。
+  console.error(
+    `[durable-identity]${demoted ? " demoted=x-claude-code-session-id" : ""} source=derived-L3 seed=${seed.slice(0, 12)} protocol=${protocol}`
+  );
   return { seed, source: "derived-L3" };
 }
 

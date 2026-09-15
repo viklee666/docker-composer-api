@@ -672,7 +672,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                       <option value="durable">durable（复用 Agent，增量发送）</option>
                       <option value="stateless">stateless（每请求新建，等同 kill switch）</option>
                     </select>
-                    <div class="hint">Claude Code 主会话认 x-claude-code-session-id；子代理再带 x-claude-code-agent-id，不会抢同一槽。</div>
+                    <div class="hint">Claude Code 主会话认 x-claude-code-session-id（需与 metadata.user_id 的 session_id 配对，防中间层按 key 盖的常量头串会话）；子代理再带 x-claude-code-agent-id，不会抢同一槽。配不上对的请求按内容推导身份并受护栏保护。</div>
                   </div>
                   <div class="setting-field">
                     <label>挂起工具最长等待（ms） <span class="env">CURSOR_SDK_TOOL_HOLD_TTL_MS</span></label>
