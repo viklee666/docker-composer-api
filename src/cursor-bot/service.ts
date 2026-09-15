@@ -45,7 +45,7 @@ import { CursorBotProvider, conversationIdFor } from "./provider.js";
 import { buildInferenceStreamRequest } from "./request-builder.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
 import { SubagentScheduler, subagentTool, type SubagentRunContext } from "./subagent-scheduler.js";
-import { runToolLoop } from "./tool-loop.js";
+import { runToolLoop, type ToolLoopResult } from "./tool-loop.js";
 import { CursorBotStore, type BotCredential } from "./store.js";
 import { DEFAULT_BOT_CLIENT_VERSION } from "../config.js";
 import type { ConnectFetch } from "./transport.js";
@@ -105,6 +105,21 @@ interface InferenceTarget {
  */
 function isRelayRetryable(error: unknown): boolean {
   return error instanceof ApiError && [401, 403, 502].includes(error.statusCode);
+}
+
+/**
+ * relay 路由 404 = Box 侧补丁丢失（Box 重建即失），换连接无用，必须给出可操作的归因。
+ * 其余错误原样抛。三条 relay 路径（单发单收 / 工具循环 / 子代理 child）共用。
+ */
+function relayError(error: unknown): unknown {
+  if (error instanceof ApiError && error.statusCode === 404) {
+    return new ApiError(
+      "Box relay 未装配（Box 重建后补丁会丢失）：请在管理后台该 Bot 凭据行重新「装配 relay」。",
+      502,
+      "upstream_error"
+    );
+  }
+  return error;
 }
 
 /** 供后台展示的 relay 状态。 */
@@ -293,14 +308,7 @@ export class CursorBotService implements CursorRunner {
         }
         return;
       } catch (error) {
-        if (error instanceof ApiError && error.statusCode === 404) {
-          // relay 路由不在 = Box 侧补丁丢失（Box 重建即失），换连接无用。
-          throw new ApiError(
-            "Box relay 未装配（Box 重建后补丁会丢失）：请在管理后台该 Bot 凭据行重新「装配 relay」。",
-            502,
-            "upstream_error"
-          );
-        }
+        if (error instanceof ApiError && error.statusCode === 404) throw relayError(error);
         if (yieldedAny || attempt >= 1 || !isRelayRetryable(error)) throw error;
         this.boxConnections.invalidate(credential.id);
       }
@@ -364,17 +372,6 @@ export class CursorBotService implements CursorRunner {
       catalog
     });
 
-    // 工具编排是多次上游往返：连接取一次复用整轮（token 刚换新，中途轮换属极端情形）。
-    const target = await this.inferenceTarget(credential);
-    const client = new CursorBotClient({
-      credential: target.credential,
-      baseUrl: target.baseUrl,
-      codec: this.settings.codec,
-      readMaxBytes: this.settings.readMaxBytes,
-      extraHeaders: target.extraHeaders,
-      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
-    });
-
     // run / conversation 落库：工具调用的幂等、事件重放、background 恢复都挂在这两行上。
     const row = this.options.store.upsertConversation({
       ownerHash: input.sessionKey,
@@ -397,7 +394,11 @@ export class CursorBotService implements CursorRunner {
         })
       : undefined;
 
-    const generator = runToolLoop(
+    // 工具编排是多次上游往返：连接取一次复用整轮（token 刚换新，中途轮换属极端情形）。
+    // relay 下必须能重取：连接缓存不设 TTL、纯失效驱动刷新，这条路径若不 invalidate，
+    // Box 重启/token 轮换后缓存里的坏连接永远修不好——而开了工具编排之后**所有**请求
+    // 都走这里，没有任何路径会去修它（单发单收的自愈路径走不到），子代理就此永久不可用。
+    const buildGenerator = (client: CursorBotClient) => runToolLoop(
       {
         client,
         store: this.options.store,
@@ -424,12 +425,7 @@ export class CursorBotService implements CursorRunner {
     );
 
     try {
-      let next = await generator.next();
-      while (!next.done) {
-        yield next.value;
-        next = await generator.next();
-      }
-      const result = next.value;
+      const result = yield* this.driveToolLoop(credential, buildGenerator, run.id);
       if (input.telemetryRef) {
         input.telemetryRef.upstreamModel = result.resolvedModel ?? resolved.requestedModel.modelId;
         input.telemetryRef.clientType = SAND_CLIENT_TYPE;
@@ -461,19 +457,49 @@ export class CursorBotService implements CursorRunner {
   }
 
   /** 子代理的 child run：同一把凭据、独立 conversation、可以是不同模型。 */
+  /**
+   * 驱动工具循环，并在 relay 下补上「首个事件产出前可重取连接」的自愈能力。
+   *
+   * 重试边界与 streamPlain 同口径：只要已经 yield 过事件就绝不重跑（客户端收到一半的流
+   * 不能重放）。首事件之前重跑是安全的——runToolLoop 的 messages 是本地副本、事件副作用
+   * （appendEvents）只在收到事件时发生，所以此时重建 generator 等价于第一次发起。
+   * run 行只在外层建一次，重试复用同一个 runId，不会产生重复行。
+   */
+  private async *driveToolLoop(
+    credential: BotCredential,
+    buildGenerator: (client: CursorBotClient) => AsyncGenerator<CursorStreamEvent, ToolLoopResult>,
+    runId: string
+  ): AsyncGenerator<CursorStreamEvent, ToolLoopResult> {
+    for (let attempt = 0; ; attempt += 1) {
+      let yieldedAny = false;
+      try {
+        const target = await this.inferenceTarget(credential);
+        const generator = buildGenerator(new CursorBotClient({
+          credential: target.credential,
+          baseUrl: target.baseUrl,
+          codec: this.settings.codec,
+          readMaxBytes: this.settings.readMaxBytes,
+          extraHeaders: target.extraHeaders,
+          ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+        }));
+        let next = await generator.next();
+        while (!next.done) {
+          yieldedAny = true;
+          yield next.value;
+          next = await generator.next();
+        }
+        return next.value;
+      } catch (error) {
+        if (this.settings.inferenceRoute !== "relay") throw error;
+        if (error instanceof ApiError && error.statusCode === 404) throw relayError(error);
+        if (yieldedAny || attempt >= 1 || !isRelayRetryable(error)) throw error;
+        // 坏连接必须丢掉：缓存不设 TTL，不 invalidate 就永远拿同一个坏连接（runId=${runId} 这轮之后也一样）。
+        this.boxConnections.invalidate(credential.id);
+      }
+    }
+  }
+
   private async runChild(credential: BotCredential, context: SubagentRunContext): Promise<{ text: string; isError?: boolean; usage?: RequestUsage }> {
-    const target = await this.inferenceTarget(credential);
-    const client = new CursorBotClient({
-      credential: target.credential,
-      baseUrl: target.baseUrl,
-      codec: this.settings.codec,
-      readMaxBytes: this.settings.readMaxBytes,
-      extraHeaders: target.extraHeaders,
-      ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
-    });
-    // child 声明了工具时同样可能收到正文形态的调用，开启同款标记还原（包 F）；
-    // 还原出的调用同样按声明过滤 + 别名归一（与 SDK 侧同口径，见 ResponseNormalizer）。
-    const normalizer = new ResponseNormalizer({ parseToolMarkers: context.tools.length > 0, tools: context.tools });
     const request = buildInferenceStreamRequest({
       messages: [{ role: "user", text: context.prompt }],
       // child 默认不继承父的工具，`tools` 由 scheduler 按 childTools 决定。
@@ -482,17 +508,41 @@ export class CursorBotService implements CursorRunner {
       invocationId: context.invocationId,
       requestedModel: context.requestedModel
     });
-    for await (const frame of client.stream(request, context.signal)) {
-      for (const _ of normalizer.accept(frame)) {
-        // child 的增量不对外流式输出，父轮次只要它的最终文本。
+    // child 的增量不对外流式输出（父轮次只要最终文本），所以整段重跑没有"流放了一半"的问题：
+    // relay 下连接坏掉时可以直接换连接重来一次，与 streamPlain / driveToolLoop 同口径。
+    for (let attempt = 0; ; attempt += 1) {
+      // child 声明了工具时同样可能收到正文形态的调用，开启同款标记还原（包 F）；
+      // 还原出的调用同样按声明过滤 + 别名归一（与 SDK 侧同口径，见 ResponseNormalizer）。
+      // normalizer 必须每次重建：重试要的是干净的聚合状态，不能接着上次的残文往下拼。
+      const normalizer = new ResponseNormalizer({ parseToolMarkers: context.tools.length > 0, tools: context.tools });
+      try {
+        const target = await this.inferenceTarget(credential);
+        const client = new CursorBotClient({
+          credential: target.credential,
+          baseUrl: target.baseUrl,
+          codec: this.settings.codec,
+          readMaxBytes: this.settings.readMaxBytes,
+          extraHeaders: target.extraHeaders,
+          ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
+        });
+        for await (const frame of client.stream(request, context.signal)) {
+          for (const _ of normalizer.accept(frame)) {
+            // child 的增量不对外流式输出，父轮次只要它的最终文本。
+          }
+        }
+        return {
+          // 读 result() 而不是 state.text：held / 未闭合 marker 的尾部残文只有 result() 的
+          // 聚合口径收全了（这里没人迭代 flush 事件），直接读 state 会漏最后一段正文。
+          text: normalizer.result().text,
+          ...(normalizer.state.usage ? { usage: normalizer.state.usage } : {})
+        };
+      } catch (error) {
+        if (this.settings.inferenceRoute !== "relay") throw error;
+        if (error instanceof ApiError && error.statusCode === 404) throw relayError(error);
+        if (attempt >= 1 || !isRelayRetryable(error)) throw error;
+        this.boxConnections.invalidate(credential.id);
       }
     }
-    return {
-      // 读 result() 而不是 state.text：held / 未闭合 marker 的尾部残文只有 result() 的
-      // 聚合口径收全了（这里没人迭代 flush 事件），直接读 state 会漏最后一段正文。
-      text: normalizer.result().text,
-      ...(normalizer.state.usage ? { usage: normalizer.state.usage } : {})
-    };
   }
 
   /** 结构化对话。有原始 body 就走 G5 的解析器，否则退回单条 user 文本。 */

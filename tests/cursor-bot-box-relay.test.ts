@@ -79,6 +79,19 @@ const ensureStep = (body = boxResponse()) => ({
   respond: () => new Response(body, { status: 200 })
 });
 
+/** 工具编排路径开跑前会拉一次模型目录（direct api2，与 relay 无关）；失败只告警不影响主流程。 */
+const catalogStep = () => ({
+  match: (url: string) => url.includes("/aiserver.v1.AiService/AvailableModels"),
+  respond: () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+});
+
+/** 只取打到 relay 的出站请求（目录请求不算），让断言不受非 relay 流量影响。 */
+const relayCalls = (calls: Array<{ url: string; init: RequestInit }>) =>
+  calls.filter((call) => call.url.includes("sand-stream-relay"));
+
+const ensureCalls = (calls: Array<{ url: string; init: RequestInit }>) =>
+  calls.filter((call) => call.url.endsWith("/aiserver.v1.GrokBotService/EnsureSandBox"));
+
 const inferenceStep = (text = "ok", check?: (url: string, init: RequestInit) => void) => ({
   match: (url: string) => url.includes("/sand-stream-relay/aiserver.v1.InferenceService/Stream"),
   respond: (url: string, init: RequestInit) => {
@@ -273,6 +286,123 @@ test("a 404 from the relay surfaces an actionable provisioning hint, not a retry
     (error: unknown) => error instanceof ApiError && /relay 未装配/.test(error.message)
   );
   assert.equal(calls.length, 2, "404 不重试");
+  store.close();
+});
+
+/*
+ * 工具编排路径（CURSOR_BOT_SEND_TOOLS / CURSOR_BOT_SUBAGENTS 打开后走 streamWithTools）
+ * 的 relay 自愈。这条路径原先完全没有 relay 处理：连接缓存不设 TTL、纯失效驱动刷新，
+ * 而开了工具编排之后**所有**请求都走这里——没有任何路径会 invalidate，Box 重启/token
+ * 轮换后缓存里的坏连接永远修不好，子代理就此永久不可用。
+ */
+
+test("relay + tool orchestration retries once with a fresh connection after a 401", async () => {
+  const store = CursorBotStore.open(":memory:");
+  store.upsertCredential({ sessionToken: "jwt-session", machineId: "m", clientVersion: "0.44.0" });
+
+  let relayHits = 0;
+  const { calls, fetchImpl } = scriptedFetch([
+    catalogStep(),
+    ensureStep(boxResponse({ gatewayToken: "stale" })),
+    {
+      match: (url) => url.includes("sand-stream-relay"),
+      respond: (_url, init) => {
+        relayHits += 1;
+        // 第一次用陈旧 token → 401；重取连接后的第二次放行。
+        if ((init.headers as Record<string, string>).authorization === "Bearer stale") {
+          return new Response("stale token", { status: 401 });
+        }
+        return streamResponse(inferenceFrames("tool loop ok"));
+      }
+    },
+    ensureStep(boxResponse({ gatewayToken: "fresh", networkToken: "nto-fresh" }))
+  ]);
+  const service = new CursorBotService({
+    store,
+    // sendTools + subagents = 子代理可用的最小配置，也是 streamWithTools 的触发条件。
+    config: baseConfig({ botInferenceRoute: "relay", botSendTools: true, botSubagents: true }),
+    fetchImpl
+  });
+
+  const events = [];
+  for await (const event of service.stream(runRequest())) events.push(event);
+  assert.ok(events.some((event) => event.type === "done"), "重取连接后必须正常收尾");
+  assert.equal(relayHits, 2, "relay 出站两次：401 一次 + 换新连接重试一次");
+  assert.equal(ensureCalls(calls).length, 2, "坏连接必须重取（EnsureSandBox 两次）");
+  const retryHeaders = relayCalls(calls)[1].init.headers as Record<string, string>;
+  assert.equal(retryHeaders.authorization, "Bearer fresh", "重试必须用新 Box token");
+  assert.equal(retryHeaders["x-anyrun-network-token"], "nto-fresh");
+  store.close();
+});
+
+test("relay + tool orchestration surfaces the provisioning hint on 404 without retrying", async () => {
+  const store = CursorBotStore.open(":memory:");
+  store.upsertCredential({ sessionToken: "jwt-session", machineId: "m", clientVersion: "0.44.0" });
+
+  const { calls, fetchImpl } = scriptedFetch([
+    catalogStep(),
+    ensureStep(),
+    { match: (url) => url.includes("sand-stream-relay"), respond: () => new Response("no route", { status: 404 }) }
+  ]);
+  const service = new CursorBotService({
+    store,
+    config: baseConfig({ botInferenceRoute: "relay", botSendTools: true, botSubagents: true }),
+    fetchImpl
+  });
+
+  await assert.rejects(
+    () => service.run(runRequest()),
+    (error: unknown) => error instanceof ApiError && /relay 未装配/.test(error.message),
+    "工具编排路径也要给出可操作归因，不能抛裸 404"
+  );
+  assert.equal(relayCalls(calls).length, 1, "404 不重试");
+  store.close();
+});
+
+test("relay + tool orchestration drops the stale connection so the next request self-heals", async () => {
+  const store = CursorBotStore.open(":memory:");
+  store.upsertCredential({ sessionToken: "jwt-session", machineId: "m", clientVersion: "0.44.0" });
+
+  // 两次 401：第一个请求内的重试也失败 → 整个请求失败。关键是坏连接必须已被丢弃，
+  // 否则（缓存无 TTL）后续每个请求都会继续拿它，子代理永久不可用。
+  // 前两次 EnsureSandBox 发陈旧 token（本请求内的重试也失败），第三次起发好 token。
+  let ensures = 0;
+  const { calls, fetchImpl } = scriptedFetch([
+    catalogStep(),
+    {
+      match: (url) => url.endsWith("/aiserver.v1.GrokBotService/EnsureSandBox"),
+      respond: () => {
+        ensures += 1;
+        return new Response(
+          ensures <= 2
+            ? boxResponse({ gatewayToken: "stale" })
+            : boxResponse({ gatewayToken: "healthy", networkToken: "nto-healthy" }),
+          { status: 200 }
+        );
+      }
+    },
+    {
+      match: (url) => url.includes("sand-stream-relay"),
+      respond: (_url, init) =>
+        (init.headers as Record<string, string>).authorization === "Bearer stale"
+          ? new Response("stale", { status: 401 })
+          : streamResponse(inferenceFrames("recovered"))
+    }
+  ]);
+  const service = new CursorBotService({
+    store,
+    config: baseConfig({ botInferenceRoute: "relay", botSendTools: true, botSubagents: true }),
+    fetchImpl
+  });
+
+  await assert.rejects(() => service.run(runRequest()), "两次 401 之后本请求失败");
+
+  // 下一个请求：坏连接已被 invalidate（缓存无 TTL，不丢就永远拿它），重新 EnsureSandBox 后恢复。
+  const events = [];
+  for await (const event of service.stream(runRequest())) events.push(event);
+  assert.ok(events.some((event) => event.type === "done"), "下一个请求必须自愈");
+  const healthy = relayCalls(calls).at(-1)!.init.headers as Record<string, string>;
+  assert.equal(healthy.authorization, "Bearer healthy", "自愈后用的是新连接");
   store.close();
 });
 
