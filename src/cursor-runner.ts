@@ -547,8 +547,7 @@ export class CursorSdkRunner implements CursorRunner {
     const text = formatDurableUserMessage({
       firstSend,
       userText,
-      systemText: turn?.systemText,
-      toolsDeclared: input.tools.length > 0
+      systemText: turn?.systemText
     });
     await sendRecoverable({
       kind: "new_user",
@@ -2073,35 +2072,12 @@ function durableIdempotencyKey(sessionId: string, runOrdinal: number, kind: stri
   return createHash("sha256").update(`${sessionId}:${runOrdinal}:${kind}`).digest("hex");
 }
 
-/**
- * durable 增量轮次的路径提醒。
- *
- * 首程发过 STABLE_DIRECTIVE 与客户端 SYSTEM（里面有真实 workspace path）之后，后续轮次只发
- * userText——于是第 2 轮起，模型上下文里持续存在的「环境事实」只剩 SDK agent 自己的 cwd
- * （容器里的 CURSOR_WORKING_DIRECTORY，通常是 /workspace）。首程那句指令会随对话变长被淡忘，
- * 而 cwd 是运行时状态，模型（Composer 被训练成信任自己的 cwd）就会拿它拼工具路径：实测表现为
- * Grep{path:"/workspace/src"} 空手而归、再改 "src" 才命中，每次白烧一轮工具往返。
- *
- * 所以有工具声明的增量轮次都带这一行。只有一句、不重发 system（那是每轮上万 token），
- * 模型需要具体路径时回对话历史里翻即可。
- */
-const DURABLE_PATH_REMINDER =
-  "Reminder: tool paths belong to the caller's workspace (see the workspace path stated earlier in this conversation), not to your own working directory.";
-
-function formatDurableUserMessage(input: {
-  firstSend: boolean;
-  userText: string;
-  systemText?: string;
-  /** 本轮是否声明了客户端工具；没有工具就没有路径问题，不加提醒（省 token）。 */
-  toolsDeclared?: boolean;
-}): string {
+function formatDurableUserMessage(input: { firstSend: boolean; userText: string; systemText?: string }): string {
   const parts: string[] = [];
   if (input.firstSend) {
     parts.push(STABLE_DIRECTIVE);
     const system = input.systemText?.trim();
     if (system) parts.push(`SYSTEM:\n${system}`);
-  } else if (input.toolsDeclared) {
-    parts.push(DURABLE_PATH_REMINDER);
   }
   if (input.userText) parts.push(input.userText);
   return parts.join("\n\n");
