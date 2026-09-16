@@ -20,7 +20,8 @@ const LIVE_HOLD_MS = 2_000;
 const LIVE_TIMEOUT_MS = 120_000;
 
 test("mini-hub parks HTTP1 on pending execute and resumes the same run after HTTP2 resolve", async () => {
-  assert.equal(SDK_VERSION, "1.0.27");
+  // 只断言「装到了什么版本」这件事本身：SDK 版本随依赖升级变化，硬编码具体版本号会让每次升级都假失败。
+  assert.match(SDK_VERSION, /^1\.\d+\.\d+$/, `unexpected installed @cursor/sdk version: ${SDK_VERSION}`);
   const hub = new MiniHub();
   const t0 = Date.now();
   const http1 = await hub.handleHttp1("Read README.md");
