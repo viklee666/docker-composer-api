@@ -7,7 +7,10 @@ import { ApiError } from "../src/errors.js";
 import { cursorChecksum } from "../src/cursor-bot/checksum.js";
 import {
   assertUsableCredential,
+  cursorTokenExpiresAtMs,
   cursorTokenType,
+  keyMintedTokenNeedsRefresh,
+  KEY_TOKEN_REFRESH_SKEW_MS,
   type CursorBotCredential
 } from "../src/cursor-bot/credentials.js";
 import {
@@ -476,6 +479,7 @@ function jwt(payload: Record<string, unknown>): string {
 test("browser web tokens are rejected, session tokens are accepted", () => {
   assert.equal(cursorTokenType(jwt({ type: "web" })), "web");
   assert.equal(cursorTokenType(jwt({ type: "session" })), "session");
+  assert.equal(cursorTokenType(jwt({ type: "api_key_token" })), "api_key_token");
   assert.equal(cursorTokenType("opaque-token"), "unknown");
 
   const base = { id: "c", machineId: "m", clientVersion: "1" };
@@ -484,7 +488,37 @@ test("browser web tokens are rejected, session tokens are accepted", () => {
     (error: unknown) => error instanceof ApiError && error.statusCode === 401
   );
   assertUsableCredential({ ...base, sessionToken: jwt({ type: "session" }) });
+  assertUsableCredential({ ...base, sessionToken: jwt({ type: "api_key_token", exp: 1_789_578_074 }) });
   assertUsableCredential({ ...base, sessionToken: "opaque-token" });
+});
+
+test("api_key_token expiry is read from JWT exp and drives the refresh window", () => {
+  const exp = 1_789_578_074;
+  const token = jwt({ type: "api_key_token", exp, time: exp - 3600 });
+  assert.equal(cursorTokenExpiresAtMs(token), exp * 1000);
+  assert.equal(cursorTokenExpiresAtMs(jwt({ type: "session" })), undefined);
+  assert.equal(cursorTokenExpiresAtMs("opaque"), undefined);
+
+  const now = exp * 1000 - KEY_TOKEN_REFRESH_SKEW_MS - 1;
+  assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, now), false);
+  assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, exp * 1000 - KEY_TOKEN_REFRESH_SKEW_MS), true);
+  assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, exp * 1000 + 1), true);
+  assert.equal(
+    keyMintedTokenNeedsRefresh(
+      { sessionToken: jwt({ type: "api_key_token" }), updatedAt: new Date(now - 10 * 60 * 1000).toISOString() },
+      now
+    ),
+    false,
+    "无 exp 且刚写入的不刷新"
+  );
+  assert.equal(
+    keyMintedTokenNeedsRefresh(
+      { sessionToken: jwt({ type: "api_key_token" }), updatedAt: new Date(now - 51 * 60 * 1000).toISOString() },
+      now
+    ),
+    true,
+    "无 exp 超过保守寿命才刷新"
+  );
 });
 
 test("credential validation names the missing fields without echoing the token", () => {

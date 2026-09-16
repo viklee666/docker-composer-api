@@ -92,6 +92,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     // 推理出口：relay = 经 Box relay（自动 EnsureSandBox）；直连路径 0.44 起已被上游拒绝，
     // 默认仍取 direct 保持行为兼容，部署时显式开 relay。
     botInferenceRoute: env.CURSOR_BOT_INFERENCE_ROUTE?.trim().toLowerCase() === "relay" ? "relay" : "direct",
+    // 由 Key 兑换的 session JWT 约 1 小时过期；默认到期前自动再兑。粘贴的桌面端 token 不走这条。
+    botAutoRefreshFromKey: booleanValue(env.CURSOR_BOT_AUTO_REFRESH_FROM_KEY, true),
 
     // Debug 快照（包 D）：env 只做总开关与上限默认值，过滤条件与运行期开关走 gateway-settings。
     // 默认关：全量落盘会把请求原文（含 prompt）写进磁盘，必须显式开启。

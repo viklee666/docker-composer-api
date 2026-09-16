@@ -75,7 +75,8 @@ test("provider overrides round-trip through the settings store", async () => {
     autoDisableThreshold: 3,
     requestTimeoutMs: 120_000,
     sendTools: true,
-    codec: "json"
+    codec: "json",
+    autoRefreshFromKey: false
   });
   const loaded = await loadProviderRunOverrides(store, "bot");
   assert.ok(loaded);
@@ -86,6 +87,7 @@ test("provider overrides round-trip through the settings store", async () => {
   assert.equal(loaded.requestTimeoutMs, 120_000);
   assert.equal(loaded.sendTools, true);
   assert.equal(loaded.codec, "json");
+  assert.equal(loaded.autoRefreshFromKey, false);
 });
 
 test("clearing a provider override (empty value) falls back to the shared default", async () => {
@@ -148,6 +150,10 @@ test("botSettings falls back from bot overrides to env defaults", () => {
   const overridden = baseConfig({ botCodec: "json", botSendTools: true, botOverrides: { codec: "proto", sendTools: false } });
   assert.equal(botSettings(overridden).codec, "proto");
   assert.equal(botSettings(overridden).sendTools, false);
+
+  const refreshOff = baseConfig({ botAutoRefreshFromKey: true, botOverrides: { autoRefreshFromKey: false } });
+  assert.equal(botSettings(refreshOff).autoRefreshFromKey, false);
+  assert.equal(botSettings(baseConfig({})).autoRefreshFromKey, true);
 });
 
 test("bot auto-disable policy keeps its own defaults and does not inherit the SDK pool knobs", () => {
@@ -290,7 +296,7 @@ test("saving sdk overrides does not touch the bot side or the shared config", as
 test("saving bot overrides does not touch the sdk side or the shared config", async (t) => {
   const { app, store, config } = await providerSettingsApp(t);
   const response = await postSettings(app, {
-    botOverrides: { reasoningEffort: "high", sendTools: true, codec: "json", requestTimeoutMs: 120_000 }
+    botOverrides: { reasoningEffort: "high", sendTools: true, codec: "json", requestTimeoutMs: 120_000, autoRefreshFromKey: false }
   });
   assert.equal(response.statusCode, 200);
 
@@ -298,17 +304,20 @@ test("saving bot overrides does not touch the sdk side or the shared config", as
   assert.equal(config.botOverrides?.sendTools, true);
   assert.equal(config.botOverrides?.codec, "json");
   assert.equal(config.botOverrides?.requestTimeoutMs, 120_000);
+  assert.equal(config.botOverrides?.autoRefreshFromKey, false);
   assert.equal(config.sdkOverrides, undefined, "SDK 侧未被触碰");
   assert.equal(config.cursorReasoningEffort, "low", "顶层公共默认未被触碰");
 
   assert.equal(await store.getSetting("botReasoningEffort"), "high");
   assert.equal(await store.getSetting("botSendTools"), "on");
   assert.equal(await store.getSetting("botCodec"), "json");
+  assert.equal(await store.getSetting("botAutoRefreshFromKey"), "off");
   assert.equal(await store.getSetting("sdkReasoningEffort"), undefined);
 
   // 保存后 botSettings 立即反映（同一进程内 bot 路线下次请求就用新值，无需重启）。
   assert.equal(botSettings(config).sendTools, true);
   assert.equal(botSettings(config).codec, "json");
+  assert.equal(botSettings(config).autoRefreshFromKey, false);
   assert.equal(providerModelDefaults(config, "bot", "composer-2.5").reasoningEffort, "high");
   assert.equal(providerModelDefaults(config, "sdk", "composer-2.5").reasoningEffort, "low");
   assert.equal(providerRequestTimeoutMs(config, "bot"), 120_000);
@@ -317,14 +326,16 @@ test("saving bot overrides does not touch the sdk side or the shared config", as
 
 test("clearing a bot override via null restores the shared default", async (t) => {
   const { app, store, config } = await providerSettingsApp(t);
-  await postSettings(app, { botOverrides: { sendTools: true, reasoningEffort: "high" } });
+  await postSettings(app, { botOverrides: { sendTools: true, reasoningEffort: "high", autoRefreshFromKey: false } });
   assert.equal(config.botOverrides?.sendTools, true);
 
-  const response = await postSettings(app, { botOverrides: { sendTools: null, reasoningEffort: null } });
+  const response = await postSettings(app, { botOverrides: { sendTools: null, reasoningEffort: null, autoRefreshFromKey: null } });
   assert.equal(response.statusCode, 200);
   assert.equal(config.botOverrides?.sendTools, undefined, "null = 恢复跟随全局");
   assert.equal(config.botOverrides?.reasoningEffort, undefined);
+  assert.equal(config.botOverrides?.autoRefreshFromKey, undefined);
   assert.equal(botSettings(config).sendTools, false, "回落 env 默认（false）");
+  assert.equal(botSettings(config).autoRefreshFromKey, true, "回落 env 默认（开）");
   assert.equal(providerModelDefaults(config, "bot", "composer-2.5").reasoningEffort, "low");
   assert.equal(await store.getSetting("botSendTools"), "", "落库为空串 = 未覆盖标记");
   assert.equal(await loadProviderRunOverrides(store, "bot"), undefined, "全部清掉后读侧回到未覆盖");
@@ -337,6 +348,7 @@ test("invalid provider override values are rejected per field", async (t) => {
   assert.equal((await postSettings(app, { sdkOverrides: { autoDisableThreshold: 99 } })).statusCode, 400);
   assert.equal((await postSettings(app, { sdkOverrides: { fastPolicy: "always" } })).statusCode, 400);
   assert.equal((await postSettings(app, { botOverrides: { codec: "msgpack" } })).statusCode, 400);
+  assert.equal((await postSettings(app, { botOverrides: { autoRefreshFromKey: "yes" } })).statusCode, 400);
 });
 
 /* ------------------------------------------------ 端到端：provider ⇒ 不同 intent */

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { RequestUsage } from "../types.js";
-import { cursorTokenType } from "./credentials.js";
+import { cursorTokenExpiresAtIso, cursorTokenType } from "./credentials.js";
 import type { DraftEvent, UnifiedEvent, UnifiedEventType } from "./events.js";
 import { UNIFIED_EVENT_VERSION } from "./events.js";
 
@@ -271,6 +271,8 @@ export interface BotCredential {
   /** 明文 session token。**只在进程内传递，绝不进日志、响应体或 fixture。** */
   sessionToken: string;
   tokenType?: string;
+  /** JWT `exp` 的 ISO 时间。读不到（不透明 token / 无 exp）时为空。 */
+  expiresAt?: string;
   machineId: string;
   macMachineId?: string;
   clientVersion: string;
@@ -480,8 +482,11 @@ export class CursorBotStore {
         values.push(value);
       };
       put("label", input.label);
-      if (input.sessionToken) put("encrypted_session_token", this.protect(input.sessionToken));
-      if (input.sessionToken) put("token_type", cursorTokenType(input.sessionToken));
+      if (input.sessionToken) {
+        put("encrypted_session_token", this.protect(input.sessionToken));
+        put("token_type", cursorTokenType(input.sessionToken));
+        put("expires_at", cursorTokenExpiresAtIso(input.sessionToken) ?? null);
+      }
       put("machine_id", input.machineId);
       put("mac_machine_id", input.macMachineId);
       put("client_version", input.clientVersion);
@@ -510,13 +515,14 @@ export class CursorBotStore {
           client_os, client_arch, client_os_version, device_type, client_key, session_id, timezone,
           status, allowed_models, excluded_models, failure_count, last_used_at, last_error, created_at, updated_at,
           source_cursor_key_id)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?)`
       )
       .run(
         id,
         input.label ?? null,
         this.protect(input.sessionToken),
         cursorTokenType(input.sessionToken),
+        cursorTokenExpiresAtIso(input.sessionToken) ?? null,
         input.machineId,
         input.macMachineId ?? null,
         input.clientVersion,
@@ -597,6 +603,14 @@ export class CursorBotStore {
       .prepare("UPDATE bot_credentials SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
       .run(error.slice(0, 400), this.iso(), id);
     return Number(this.db.prepare("SELECT failure_count FROM bot_credentials WHERE id = ?").get(id)?.failure_count ?? 0);
+  }
+
+  /**
+   * 只留错误痕迹，不累计 failure_count、不改 updated_at。
+   * 兑换失败不该把「token 写入时间」往后推（无 exp 时回落寿命按 updated_at 算）。
+   */
+  setCredentialLastError(id: string, error: string | null): void {
+    this.db.prepare("UPDATE bot_credentials SET last_error = ? WHERE id = ?").run(error?.slice(0, 400) ?? null, id);
   }
 
   /** 整包替换额度桶标记（包 B）。undefined = 清空。 */
@@ -1067,11 +1081,13 @@ export class CursorBotStore {
   private mapCredential(row: Record<string, unknown>): BotCredential {
     // 包 B：先解析额度桶标记，解析不出（脏 JSON / 空列）当无标记，不挡选路。到期判断在选路时做。
     const exhaustedBuckets = parseBuckets(optional(row.exhausted_buckets));
+    const sessionToken = this.reveal(row.encrypted_session_token as string);
     return {
       id: row.id as string,
       label: optional(row.label),
-      sessionToken: this.reveal(row.encrypted_session_token as string),
-      tokenType: optional(row.token_type),
+      sessionToken,
+      tokenType: cursorTokenType(sessionToken),
+      expiresAt: optional(row.expires_at) ?? cursorTokenExpiresAtIso(sessionToken),
       machineId: row.machine_id as string,
       macMachineId: optional(row.mac_machine_id),
       clientVersion: row.client_version as string,

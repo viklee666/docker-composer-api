@@ -42,6 +42,7 @@ test("bot config defaults keep the SDK route in charge and every extra off", () 
   assert.deepEqual(settings.localTools, [], "本地工具默认全关");
   assert.equal(settings.codec, "proto");
   assert.match(settings.baseUrl, /^https:\/\//);
+  assert.equal(settings.autoRefreshFromKey, true, "Key 兑换的 1 小时短票默认到期前自动再兑");
 });
 
 test("bot config reads its env switches", () => {
@@ -53,7 +54,8 @@ test("bot config reads its env switches", () => {
       CURSOR_BOT_CODEC: "json",
       CURSOR_BOT_SEND_TOOLS: "true",
       CURSOR_BOT_LOCAL_TOOLS: "read_file, other",
-      CURSOR_BOT_SUBAGENTS: "1"
+      CURSOR_BOT_SUBAGENTS: "1",
+      CURSOR_BOT_AUTO_REFRESH_FROM_KEY: "false"
     })
   );
   assert.equal(settings.defaultProvider, "bot");
@@ -62,6 +64,7 @@ test("bot config reads its env switches", () => {
   assert.equal(settings.sendTools, true);
   assert.deepEqual(settings.localTools, ["read_file", "other"]);
   assert.equal(settings.subagents, true);
+  assert.equal(settings.autoRefreshFromKey, false);
 });
 
 /* ------------------------------------------------------ 凭据与可用性 */

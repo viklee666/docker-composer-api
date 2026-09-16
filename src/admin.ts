@@ -690,6 +690,17 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { credential: publicCredential(record) };
   });
 
+  /**
+   * 用源 Cursor Key 再兑一次 session JWT。只对 from-key 凭据有效；
+   * 不看自动刷新开关——运维点按钮就是要现在换。
+   */
+  app.post("/admin/api/bot/credentials/:id/refresh", async (request) => {
+    requireAdmin(request, deps);
+    const bot = requireBot(deps);
+    const record = await bot.refreshCredentialFromSourceKey(keyId(request));
+    return { credential: publicCredential(record) };
+  });
+
   app.post("/admin/api/bot/credentials", async (request) => {
     requireAdmin(request, deps);
     const bot = requireBot(deps);
@@ -1334,6 +1345,7 @@ function publicCredential(record: BotCredential): Record<string, unknown> {
     id: record.id,
     label: record.label ?? null,
     tokenType: record.tokenType ?? "unknown",
+    expiresAt: record.expiresAt ?? null,
     tokenHint: tokenHint(record.sessionToken),
     machineId: maskTail(record.machineId),
     hasMacMachineId: Boolean(record.macMachineId),
@@ -1805,6 +1817,13 @@ async function applyProviderOverrides(
       overrides.inferenceRoute = patch.inferenceRoute === "direct" || patch.inferenceRoute === "relay" ? patch.inferenceRoute : undefined;
       touched = true;
     }
+    if (patch.autoRefreshFromKey !== undefined) {
+      if (patch.autoRefreshFromKey !== null && typeof patch.autoRefreshFromKey !== "boolean") {
+        throw new ApiError("botAutoRefreshFromKey must be a boolean or null.", 400, "invalid_request_error", "botAutoRefreshFromKey");
+      }
+      overrides.autoRefreshFromKey = patch.autoRefreshFromKey ?? undefined;
+      touched = true;
+    }
   }
 
   if (!touched) return false;
@@ -1838,7 +1857,8 @@ function providerOverridesEcho(provider: GatewayProvider, overrides: ProviderRun
       ? {
           sendTools: overrides?.sendTools ?? null,
           codec: overrides?.codec ?? "",
-          inferenceRoute: overrides?.inferenceRoute ?? ""
+          inferenceRoute: overrides?.inferenceRoute ?? "",
+          autoRefreshFromKey: overrides?.autoRefreshFromKey ?? null
         }
       : {})
   };

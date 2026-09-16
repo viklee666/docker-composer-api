@@ -43,6 +43,7 @@ function botFetch(
   models: AvailableModelsResponse_AvailableModel[],
   exchange: {
     accessToken?: string;
+    accessTokens?: string[];
     refreshToken?: string;
     status?: number;
     body?: unknown;
@@ -65,7 +66,8 @@ function botFetch(
         const payload = exchange.body ?? { error: "denied" };
         return new Response(typeof payload === "string" ? payload : JSON.stringify(payload), { status: exchange.status });
       }
-      return Response.json({ accessToken: session, refreshToken: refresh });
+      const nextToken = exchange.accessTokens?.shift() ?? session;
+      return Response.json({ accessToken: nextToken, refreshToken: refresh });
     }
     if (href.includes("AvailableModels")) {
       if (exchange.failCatalog) return new Response("nope", { status: 500 });
@@ -131,7 +133,8 @@ async function buildApp(
         })
       ],
       options.exchange
-    )
+    ),
+    resolveSourceKey: (id) => keyPool.get(id)
   });
 
   const app = createApp({
@@ -178,6 +181,9 @@ test("admin endpoints require the admin password, not just any gateway key", asy
     (await app.inject({ method: "POST", url: fromKey, headers: apiAuth, payload: { cursorKeyId: "x" } })).statusCode,
     401
   );
+  const refresh = "/admin/api/bot/credentials/x/refresh";
+  assert.equal((await app.inject({ method: "POST", url: refresh })).statusCode, 401);
+  assert.equal((await app.inject({ method: "POST", url: refresh, headers: apiAuth })).statusCode, 401);
   await app.close();
 });
 
@@ -312,6 +318,53 @@ test("importing from a missing Cursor key is 404 and does not invent a credentia
   });
   assert.equal(response.statusCode, 404);
   assert.equal(botStore.listCredentials().length, 0);
+  await app.close();
+});
+
+test("from-key credential can be force-refreshed from the source key", async () => {
+  const first = jwt({ type: "api_key_token", exp: Math.floor(Date.now() / 1000) + 3600 });
+  const second = jwt({ type: "api_key_token", exp: Math.floor(Date.now() / 1000) + 7200 });
+  const calls: Array<{ url: string; authorization: string; body: string }> = [];
+  const { app, botStore, keyPool } = await buildApp({
+    exchange: { accessTokens: [first, second], refreshToken: "refresh-token", calls }
+  });
+  const [key] = await keyPool.list();
+  const created = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id }
+  });
+  assert.equal(created.statusCode, 200);
+  const id = (created.json() as { credential: { id: string } }).credential.id;
+  const machineId = botStore.credential(id)!.machineId;
+  assert.equal(botStore.credential(id)?.sessionToken, first);
+  assert.equal(botStore.credential(id)?.tokenType, "api_key_token");
+  assert.ok(botStore.credential(id)?.expiresAt);
+
+  const refreshed = await app.inject({
+    method: "POST",
+    url: `/admin/api/bot/credentials/${id}/refresh`,
+    headers: adminAuth
+  });
+  assert.equal(refreshed.statusCode, 200, refreshed.body);
+  const body = refreshed.json() as { credential: { expiresAt: string; sessionToken?: string } };
+  assert.ok(!JSON.stringify(body).includes(second), "刷新响应不回传新 token 明文");
+  assert.equal(botStore.credential(id)?.sessionToken, second);
+  assert.equal(botStore.credential(id)?.machineId, machineId);
+  assert.equal(calls.length, 2);
+
+  const pasted = botStore.upsertCredential({
+    sessionToken: "pasted",
+    machineId: "m2",
+    clientVersion: "1"
+  });
+  const refused = await app.inject({
+    method: "POST",
+    url: `/admin/api/bot/credentials/${pasted.id}/refresh`,
+    headers: adminAuth
+  });
+  assert.equal(refused.statusCode, 400);
   await app.close();
 });
 

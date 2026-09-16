@@ -416,7 +416,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                 </select>
                 <button class="primary" id="btn-bot-from-key">从 Key 拉取</button>
               </div>
-              <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。同一把 key 再拉取会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token。</p>
+              <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。这类 JWT（<code>api_key_token</code>）约 1 小时过期；默认会在到期前用同一把 Key 自动再兑，machineId 不变。同一把 key 再拉取也会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token（不会自动刷新）。</p>
               <div class="row" style="margin-bottom:14px">
                 <input id="bot-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
                 <input id="bot-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
@@ -426,7 +426,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
               <div class="table-scroll">
                 <table>
                   <thead><tr>
-                    <th>备注</th><th>token</th><th>类型</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
+                    <th>备注</th><th>token</th><th>类型</th><th>过期</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
                   </tr></thead>
                   <tbody id="bot-body"></tbody>
                 </table>
@@ -453,7 +453,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
           <div class="panel">
             <div class="head">
               <h2>运行设置</h2>
-              <span class="hint">回显当前生效值（env + 运行设置页的 Bot 覆盖）。「向上游声明工具」「编码」已可在「运行设置」页的 Bot 块实时修改；其余项仍来自环境变量，改完需重启。</span>
+              <span class="hint">回显当前生效值（env + 运行设置页的 Bot 覆盖）。「向上游声明工具」「编码」「自动刷新 Key 凭据」已可在「运行设置」页的 Bot 块实时修改；其余项仍来自环境变量，改完需重启。</span>
             </div>
             <div class="body">
               <div class="table-scroll">
@@ -874,6 +874,15 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                       <option value="relay">Box relay（自动取连接，推荐）</option>
                     </select>
                     <div class="hint">0.44 起直连会被上游拒绝，Bot 路线要用 relay。切换后到「Bot 凭据」页点 Relay 检查装配状态。</div>
+                  </div>
+                  <div class="setting-field">
+                    <label>自动刷新 Key 兑换的凭据 <span class="env">CURSOR_BOT_AUTO_REFRESH_FROM_KEY</span></label>
+                    <select id="bot-auto-refresh-from-key">
+                      <option value="">跟随 env / 默认（开启）</option>
+                      <option value="on">开启</option>
+                      <option value="off">关闭</option>
+                    </select>
+                    <div class="hint">只作用于从 Cursor Key 池兑换的 session JWT（约 1 小时过期）。到期前 5 分钟自动再兑，machineId 不变。粘贴的桌面端 token 不受影响。</div>
                   </div>
                   <div class="setting-field">
                     <label>Bot 上游空闲超时（ms）</label>
@@ -1302,7 +1311,8 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     ['本地工具白名单', 'localTools', 'CURSOR_BOT_LOCAL_TOOLS'],
     ['网关子代理', 'subagents', 'CURSOR_BOT_SUBAGENTS'],
     ['background worker', 'background', 'CURSOR_BOT_BACKGROUND'],
-    ['客户端版本', 'clientVersion', 'CURSOR_BOT_CLIENT_VERSION']
+    ['客户端版本', 'clientVersion', 'CURSOR_BOT_CLIENT_VERSION'],
+    ['自动刷新 Key 凭据', 'autoRefreshFromKey', 'CURSOR_BOT_AUTO_REFRESH_FROM_KEY']
   ];
 
   function loadBot(){
@@ -1376,6 +1386,9 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         '<button data-bot-copy="' + esc(item.id) + '" title="复制完整 session token 到剪贴板（页面不显示明文）">复制</button>',
         '<button data-bot-test="' + esc(item.id) + '">测试</button>',
         '<button data-bot-relay="' + esc(item.id) + '" title="检查 Box relay 状态；未装配时可一键装配">Relay</button>',
+        item.sourceCursorKeyId
+          ? '<button data-bot-refresh="' + esc(item.id) + '" title="用源 Cursor Key 再兑换一次 session JWT">刷新</button>'
+          : '',
         item.status === 'active'
           ? '<button data-bot-disable="' + esc(item.id) + '">停用</button>'
           : '<button data-bot-enable="' + esc(item.id) + '">启用</button>',
@@ -1386,6 +1399,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         '<td>' + esc(item.label || '-') + '</td>' +
         '<td><code>' + esc(item.tokenHint) + '</code></td>' +
         '<td>' + esc(item.tokenType) + warn + '</td>' +
+        '<td class="muted">' + esc(tokenExpiryLabel(item.expiresAt)) + '</td>' +
         '<td><code>' + esc(item.machineId) + '</code>' + (item.hasMacMachineId ? ' +mac' : '') + '</td>' +
         '<td>' + esc(item.clientVersion) + '</td>' +
         '<td>' + badge + '</td>' +
@@ -1394,6 +1408,18 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         '<td class="row" style="gap:6px">' + actions + '</td>' +
         '</tr>';
     }).join('');
+  }
+
+  function tokenExpiryLabel(iso){
+    if (!iso) return '-';
+    var ms = Date.parse(iso) - Date.now();
+    if (!isFinite(ms)) return '-';
+    if (ms <= 0) return '已过期';
+    var min = Math.round(ms / 60000);
+    if (min < 90) return min + ' 分钟后';
+    var hours = Math.round(min / 60);
+    if (hours < 48) return hours + ' 小时后';
+    return iso.replace('T', ' ').slice(0, 19);
   }
 
   /** 装配任务轮询：30s 一次、最多 20 次（10 分钟），任务结束 toast 一次。 */
@@ -1621,6 +1647,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     $('bot-send-tools').value = bot.sendTools == null ? '' : (bot.sendTools ? 'on' : 'off');
     $('bot-codec').value = bot.codec || '';
     $('bot-inference-route').value = bot.inferenceRoute || '';
+    $('bot-auto-refresh-from-key').value = bot.autoRefreshFromKey == null ? '' : (bot.autoRefreshFromKey ? 'on' : 'off');
     $('bot-request-timeout').value = bot.requestTimeoutMs == null ? '' : bot.requestTimeoutMs;
     $('bot-auto-disable').value = bot.autoDisableKeys == null ? '' : (bot.autoDisableKeys ? 'on' : 'off');
     $('bot-auto-disable-threshold').value = bot.autoDisableThreshold == null ? '' : bot.autoDisableThreshold;
@@ -2604,6 +2631,23 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       });
       return;
     }
+    id = target.getAttribute('data-bot-refresh');
+    if (id) {
+      target.disabled = true;
+      var prev = target.textContent;
+      target.textContent = '刷新中…';
+      api('POST', '/admin/api/bot/credentials/' + encodeURIComponent(id) + '/refresh').then(function(){
+        toast('已用源 Key 刷新 session token');
+        loadBot();
+      }).catch(function(err){
+        if (err.message !== 'unauthorized') toast('刷新失败：' + err.message, true);
+        loadBot();
+      }).finally(function(){
+        target.disabled = false;
+        target.textContent = prev || '刷新';
+      });
+      return;
+    }
     id = target.getAttribute('data-bot-enable') || target.getAttribute('data-bot-disable');
     if (id) {
       var action = target.hasAttribute('data-bot-enable') ? 'enable' : 'disable';
@@ -2929,6 +2973,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         sendTools: $('bot-send-tools').value === '' ? null : $('bot-send-tools').value === 'on',
         codec: $('bot-codec').value || null,
         inferenceRoute: $('bot-inference-route').value || null,
+        autoRefreshFromKey: $('bot-auto-refresh-from-key').value === '' ? null : $('bot-auto-refresh-from-key').value === 'on',
         requestTimeoutMs: botTimeout,
         autoDisableKeys: $('bot-auto-disable').value === '' ? null : $('bot-auto-disable').value === 'on',
         autoDisableThreshold: botThreshold

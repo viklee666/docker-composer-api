@@ -41,11 +41,18 @@ export {
 export { cursorChecksum } from "./checksum.js";
 
 export {
+  KEY_TOKEN_REFRESH_FALLBACK_TTL_MS,
+  KEY_TOKEN_REFRESH_INTERVAL_MS,
+  KEY_TOKEN_REFRESH_RETRY_MS,
+  KEY_TOKEN_REFRESH_SKEW_MS,
   SAND_CLIENT_TYPE,
   SAND_DEFAULT_MODEL_ID,
   assertUsableCredential,
   credentialClientType,
+  cursorTokenExpiresAtIso,
+  cursorTokenExpiresAtMs,
   cursorTokenType,
+  keyMintedTokenNeedsRefresh,
   type CursorBotCredential,
   type CursorTokenType
 } from "./credentials.js";

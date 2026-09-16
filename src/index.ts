@@ -272,12 +272,18 @@ seedBotCredential(botStore, config);
 // 包 B：额度桶双向联动协调器。key 池与 bot 凭据表背后是同一个 Cursor 账号，
 // 任一侧撞上 resource_exhausted 都把另一侧的同一个桶一起标上，清除时也一起清。
 const quotaBucketSync = new QuotaBucketSync({ keyPool, botStore, table: quotaBucketTable });
-const bot = new CursorBotService({ store: botStore, config, quotaBuckets: quotaBucketSync });
+const bot = new CursorBotService({
+  store: botStore,
+  config,
+  quotaBuckets: quotaBucketSync,
+  resolveSourceKey: (id) => keyPool.get(id)
+});
 if (bot.status().available) {
   console.log(`Cursor Bot: ${bot.status().activeCredentials} credential(s) ready, base=${botSettings(config).baseUrl}`);
 } else {
   console.log(`Cursor Bot: inactive (${bot.status().reason ?? "未配置"})`);
 }
+bot.startKeyTokenRefresh();
 
 // background worker 只在显式打开时启动：它会自己取 lease 跑 queued 的 run，
 // 没有对外端点在用的时候白跑一圈没意义。
@@ -399,6 +405,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
       await executorLeases.releaseAll();
       // 关停 Bot worker 不是失败：它会把在途 run 放回 queued，重启后接着跑。
       await botWorker?.stop();
+      bot.stopKeyTokenRefresh();
       botStore.close();
       localAgentStore.close();
       process.exit(0);

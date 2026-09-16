@@ -360,7 +360,8 @@ const PROVIDER_OVERRIDE_KEYS = {
   agentMode: "AgentMode",
   sendTools: "SendTools",
   codec: "Codec",
-  inferenceRoute: "InferenceRoute"
+  inferenceRoute: "InferenceRoute",
+  autoRefreshFromKey: "AutoRefreshFromKey"
 } as const;
 
 function providerSettingKey(
@@ -423,6 +424,7 @@ export async function loadProviderRunOverrides(
     if (codec === "proto" || codec === "json") overrides.codec = codec;
     const route = await store.getSetting(providerSettingKey("bot", "inferenceRoute"));
     if (route === "direct" || route === "relay") overrides.inferenceRoute = route;
+    overrides.autoRefreshFromKey = await loadOverrideFlag(store, providerSettingKey("bot", "autoRefreshFromKey"));
   }
 
   return Object.values(overrides).some((value) => value !== undefined) ? overrides : undefined;
@@ -466,6 +468,7 @@ export async function saveProviderRunOverrides(
     await saveOverrideFlag(store, providerSettingKey("bot", "sendTools"), overrides.sendTools);
     await store.setSetting(providerSettingKey("bot", "codec"), overrides.codec ?? "");
     await store.setSetting(providerSettingKey("bot", "inferenceRoute"), overrides.inferenceRoute ?? "");
+    await saveOverrideFlag(store, providerSettingKey("bot", "autoRefreshFromKey"), overrides.autoRefreshFromKey);
   }
 }
 

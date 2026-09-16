@@ -29,7 +29,12 @@ import { resolveRequestedModel } from "./catalog.js";
 import { CursorBotClient, DEFAULT_BOT_BASE_URL } from "./client.js";
 import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
 import type { CursorBotCredential } from "./credentials.js";
-import { SAND_CLIENT_TYPE } from "./credentials.js";
+import {
+  KEY_TOKEN_REFRESH_INTERVAL_MS,
+  KEY_TOKEN_REFRESH_RETRY_MS,
+  SAND_CLIENT_TYPE,
+  keyMintedTokenNeedsRefresh
+} from "./credentials.js";
 import { DEFAULT_READ_MAX_BYTES } from "./envelope.js";
 import { isUpstreamResourceExhausted } from "./errors.js";
 import type { UnifiedEvent } from "./events.js";
@@ -68,6 +73,11 @@ export interface BotSettings {
    * `relay` = 经 Box relay（EnsureSandBox 自动取连接，token 失效自动重取重试）。
    */
   inferenceRoute: "direct" | "relay";
+  /**
+   * 由 Cursor Key 兑换的 session JWT 到期前是否自动再兑。
+   * 只作用于带 sourceCursorKeyId 的凭据。
+   */
+  autoRefreshFromKey: boolean;
 }
 
 export function botSettings(config: GatewayConfig): BotSettings {
@@ -84,7 +94,8 @@ export function botSettings(config: GatewayConfig): BotSettings {
     background: config.botBackground ?? false,
     clientVersion: config.botClientVersion?.trim() || DEFAULT_BOT_CLIENT_VERSION,
     extraHeaders: config.botExtraHeaders ?? {},
-    inferenceRoute: overrides?.inferenceRoute ?? config.botInferenceRoute ?? "direct"
+    inferenceRoute: overrides?.inferenceRoute ?? config.botInferenceRoute ?? "direct",
+    autoRefreshFromKey: overrides?.autoRefreshFromKey ?? config.botAutoRefreshFromKey ?? true
   };
 }
 
@@ -175,6 +186,15 @@ export interface CursorBotServiceOptions {
    * 未提供时不做桶过滤、不标桶，行为与改造前一致（测试装配不用改）。
    */
   quotaBuckets?: QuotaBucketHooks;
+  /**
+   * 解析兑换源 Cursor key。自动刷新 from-key 凭据时用它拿明文 apiKey。
+   * 未提供则自动刷新静默跳过（测试装配不必注入）。
+   */
+  resolveSourceKey?: (
+    id: string
+  ) => Promise<Pick<CursorKeyRecord, "id" | "apiKey" | "label" | "modelScope" | "status"> | undefined>;
+  /** 可注入时钟，方便测到期窗口。 */
+  now?: () => Date;
 }
 
 /**
@@ -191,6 +211,11 @@ export class CursorBotService implements CursorRunner {
   private readonly boxConnections = new BoxRelayConnectionManager();
   /** 装配任务（按凭据至多一个；进程内存态，重启即清）。 */
   private readonly relayProvisions = new Map<string, RelayProvisionJob>();
+  /** 同一把凭据的兑换单飞：并发请求不能每人打一次 exchange。 */
+  private readonly keyTokenRefreshes = new Map<string, Promise<BotCredential>>();
+  /** 兑换失败后的退避截止（credential id → epoch ms）。 */
+  private readonly keyTokenRefreshBackoffUntil = new Map<string, number>();
+  private keyTokenRefreshTimer?: ReturnType<typeof setInterval>;
   /** runId → SSE 订阅者。事件先落库、再从这里推出去。 */
   private readonly listeners = new Map<string, Set<(event: UnifiedEvent) => void>>();
 
@@ -268,7 +293,7 @@ export class CursorBotService implements CursorRunner {
     // 包 B：整条请求（含失败标桶、成功清标记）都按这个桶算。vendor 推断用目录缓存里的
     // 任意一份——vendor 是模型属性，与用哪把凭据拉到的目录无关。
     const bucket = this.options.quotaBuckets?.resolveBucket(input.model, this.anyVendorIsCursor(input.model));
-    const credential = this.pickCredential(input.model, bucket);
+    const credential = await this.ensureFreshKeyToken(this.pickCredential(input.model, bucket));
     try {
       // 网关侧需要代跑工具（本地工具 / 子代理）时走多轮循环；否则单发单收。
       // 两条路都产出同样的 `CursorStreamEvent`，对外 SSE 层不区分。
@@ -637,15 +662,14 @@ export class CursorBotService implements CursorRunner {
 
   /** 对外模型列表（`/v1/models` 的 Bot 视角）。DISABLED 的不暴露。 */
   async listModels(force = false): Promise<BotModelEntry[]> {
-    const credential = this.pickCredential();
+    const credential = await this.ensureFreshKeyToken(this.pickCredential());
     const catalog = await this.catalog(credential, force);
     return (catalog?.models ?? []).filter((model) => model.degradation !== "disabled");
   }
 
   /** 连通性测试：后台按钮用。成功返回目录规模，失败原样把错误交回去。 */
   async testCredential(credentialId: string): Promise<{ ok: true; models: number; defaultModel?: string }> {
-    const credential = this.options.store.credential(credentialId);
-    if (!credential) throw new ApiError("Credential not found.", 404, "not_found");
+    const credential = await this.ensureFreshKeyToken(this.requireCredential(credentialId));
     try {
       const catalog = await fetchAvailableModels({
         credential,
@@ -682,6 +706,7 @@ export class CursorBotService implements CursorRunner {
       fetchImpl: this.options.fetchImpl
     });
     const existing = this.options.store.credentialBySourceKeyId(key.id);
+    const previousToken = existing?.sessionToken;
     const label = options.label?.trim() || key.label?.trim() || existing?.label;
     const write = (target?: BotCredential): BotCredential =>
       this.options.store.upsertCredential({
@@ -699,11 +724,17 @@ export class CursorBotService implements CursorRunner {
         status: "active"
       });
     try {
-      return write(existing);
+      const written = write(existing);
+      if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
+      return written;
     } catch (error) {
       // 两个进程同时首次导入同一把 key 时，输家撞 UNIQUE。改走更新而不是把兑换结果丢掉。
       const raced = this.options.store.credentialBySourceKeyId(key.id);
-      if (raced) return write(raced);
+      if (raced) {
+        const written = write(raced);
+        if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
+        return written;
+      }
       throw error;
     }
   }
@@ -752,7 +783,7 @@ export class CursorBotService implements CursorRunner {
    * 探测有网络往返（上限 30s），只供后台按钮触发，不进请求热路径。
    */
   async relayStatus(credentialId: string): Promise<RelayStatusReport> {
-    const credential = this.requireCredential(credentialId);
+    const credential = await this.ensureFreshKeyToken(this.requireCredential(credentialId));
     const connection = await this.boxConnections.get(credential, {
       baseUrl: this.settings.baseUrl,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
@@ -792,11 +823,13 @@ export class CursorBotService implements CursorRunner {
     };
     this.relayProvisions.set(credential.id, { snapshot });
 
-    const getConnection = (): Promise<BoxRelayConnection> =>
-      this.boxConnections.get(credential, {
+    const getConnection = async (): Promise<BoxRelayConnection> => {
+      const fresh = await this.ensureFreshKeyToken(this.requireCredential(credential.id));
+      return this.boxConnections.get(fresh, {
         baseUrl: this.settings.baseUrl,
         ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {})
       });
+    };
     // 装配期间连接可能因 host 重启轮换：探测报 auth/不可达就失效重取。
     const refreshedConnection = async (): Promise<BoxRelayConnection> => {
       try {
@@ -825,6 +858,107 @@ export class CursorBotService implements CursorRunner {
       });
 
     return { ...snapshot };
+  }
+
+  /**
+   * 由 Key 兑换的短票巡检。进程启动时打开；后台改开关立即生效（每次 tick 现查 settings）。
+   * 定时器 unref，不独自拖住进程。
+   */
+  startKeyTokenRefresh(): void {
+    if (this.keyTokenRefreshTimer) return;
+    const tick = (): void => {
+      void this.refreshExpiringKeyTokens().catch((error: unknown) => {
+        console.error(`[cursor-bot] key token refresh tick failed: ${errorText(error)}`);
+      });
+    };
+    this.keyTokenRefreshTimer = setInterval(tick, KEY_TOKEN_REFRESH_INTERVAL_MS);
+    this.keyTokenRefreshTimer.unref?.();
+    tick();
+  }
+
+  stopKeyTokenRefresh(): void {
+    if (!this.keyTokenRefreshTimer) return;
+    clearInterval(this.keyTokenRefreshTimer);
+    this.keyTokenRefreshTimer = undefined;
+  }
+
+  /** 巡检所有 from-key 凭据：到期窗口内的再兑一次。自动刷新关闭时直接返回。 */
+  async refreshExpiringKeyTokens(): Promise<void> {
+    if (!this.settings.autoRefreshFromKey || !this.options.resolveSourceKey) return;
+    for (const credential of this.options.store.activeCredentials()) {
+      if (!credential.sourceCursorKeyId) continue;
+      await this.ensureFreshKeyToken(credential);
+    }
+  }
+
+  /**
+   * 后台「刷新」：无视到期窗口与自动刷新开关，只要有 sourceCursorKeyId 就再兑一次。
+   */
+  async refreshCredentialFromSourceKey(credentialId: string): Promise<BotCredential> {
+    const credential = this.requireCredential(credentialId);
+    if (!credential.sourceCursorKeyId) {
+      throw new ApiError("这份凭据不是从 Cursor Key 兑换的，无法自动刷新。", 400, "invalid_request_error");
+    }
+    return this.refreshFromSourceKey(credential, { force: true, allowDisabledKey: true });
+  }
+
+  private nowMs(): number {
+    return (this.options.now?.() ?? new Date()).getTime();
+  }
+
+  private async ensureFreshKeyToken(credential: BotCredential): Promise<BotCredential> {
+    if (!credential.sourceCursorKeyId || !this.options.resolveSourceKey) return credential;
+    if (!this.settings.autoRefreshFromKey) return credential;
+    if (!keyMintedTokenNeedsRefresh(credential, this.nowMs())) return credential;
+    return this.refreshFromSourceKey(credential, { force: false, allowDisabledKey: false });
+  }
+
+  private async refreshFromSourceKey(
+    credential: BotCredential,
+    options: { force: boolean; allowDisabledKey: boolean }
+  ): Promise<BotCredential> {
+    const inflight = this.keyTokenRefreshes.get(credential.id);
+    if (inflight) return inflight;
+    const task = this.doRefreshFromSourceKey(credential, options).finally(() => {
+      this.keyTokenRefreshes.delete(credential.id);
+    });
+    this.keyTokenRefreshes.set(credential.id, task);
+    return task;
+  }
+
+  private async doRefreshFromSourceKey(
+    credential: BotCredential,
+    options: { force: boolean; allowDisabledKey: boolean }
+  ): Promise<BotCredential> {
+    const sourceKeyId = credential.sourceCursorKeyId?.trim();
+    if (!sourceKeyId) return credential;
+    const backoffUntil = this.keyTokenRefreshBackoffUntil.get(credential.id) ?? 0;
+    if (!options.force && backoffUntil > this.nowMs()) return credential;
+
+    const key = await this.options.resolveSourceKey?.(sourceKeyId);
+    if (!key?.apiKey) {
+      if (options.force) {
+        throw new ApiError("源 Cursor Key 已不在池里，无法刷新这份凭据。", 404, "not_found", "cursorKeyId");
+      }
+      return credential;
+    }
+    if (key.status === "disabled" && !options.allowDisabledKey) return credential;
+
+    try {
+      const next = await this.importFromCursorKey(key);
+      this.keyTokenRefreshBackoffUntil.delete(credential.id);
+      this.options.store.setCredentialLastError(next.id, null);
+      if (next.sessionToken !== credential.sessionToken) {
+        console.log(`[cursor-bot] refreshed key-minted session token for credential ${next.id}`);
+      }
+      return next;
+    } catch (error) {
+      this.keyTokenRefreshBackoffUntil.set(credential.id, this.nowMs() + KEY_TOKEN_REFRESH_RETRY_MS);
+      this.options.store.setCredentialLastError(credential.id, `刷新 session token 失败：${errorText(error)}`);
+      if (options.force) throw error;
+      console.error(`[cursor-bot] failed to refresh key-minted token for credential ${credential.id}: ${errorText(error)}`);
+      return credential;
+    }
   }
 
   private requireCredential(credentialId: string): BotCredential {

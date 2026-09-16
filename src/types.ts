@@ -151,6 +151,13 @@ export interface GatewayConfig {
    * env: CURSOR_BOT_INFERENCE_ROUTE。
    */
   botInferenceRoute?: "direct" | "relay";
+  /**
+   * 是否自动刷新「从 Cursor Key 兑换」的 Bot session JWT。
+   * 这类 token 的 `type` 是 `api_key_token`，实测有效期约 1 小时。
+   * 只作用于带 `sourceCursorKeyId` 的凭据；粘贴的桌面端 token 不受影响。
+   * 默认开。env: CURSOR_BOT_AUTO_REFRESH_FROM_KEY。后台 Bot 运行设置可覆盖。
+   */
+  botAutoRefreshFromKey?: boolean;
 
   /* ------------------------------- Debug 模式（包 D，计划 §3.1） */
 
@@ -518,6 +525,10 @@ export interface ProviderRunOverrides {
    * EnsureSandBox 自动获取、失效自动重取。
    */
   inferenceRoute?: "direct" | "relay";
+  /**
+   * Bot 路线：是否自动刷新由 Cursor Key 兑换的短票（顶层 botAutoRefreshFromKey 的覆盖）。
+   */
+  autoRefreshFromKey?: boolean;
 }
 
 export interface CursorRunResult {
