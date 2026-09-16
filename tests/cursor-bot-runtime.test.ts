@@ -656,6 +656,33 @@ test("with an executor the loop feeds results back on a new invocation id", asyn
   ]);
 });
 
+test("grok tool loop still feeds results back without advertising tools[]", async () => {
+  const { client, requests } = fakeClient([
+    [toolFrame({ toolCallId: "c1", toolName: "search", args: '{"q":1}', isComplete: true })],
+    [textFrame("final answer")]
+  ]);
+  const result = await drainLoop(
+    runToolLoop(
+      { client, executeTool: async () => ({ result: { hits: 2 } }) },
+      {
+        conversation: conversation({ tools: [{ name: "search" }] }),
+        requestedModel: { modelId: "grok-4.6" },
+        runId: "run-1",
+        newInvocationId: () => "inv-g"
+      }
+    )
+  );
+  assert.equal(result.stoppedBecause, "completed");
+  assert.equal(result.text, "final answer");
+  assert.deepEqual(requests[0].toolNames, []);
+  assert.deepEqual(requests[1].toolNames, []);
+  assert.deepEqual(requests[1].roles, [
+    InferenceMessageRole.USER,
+    InferenceMessageRole.ASSISTANT,
+    InferenceMessageRole.TOOL
+  ]);
+});
+
 test("the loop stops at the iteration ceiling instead of spinning forever", async () => {
   const { client, requests } = fakeClient([[toolFrame({ toolCallId: "c1", toolName: "t", args: "{}", isComplete: true })]]);
   const result = await drainLoop(

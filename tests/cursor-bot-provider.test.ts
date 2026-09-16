@@ -149,6 +149,37 @@ test("a built request survives a binary round trip", () => {
   assert.equal(decoded.requestedModel?.parameters[0].value, "low");
 });
 
+test("grok keeps client tools off the wire; other models still advertise", () => {
+  const tools = [{ name: "search", description: "d", inputSchema: { type: "object" } }];
+  const grok = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "grok-4.6" }
+  });
+  assert.deepEqual(grok.tools, []);
+
+  const composer = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "composer-2.5" }
+  });
+  assert.equal(composer.tools[0].name, "search");
+
+  const forced = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    advertiseTools: true,
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "grok-4.6" }
+  });
+  assert.equal(forced.tools[0].name, "search");
+});
+
 /* ---------------------------------------------------------- response normalizer */
 
 function textFrame(text: string, isFinal = false): InferenceStreamResponse {
@@ -766,15 +797,44 @@ test("system instructions are sent as their own SYSTEM message", async () => {
   assert.equal(captured[0].request.messages[0].content.value, "gateway policy");
 });
 
-test("tools stay off the wire until the tool loop is verified", async () => {
+test("tools stay off the wire until sendTools is on; grok never advertises", async () => {
   const tools = [{ name: "search", description: "d", inputSchema: { type: "object" } }];
   const off = provider([messageFrame(textFrame("ok")), endFrame()]);
   await off.instance.run(runRequest({ tools }));
   assert.deepEqual(off.captured[0].request.tools, []);
 
-  const on = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
-  await on.instance.run(runRequest({ tools }));
-  assert.equal(on.captured[0].request.tools[0].name, "search");
+  const grokOn = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
+  await grokOn.instance.run(runRequest({ tools }));
+  assert.deepEqual(grokOn.captured[0].request.tools, [], "grok 不声明 tools[] 也能调工具");
+
+  const composerOn = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
+  await composerOn.instance.run(runRequest({ model: "composer-2.5", tools }));
+  assert.equal(composerOn.captured[0].request.tools[0].name, "search");
+});
+
+test("grok sendTools still reconstitutes body markers without advertising tools", async () => {
+  const marker = '<tool_call>{"name":"search","arguments":{"q":"x"}}</tool_call>';
+  const { instance, captured } = provider(
+    [messageFrame(textFrame("查一下 " + marker)), messageFrame(textFrame("", true)), endFrame()],
+    { sendTools: true }
+  );
+  const events = [];
+  for await (const event of instance.stream(
+    runRequest({ tools: [{ name: "search", description: "d", inputSchema: { type: "object" } }] })
+  )) {
+    events.push(event);
+  }
+  assert.deepEqual(captured[0].request.tools, []);
+  const calls = events.filter((event) => event.type === "tool_call");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.type, "tool_call");
+  if (calls[0]?.type !== "tool_call") return;
+  assert.equal(calls[0].toolCall.name, "search");
+  assert.deepEqual(calls[0].toolCall.arguments, { q: "x" });
+  const done = events.find((event) => event.type === "done");
+  assert.equal(done?.type, "done");
+  if (done?.type !== "done") return;
+  assert.ok(!done.result.text.includes("<tool_call>"));
 });
 
 test("telemetry captures the model, params and upstream usage", async () => {

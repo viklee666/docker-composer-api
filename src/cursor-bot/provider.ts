@@ -41,11 +41,9 @@ export interface CursorBotProviderOptions {
    */
   systemInstructions?: string[];
   /**
-   * 是否向上游声明 `tools[]`。默认 false。
-   *
-   * request-builder 与 response-normalizer 都已按 descriptor 实现了工具的编解码，
-   * 但「同 conversation_id、新 invocation_id 的第二次 Stream 请求能否接续」尚未实测（G6/P2），
-   * 在那之前声明工具会让模型发起一轮网关接不住的调用。
+   * 是否把调用方的工具表纳入本轮对话（解析 XML / 过滤未声明调用）。
+   * 默认 false。真正写进上游 `tools[]` 还要过 `shouldAdvertiseBotTools`：
+   * grok 家族即使这里为 true 也不会声明——它不声明也能发起调用，一声明反而 `resource_exhausted`。
    */
   sendTools?: boolean;
   /** 供测试注入。 */

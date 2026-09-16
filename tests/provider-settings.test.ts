@@ -201,7 +201,7 @@ test("bot sendTools takes effect at runtime without rebuilding the service", asy
     protocol: "openai-chat",
     apiKey: "unused",
     useKeyPool: false,
-    model: "grok-4.6",
+    model: "composer-2.5",
     prompt: "hello",
     sessionKey: "owner",
     images: [],
@@ -216,9 +216,12 @@ test("bot sendTools takes effect at runtime without rebuilding the service", asy
   for await (const _ of service.stream(run)) void _;
   assert.equal(upstream[1].tools.length, 1, "运行期改 sendTools=true 后同一请求带上 tools");
 
+  for await (const _ of service.stream({ ...run, model: "grok-4.6" })) void _;
+  assert.equal(upstream[2].tools.length, 0, "grok 即使 sendTools=true 也不向上游声明 tools[]");
+
   config.botOverrides = { sendTools: false };
   for await (const _ of service.stream(run)) void _;
-  assert.equal(upstream[2].tools.length, 0, "改回 false 同样立即生效");
+  assert.equal(upstream[3].tools.length, 0, "改回 false 同样立即生效");
   store.close();
 });
 

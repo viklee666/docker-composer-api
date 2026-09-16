@@ -80,6 +80,7 @@ export {
 export {
   buildInferenceStreamRequest,
   buildRequestedModel,
+  shouldAdvertiseBotTools,
   toStruct,
   toValue,
   type BotConversation as BotRequestConversation,

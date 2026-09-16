@@ -131,9 +131,8 @@ export async function* runToolLoop(
     }
 
     const normalizer = new ResponseNormalizer({
-      // 本轮声明了 tools 才解析正文标记（包 F）：上游可能不回结构化 tool_call 帧而把
-      // 调用写进正文，这里把它们还原成 tool_call 事件喂给循环；声明表一并交给
-      // normalizer 做未声明过滤与别名归一（与 SDK 侧同口径）。
+      // 本轮本地有工具表才解析正文标记（包 F）。grok 不把 tools[] 发给上游，
+      // 但仍靠这里把正文 XML / 结构化帧还原成 tool_call。
       parseToolMarkers: (options.conversation.tools?.length ?? 0) > 0,
       tools: options.conversation.tools
     });
