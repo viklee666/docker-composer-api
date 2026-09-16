@@ -42,8 +42,7 @@ import type {
  * File-edit guardrail + “use already-registered tools”.
  */
 export const STABLE_DIRECTIVE =
-  "Do not edit, create, or delete files on this machine, and do not run shell commands here. When a task needs a tool, call one of the already-registered tools through the tool interface; do not claim a registered tool is unavailable. " +
-  "Tools run on the CALLER's machine, which has a different filesystem from this one: never build tool paths from your own working directory. Use the workspace path the caller states in the conversation, paths that appeared in earlier tool results, or plain workspace-relative paths.";
+  "Do not edit, create, or delete files on this machine, and do not run shell commands here. When a task needs a tool, call one of the already-registered tools through the tool interface; do not claim a registered tool is unavailable.";
 
 /** 解析后可直接发给 SDK 的模型选择 + 会话模式。 */
 interface ResolvedModelRun {

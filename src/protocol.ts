@@ -818,7 +818,6 @@ function systemDirective(tools: GatewayTool[]): string {
   if (!tools.length) return "Respond to the conversation below directly. Do not use tools or edit files.";
   return [
     "The caller registered external tools (listed under TOOLS below), executed by the CALLER on their machine, not by you.",
-    "That machine has a different filesystem from yours: never build tool paths from your own working directory. Use the workspace path the caller states in the conversation, paths that appeared in earlier TOOL RESULT messages, or plain workspace-relative paths.",
     "Treat every listed tool as available. Use the exact tool name and input schema shown under TOOLS; never claim a listed tool is unavailable and never substitute a builtin tool for it.",
     "When a listed tool is needed, call it through the tool interface. Only if the tool interface is unavailable, reply with ONLY fallback tool call block(s) in exactly this format and no other prose:",
     '<tool_call>{"name":"tool_name","arguments":{"key":"value"}}</tool_call>',

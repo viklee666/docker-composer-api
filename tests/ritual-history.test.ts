@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { STABLE_DIRECTIVE } from "../src/cursor-runner.js";
 import {
   isRitualAssistantText,
   prepareAnthropicMessages,
@@ -416,50 +415,4 @@ test("prepareOpenAiChat keeps host-meta tool result even when it appears before 
   assert.ok(prompt.includes("schema-pack"), "host-meta tool result now replays regardless of ordering");
   assert.ok(prompt.includes("GetMcpTools"), "host-meta tool_calls now replay");
   assert.ok(prompt.includes("Hello"), "user Hello stays");
-});
-
-test("tool directives tell the model the caller's filesystem owns the paths", () => {
-  // 网关容器里 SDK agent 的 cwd 是 /workspace，而工具实际由调用方在**他们自己的机器**上执行。
-  // 不点破这件事，模型会拿自己的 cwd 拼路径（实测：先试 /workspace/src 失败、再试 src 才成功，
-  // 白烧一轮工具调用；并发场景下还会助推重试循环）。三套协议的合成 prompt 都要带这句。
-  const chat = prepareOpenAiChat({
-    model: "composer-2.5",
-    messages: [{ role: "user", content: "read a file" }],
-    tools: [READ_CHAT]
-  });
-  const anthropic = prepareAnthropicMessages({
-    model: "composer-2.5",
-    max_tokens: 1024,
-    tools: [READ_ANTHROPIC],
-    messages: [{ role: "user", content: "read a file" }]
-  });
-  const responses = prepareOpenAiResponses({
-    model: "composer-2.5",
-    input: "read a file",
-    tools: [READ_RESPONSES]
-  });
-
-  for (const [name, prepared] of [["chat", chat], ["anthropic", anthropic], ["responses", responses]] as const) {
-    assert.match(
-      prepared.prompt,
-      /never build tool paths from your own working directory/,
-      `${name}: 必须告诉模型不要用自己的 cwd 拼路径`
-    );
-    assert.match(
-      prepared.prompt,
-      /workspace path the caller states in the conversation/,
-      `${name}: 必须指出正确的路径来源`
-    );
-  }
-
-  // 无工具的请求不谈路径（没有工具就没有路径问题，多一句只是噪音）。
-  const noTools = prepareOpenAiChat({ model: "composer-2.5", messages: [{ role: "user", content: "hi" }] });
-  assert.doesNotMatch(noTools.prompt, /never build tool paths/);
-});
-
-test("STABLE_DIRECTIVE carries the same path ownership rule for durable first sends", () => {
-  // durable 首程只发 STABLE_DIRECTIVE + 客户端 system，走不到 systemDirective 那条路径，
-  // 所以这句必须两处都有，否则 durable 会话从第一轮起就会拼错路径。
-  assert.match(STABLE_DIRECTIVE, /Tools run on the CALLER's machine/);
-  assert.match(STABLE_DIRECTIVE, /never build tool paths from your own working directory/);
 });
