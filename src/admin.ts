@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ADMIN_HTML } from "./admin-ui.js";
 import { extractToken } from "./auth.js";
@@ -670,6 +673,14 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   /**
+   * 本机取 Grok Bot token 的脚本（不含任何密钥）。后台「下载 / 查看」用。
+   */
+  app.get("/admin/api/bot/grok-bot-token-script", async (request) => {
+    requireAdmin(request, deps);
+    return { filename: "grok-bot-token.mjs", script: loadGrokBotTokenScript() };
+  });
+
+  /**
    * 从 Cursor Key 池兑换 Bot session token。
    * 必须挂在 `credentials/:id` 之前，避免 `from-key` 被当成凭据 id。
    */
@@ -709,7 +720,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     if (cursorTokenType(token) === "web") {
       throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
     }
-    const record = bot.importDesktopSession({
+    const record = await bot.importDesktopSession({
       sessionToken: token,
       machineId,
       label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined
@@ -740,19 +751,19 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     if (cursorTokenType(token) === "web") {
       throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
     }
-    const record = bot.store.upsertCredential({
+    const record = await bot.putSessionCredential({
       sessionToken: token,
       label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined,
-      // machineId 生命周期内不可变：不给就生成一把并持久化，绝不每次请求随机。
-      machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : randomUUID(),
+      machineId: typeof body.machineId === "string" && body.machineId.trim() ? body.machineId.trim() : undefined,
       macMachineId: stringParam(body.macMachineId),
-      clientVersion: stringParam(body.clientVersion) ?? botSettings(deps.config).clientVersion,
-      clientOs: stringParam(body.clientOs) ?? process.platform,
-      clientArch: stringParam(body.clientArch) ?? process.arch,
-      deviceType: stringParam(body.deviceType) ?? "desktop",
+      clientVersion: stringParam(body.clientVersion),
+      clientOs: stringParam(body.clientOs),
+      clientArch: stringParam(body.clientArch),
+      deviceType: stringParam(body.deviceType),
       timezone: stringParam(body.timezone),
       allowedModels: optionalStringArray(body.allowed, "allowed"),
-      excludedModels: optionalStringArray(body.excluded, "excluded")
+      excludedModels: optionalStringArray(body.excluded, "excluded"),
+      lookupEmail: true
     });
     return { credential: publicCredential(record) };
   });
@@ -770,7 +781,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     const record = bot.store.upsertCredential({
       id,
-      ...(token ? { sessionToken: token } : {}),
+      ...(token ? { sessionToken: token, sourceCursorKeyId: null } : {}),
       label: stringParam(body.label),
       machineId: stringParam(body.machineId) ?? existing.machineId,
       macMachineId: stringParam(body.macMachineId),
@@ -1374,6 +1385,13 @@ function publicCredential(record: BotCredential): Record<string, unknown> {
     tokenType: record.tokenType ?? "unknown",
     expiresAt: record.expiresAt ?? null,
     tokenHint: tokenHint(record.sessionToken),
+    account: record.accountUserId
+      ? {
+          userId: record.accountUserId,
+          email: record.accountEmail ?? null,
+          sub: record.accountSub ?? null
+        }
+      : null,
     machineId: maskTail(record.machineId),
     hasMacMachineId: Boolean(record.macMachineId),
     clientVersion: record.clientVersion,
@@ -1400,6 +1418,19 @@ function tokenHint(token: string): string {
 
 function maskTail(value: string): string {
   return value.length <= 8 ? "***" : `${value.slice(0, 8)}…`;
+}
+
+function loadGrokBotTokenScript(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(process.cwd(), "scripts", "import-local-grok-bot.mjs"),
+    join(here, "..", "..", "scripts", "import-local-grok-bot.mjs"),
+    join(here, "..", "..", "..", "scripts", "import-local-grok-bot.mjs")
+  ];
+  for (const path of candidates) {
+    if (existsSync(path)) return readFileSync(path, "utf8");
+  }
+  throw new ApiError("取 token 脚本不在这个部署里（容器镜像需要带上 scripts/import-local-grok-bot.mjs）。", 404, "not_found");
 }
 
 function requireGatewayKeyPool(deps: AppDeps): GatewayKeyPool {

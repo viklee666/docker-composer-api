@@ -415,9 +415,11 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                   <option value="">选择一把 Cursor Key</option>
                 </select>
                 <button class="primary" id="btn-bot-from-key">从 Key 拉取</button>
-                <button id="btn-bot-from-grok" title="读取这台电脑已登录的 Grok Bot，导入约 60 天的 session JWT">从本机 Grok Bot 导入</button>
+                <button id="btn-bot-script-download" title="下载在本机运行的取 token 脚本">下载取 token 脚本</button>
+                <button id="btn-bot-script-view">查看脚本</button>
               </div>
-              <p class="note" style="margin-top:0;margin-bottom:8px" id="bot-grok-helper-hint">Grok Bot 的 token 在本机 AppData 里且已 DPAPI 加密，网页读不到。先在<strong>打开这个后台的这台电脑</strong>运行 <code>node scripts/import-local-grok-bot.mjs</code>（或双击 <code>scripts/import-local-grok-bot.cmd</code>），再点「从本机 Grok Bot 导入」。</p>
+              <p class="note" style="margin-top:0;margin-bottom:8px">在装着 Grok Bot 的电脑上运行 <code>node grok-bot-token.mjs</code>（或双击下载后的脚本）。token 会复制到剪贴板，再粘贴到下面；<strong>同一 Cursor 账号会覆盖</strong>原凭据。网页读不到本机 AppData，所以必须在那台电脑上跑脚本。</p>
+              <pre class="mono hidden" id="bot-script-source" style="max-height:360px;overflow:auto;white-space:pre-wrap;font-size:12px;background:var(--panel-2);padding:12px;border-radius:8px;margin:0 0 12px"></pre>
               <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。这类 JWT（<code>api_key_token</code>）约 1 小时过期；默认每分钟巡检，到期前 10 分钟用同一把 Key 自动再兑（过期/401 也会自动再兑），machineId 不变。同一把 key 再拉取也会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token（不会自动刷新）。</p>
               <div class="row" style="margin-bottom:14px">
                 <input id="bot-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
@@ -428,7 +430,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
               <div class="table-scroll">
                 <table>
                   <thead><tr>
-                    <th>备注</th><th>token</th><th>类型</th><th>过期</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
+                    <th>备注</th><th>账号</th><th>token</th><th>类型</th><th>过期</th><th>设备</th><th>版本</th><th>状态</th><th>失败数</th><th>最后使用</th><th>操作</th>
                   </tr></thead>
                   <tbody id="bot-body"></tbody>
                 </table>
@@ -1323,30 +1325,11 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       renderBotSettings(data.settings || {});
       renderBotCredentials(data.credentials || []);
       fillCcKeySelect(Array.isArray(data.cursorKeys) ? data.cursorKeys : lastKeys);
-      probeGrokHelper();
       if (data.status && data.status.available) loadBotModels(false);
       else fillCcChatModels();
     }).catch(function(err){
       $('bot-status-title').textContent = '读取失败';
       $('bot-status-detail').textContent = err.message;
-    });
-  }
-
-  var GROK_BOT_HELPER = 'http://127.0.0.1:17876';
-  function probeGrokHelper(){
-    var hint = $('bot-grok-helper-hint');
-    if (!hint) return;
-    fetch(GROK_BOT_HELPER + '/status', { signal: AbortSignal.timeout(800) }).then(function(res){
-      return res.json().catch(function(){ return {}; }).then(function(data){
-        if (!res.ok || !data || !data.ok) throw new Error('offline');
-        var bits = ['本机助手在线'];
-        if (data.email) bits.push(data.email);
-        if (data.tokenType) bits.push(data.tokenType);
-        if (data.expiresAt) bits.push(tokenExpiryLabel(data.expiresAt));
-        hint.textContent = bits.join(' · ') + '。点「从本机 Grok Bot 导入」即可写入网关。';
-      });
-    }).catch(function(){
-      hint.textContent = '未检测到本机助手。在打开这个后台的这台电脑运行 node scripts/import-local-grok-bot.mjs（或双击 scripts/import-local-grok-bot.cmd），再点导入。Grok Bot 的 token 已 DPAPI 加密，网页读不到。';
     });
   }
 
@@ -1403,6 +1386,14 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       if (bucketNames.length) {
         warn += ' <span class="chip warn" title="该桶的模型额度耗尽：选凭据时暂时避开，到期或一次成功后自动恢复">额度桶：' + esc(bucketNames.join(', ')) + '</span>';
       }
+      var account = item.account || {};
+      var accountHtml = '-';
+      if (account.email) {
+        accountHtml = esc(account.email) +
+          (account.userId ? '<div class="muted mono" style="font-size:11px">' + esc(account.userId) + '</div>' : '');
+      } else if (account.userId) {
+        accountHtml = '<span class="mono">' + esc(account.userId) + '</span>';
+      }
       var actions = [
         '<button data-bot-copy="' + esc(item.id) + '" title="复制完整 session token 到剪贴板（页面不显示明文）">复制</button>',
         '<button data-bot-test="' + esc(item.id) + '">测试</button>',
@@ -1418,6 +1409,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       ].join(' ');
       return '<tr>' +
         '<td>' + esc(item.label || '-') + '</td>' +
+        '<td>' + accountHtml + '</td>' +
         '<td><code>' + esc(item.tokenHint) + '</code></td>' +
         '<td>' + esc(item.tokenType) + warn + '</td>' +
         '<td class="muted">' + esc(tokenExpiryLabel(item.expiresAt)) + '</td>' +
@@ -2583,35 +2575,41 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     });
   });
 
-  $('btn-bot-from-grok').addEventListener('click', function(){
-    var btn = $('btn-bot-from-grok');
+  function loadGrokBotTokenScript(){
+    return api('GET', '/admin/api/bot/grok-bot-token-script').then(function(data){
+      if (!data || !data.script) throw new Error('脚本为空');
+      return data;
+    });
+  }
+  $('btn-bot-script-download').addEventListener('click', function(){
+    var btn = $('btn-bot-script-download');
     btn.disabled = true;
-    var prev = btn.textContent;
-    btn.textContent = '导入中…';
-    fetch(GROK_BOT_HELPER + '/import', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ gatewayUrl: location.origin, adminToken: token }),
-      signal: AbortSignal.timeout(15000)
-    }).then(function(res){
-      return res.json().catch(function(){ return {}; }).then(function(data){
-        if (!res.ok || !data || data.ok === false) {
-          throw new Error((data && data.error) || ('HTTP ' + res.status));
-        }
-        var who = data.email || data.label || 'Grok Bot';
-        toast('已导入本机 Grok Bot：' + who + (data.tokenType ? '（' + data.tokenType + '）' : ''));
-        loadBot();
-      });
+    loadGrokBotTokenScript().then(function(data){
+      var blob = new Blob([data.script], { type: 'text/javascript;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = data.filename || 'grok-bot-token.mjs';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast('已下载 ' + (data.filename || 'grok-bot-token.mjs') + '，在装着 Grok Bot 的电脑上运行 node grok-bot-token.mjs');
     }).catch(function(err){
-      var message = err && err.name === 'TimeoutError' ? '本机助手超时' : (err && err.message);
-      if (message === 'Failed to fetch' || message === 'NetworkError when attempting to fetch resource.' || !message) {
-        toast('未连上本机助手。先运行 node scripts/import-local-grok-bot.mjs（必须在打开这个后台的这台电脑上）', true);
-        return;
-      }
-      toast('导入失败：' + message, true);
-    }).finally(function(){
-      btn.disabled = false;
-      btn.textContent = prev || '从本机 Grok Bot 导入';
+      if (err.message !== 'unauthorized') toast('下载失败：' + err.message, true);
+    }).finally(function(){ btn.disabled = false; });
+  });
+  $('btn-bot-script-view').addEventListener('click', function(){
+    var box = $('bot-script-source');
+    if (!box.classList.contains('hidden') && box.textContent) {
+      box.classList.add('hidden');
+      return;
+    }
+    loadGrokBotTokenScript().then(function(data){
+      box.textContent = data.script;
+      box.classList.remove('hidden');
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') toast('读取脚本失败：' + err.message, true);
     });
   });
 

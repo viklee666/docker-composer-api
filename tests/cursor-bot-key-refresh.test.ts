@@ -186,6 +186,41 @@ test("auto-refresh does not touch pasted tokens or honor a disabled switch", asy
   store.close();
 });
 
+test("putSessionCredential without a source key unlinks auto-refresh even for api_key_token", async () => {
+  const now = Date.now();
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  let exchanges = 0;
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async (url) => {
+      if (String(url).includes("/auth/exchange_user_api_key")) exchanges += 1;
+      return Response.json({
+        accessToken: jwt({ type: "api_key_token", sub: "auth0|manual", exp: Math.floor(now / 1000) + 3600 }),
+        refreshToken: "r"
+      });
+    }
+  });
+  const linked = store.upsertCredential({
+    sessionToken: jwt({ type: "api_key_token", sub: "auth0|manual", exp: Math.floor(now / 1000) + 30 }),
+    machineId: "m-link",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id
+  });
+  const overwritten = await service.putSessionCredential({
+    sessionToken: jwt({ type: "api_key_token", sub: "auth0|manual", exp: Math.floor(now / 1000) + 30 }),
+    lookupEmail: false
+  });
+  assert.equal(overwritten.id, linked.id);
+  assert.equal(overwritten.sourceCursorKeyId, undefined, "手工写入必须摘掉 Key 池绑定");
+  await service.refreshExpiringKeyTokens();
+  assert.equal(exchanges, 0, "摘绑后巡检不得再兑");
+  store.close();
+});
+
 test("auto-refresh skips a disabled source key; concurrent callers single-flight", async () => {
   const now = Date.now();
   const expiring = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 30 });
@@ -448,11 +483,14 @@ test("startKeyTokenRefresh ticks immediately then can be stopped", async () => {
     clientVersion: "1",
     sourceCursorKeyId: source.id
   });
-  service.startKeyTokenRefresh();
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(exchanges, 1, "启动时应立刻巡检一次");
-  service.stopKeyTokenRefresh();
-  store.close();
+  try {
+    service.startKeyTokenRefresh();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(exchanges, 1, "启动时应立刻巡检一次");
+  } finally {
+    service.stopKeyTokenRefresh();
+    store.close();
+  }
 });
 
 test("a 503 from every credential being disabled revives from-key tokens and continues", async () => {

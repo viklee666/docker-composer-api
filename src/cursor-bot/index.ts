@@ -49,6 +49,7 @@ export {
   SAND_DEFAULT_MODEL_ID,
   assertUsableCredential,
   credentialClientType,
+  cursorTokenAccount,
   cursorTokenExpiresAtIso,
   cursorTokenExpiresAtMs,
   cursorTokenIssuedAtMs,
@@ -56,6 +57,7 @@ export {
   keyMintedTokenExpired,
   keyMintedTokenNeedsRefresh,
   type CursorBotCredential,
+  type CursorTokenAccount,
   type CursorTokenType
 } from "./credentials.js";
 

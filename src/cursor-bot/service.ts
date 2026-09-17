@@ -33,6 +33,7 @@ import {
   KEY_TOKEN_REFRESH_INTERVAL_MS,
   KEY_TOKEN_REFRESH_RETRY_MS,
   SAND_CLIENT_TYPE,
+  cursorTokenAccount,
   keyMintedTokenExpired,
   keyMintedTokenNeedsRefresh
 } from "./credentials.js";
@@ -719,34 +720,139 @@ export class CursorBotService implements CursorRunner {
   }
 
   /**
-   * 写入本机 Grok Bot / Cursor 桌面端的长效 session JWT。
-   * 同一 machineId 再导入只换 token，不换设备身份；不碰 from-key 凭据。
+   * 写入一份 Bot session JWT。同一 Cursor 账号（JWT `sub` → user id）已有凭据则覆盖，
+   * 保留原来的 machineId。未传入 `sourceCursorKeyId` 时摘掉 Key 池绑定——
+   * 手工粘贴 / 桌面导入绝不能被自动刷新兑掉。
    */
-  importDesktopSession(input: {
+  async putSessionCredential(input: {
+    sessionToken: string;
+    label?: string;
+    machineId?: string;
+    macMachineId?: string;
+    clientVersion?: string;
+    clientOs?: string;
+    clientArch?: string;
+    deviceType?: string;
+    timezone?: string;
+    allowedModels?: string[];
+    excludedModels?: string[];
+    sourceCursorKeyId?: string | null;
+    accountEmail?: string;
+    lookupEmail?: boolean;
+  }): Promise<BotCredential> {
+    const sessionToken = input.sessionToken.trim();
+    if (!sessionToken) throw new ApiError("sessionToken is required.", 400, "invalid_request_error", "sessionToken");
+    const account = cursorTokenAccount(sessionToken);
+    const existing =
+      (input.sourceCursorKeyId ? this.options.store.credentialBySourceKeyId(input.sourceCursorKeyId) : undefined) ??
+      (account ? this.options.store.credentialByUserId(account.userId) : undefined);
+    let accountEmail = input.accountEmail?.trim() || existing?.accountEmail || account?.email;
+    if (input.lookupEmail !== false && !accountEmail) {
+      accountEmail = (await this.lookupAccountEmail(sessionToken)) ?? undefined;
+    }
+    // 未显式传入 = 手工写入（粘贴 / 桌面导入），必须摘掉 Key 池绑定。
+    // 不能按 JWT type 判断：粘一张 api_key_token 上去若仍挂着 sourceCursorKeyId，
+    // 自动刷新会在一小时内把它兑回短票，等于手工填写作废。
+    const sourceCursorKeyId = input.sourceCursorKeyId !== undefined ? input.sourceCursorKeyId : null;
+    const write = (target?: BotCredential): BotCredential =>
+      this.options.store.upsertCredential({
+        ...(target ? { id: target.id } : {}),
+        label: input.label?.trim() || target?.label || accountEmail || account?.userId,
+        sessionToken,
+        machineId: target?.machineId || input.machineId?.trim() || randomUUID(),
+        macMachineId: input.macMachineId,
+        clientVersion: input.clientVersion ?? this.settings.clientVersion,
+        ...(!target
+          ? {
+              clientOs: input.clientOs ?? process.platform,
+              clientArch: input.clientArch ?? process.arch,
+              deviceType: input.deviceType ?? "desktop"
+            }
+          : {}),
+        timezone: input.timezone,
+        allowedModels: input.allowedModels,
+        excludedModels: input.excludedModels,
+        sourceCursorKeyId,
+        accountEmail: accountEmail ?? null,
+        status: "active"
+      });
+    const previousToken = existing?.sessionToken;
+    try {
+      const written = write(existing);
+      if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
+      return written;
+    } catch (error) {
+      const raced = account ? this.options.store.credentialByUserId(account.userId) : undefined;
+      if (raced) {
+        const written = write(raced);
+        if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
+        return written;
+      }
+      throw error;
+    }
+  }
+
+  private async lookupAccountEmail(sessionToken: string): Promise<string | undefined> {
+    const doFetch = this.options.fetchImpl ?? ((input, init) => fetch(input, init));
+    const account = cursorTokenAccount(sessionToken);
+    try {
+      const stripe = await doFetch("https://api2.cursor.sh/auth/full_stripe_profile", {
+        headers: { authorization: `Bearer ${sessionToken}` },
+        signal: AbortSignal.timeout(5_000)
+      });
+      if (stripe.ok) {
+        const body: unknown = await stripe.json();
+        const email =
+          body && typeof body === "object"
+            ? (body as { email?: unknown; membership?: { email?: unknown } }).email ??
+              (body as { membership?: { email?: unknown } }).membership?.email
+            : undefined;
+        if (typeof email === "string" && email.includes("@")) return email.trim();
+      }
+    } catch {
+      // 邮箱查询失败不挡导入。
+    }
+    if (!account?.userId.startsWith("user_")) return undefined;
+    try {
+      const me = await doFetch("https://cursor.com/api/dashboard/get-me", {
+        method: "POST",
+        headers: {
+          cookie: `WorkosCursorSessionToken=${account.userId}::${sessionToken}`,
+          "content-type": "application/json",
+          origin: "https://cursor.com"
+        },
+        body: "{}",
+        signal: AbortSignal.timeout(5_000)
+      });
+      if (!me.ok) return undefined;
+      const body: unknown = await me.json();
+      const email = body && typeof body === "object" ? (body as { email?: unknown }).email : undefined;
+      if (typeof email === "string" && email.includes("@")) return email.trim();
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * 写入本机 Grok Bot / Cursor 桌面端的长效 session JWT。
+   * 同一账号已有凭据则覆盖；machineId 只在新建时使用。
+   */
+  async importDesktopSession(input: {
     sessionToken: string;
     machineId: string;
     label?: string;
-  }): BotCredential {
+  }): Promise<BotCredential> {
     const sessionToken = input.sessionToken.trim();
     const machineId = input.machineId.trim();
     if (!sessionToken) throw new ApiError("sessionToken is required.", 400, "invalid_request_error", "sessionToken");
     if (!machineId) throw new ApiError("machineId is required.", 400, "invalid_request_error", "machineId");
-    const existing = this.options.store.credentialByMachineId(machineId);
-    const target = existing && !existing.sourceCursorKeyId ? existing : undefined;
-    const previousToken = target?.sessionToken;
-    const written = this.options.store.upsertCredential({
-      ...(target ? { id: target.id } : {}),
-      label: input.label?.trim() || target?.label || "Grok Bot",
+    return this.putSessionCredential({
       sessionToken,
-      machineId: target?.machineId || machineId,
-      clientVersion: this.settings.clientVersion,
-      ...(!target
-        ? { clientOs: process.platform, clientArch: process.arch, deviceType: "desktop" }
-        : {}),
-      status: "active"
+      machineId,
+      label: input.label,
+      lookupEmail: true
     });
-    if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
-    return written;
   }
 
   /**
@@ -763,37 +869,16 @@ export class CursorBotService implements CursorRunner {
       fetchImpl: this.options.fetchImpl
     });
     const existing = this.options.store.credentialBySourceKeyId(key.id);
-    const previousToken = existing?.sessionToken;
     const label = options.label?.trim() || key.label?.trim() || existing?.label;
-    const write = (target?: BotCredential): BotCredential =>
-      this.options.store.upsertCredential({
-        ...(target ? { id: target.id } : {}),
-        label,
-        sessionToken: tokens.accessToken,
-        machineId: target?.machineId || options.machineId?.trim() || randomUUID(),
-        clientVersion: this.settings.clientVersion,
-        ...(!target
-          ? { clientOs: process.platform, clientArch: process.arch, deviceType: "desktop" }
-          : {}),
-        sourceCursorKeyId: key.id,
-        allowedModels: key.modelScope.allowed,
-        excludedModels: key.modelScope.excluded,
-        status: "active"
-      });
-    try {
-      const written = write(existing);
-      if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
-      return written;
-    } catch (error) {
-      // 两个进程同时首次导入同一把 key 时，输家撞 UNIQUE。改走更新而不是把兑换结果丢掉。
-      const raced = this.options.store.credentialBySourceKeyId(key.id);
-      if (raced) {
-        const written = write(raced);
-        if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
-        return written;
-      }
-      throw error;
-    }
+    return this.putSessionCredential({
+      sessionToken: tokens.accessToken,
+      label,
+      machineId: existing?.machineId || options.machineId?.trim(),
+      sourceCursorKeyId: key.id,
+      allowedModels: key.modelScope.allowed,
+      excludedModels: key.modelScope.excluded,
+      lookupEmail: false
+    });
   }
 
   private providerFor(credential: BotCredential, input: CursorRunRequest, target: InferenceTarget): CursorBotProvider {

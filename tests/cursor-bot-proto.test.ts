@@ -7,6 +7,7 @@ import { ApiError } from "../src/errors.js";
 import { cursorChecksum } from "../src/cursor-bot/checksum.js";
 import {
   assertUsableCredential,
+  cursorTokenAccount,
   cursorTokenExpiresAtMs,
   cursorTokenIssuedAtMs,
   cursorTokenType,
@@ -492,6 +493,19 @@ test("browser web tokens are rejected, session tokens are accepted", () => {
   assertUsableCredential({ ...base, sessionToken: jwt({ type: "session" }) });
   assertUsableCredential({ ...base, sessionToken: jwt({ type: "api_key_token", exp: 1_789_578_074 }) });
   assertUsableCredential({ ...base, sessionToken: "opaque-token" });
+});
+
+test("cursorTokenAccount reads sub/userId/email from the JWT", () => {
+  assert.equal(cursorTokenAccount("opaque"), undefined);
+  assert.deepEqual(cursorTokenAccount(jwt({ type: "session", sub: "auth0|user_01ABC" })), {
+    sub: "auth0|user_01ABC",
+    userId: "user_01ABC"
+  });
+  assert.deepEqual(
+    cursorTokenAccount(jwt({ type: "api_key_token", sub: "google-oauth2|user_01ABC", email: "a@b.com" })),
+    { sub: "google-oauth2|user_01ABC", userId: "user_01ABC", email: "a@b.com" }
+  );
+  assert.equal(cursorTokenAccount(jwt({ type: "session", sub: "user_01PLAIN" }))?.userId, "user_01PLAIN");
 });
 
 test("api_key_token expiry is read from JWT exp and drives the refresh window", () => {

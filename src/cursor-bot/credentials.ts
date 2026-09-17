@@ -46,6 +46,15 @@ export interface CursorBotCredential {
  */
 export type CursorTokenType = "session" | "web" | "api_key_token" | "unknown";
 
+/** JWT 里能读到的账号身份。邮箱经常不在 token 里，只有 `sub`。 */
+export interface CursorTokenAccount {
+  /** JWT `sub` 原文，例如 `auth0|user_01ABC`。 */
+  sub: string;
+  /** 归一后的 Cursor user id（`user_01…`），同一账号跨 web/session/api_key_token 都一样。 */
+  userId: string;
+  email?: string;
+}
+
 /** 到期前这么久就该再兑一次。短票约 1 小时；10 分钟窗口覆盖巡检间隔和兑换往返。 */
 export const KEY_TOKEN_REFRESH_SKEW_MS = 10 * 60 * 1000;
 /** 后台巡检间隔。 */
@@ -84,6 +93,40 @@ export function cursorTokenType(token: string): CursorTokenType {
   if (type === "session") return "session";
   if (type === "api_key_token") return "api_key_token";
   return "unknown";
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text || undefined;
+}
+
+/** 从 `auth0|user_01…` / `google-oauth2|user_01…` / 裸 `user_01…` 取出稳定的账号 id。 */
+export function cursorAccountUserId(sub: string): string {
+  const text = sub.trim();
+  const pipe = text.lastIndexOf("|");
+  return pipe >= 0 ? text.slice(pipe + 1).trim() : text;
+}
+
+/**
+ * 只读 JWT 的账号 claims。不校验签名。
+ * 实测 Cursor 的 session / api_key_token 都有 `sub`；`email` 经常没有。
+ */
+export function cursorTokenAccount(token: string): CursorTokenAccount | undefined {
+  const payload = readJwtPayload(token);
+  if (!payload) return undefined;
+  const sub = asNonEmptyString(payload.sub);
+  if (!sub) return undefined;
+  const email =
+    asNonEmptyString(payload.email) ??
+    (asNonEmptyString(payload.preferred_username)?.includes("@")
+      ? asNonEmptyString(payload.preferred_username)
+      : undefined);
+  return {
+    sub,
+    userId: cursorAccountUserId(sub),
+    ...(email ? { email } : {})
+  };
 }
 
 /**

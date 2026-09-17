@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { RequestUsage } from "../types.js";
-import { cursorTokenExpiresAtIso, cursorTokenType } from "./credentials.js";
+import { cursorAccountUserId, cursorTokenAccount, cursorTokenExpiresAtIso, cursorTokenType } from "./credentials.js";
 import type { DraftEvent, UnifiedEvent, UnifiedEventType } from "./events.js";
 import { UNIFIED_EVENT_VERSION } from "./events.js";
 
@@ -147,7 +147,10 @@ const SCHEMA = `
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    source_cursor_key_id TEXT
+    source_cursor_key_id TEXT,
+    account_sub TEXT,
+    account_user_id TEXT,
+    account_email TEXT
   );
 
   CREATE TABLE IF NOT EXISTS bot_conversations (
@@ -298,6 +301,11 @@ export interface BotCredential {
   updatedAt: string;
   /** 从 Cursor Key 池兑换来的凭据会记下源 key id，再拉一次时换 token、不换 machineId。 */
   sourceCursorKeyId?: string;
+  /** JWT `sub` 原文。 */
+  accountSub?: string;
+  /** 归一后的 `user_01…`，同一账号覆盖凭据用这个。 */
+  accountUserId?: string;
+  accountEmail?: string;
 }
 
 export interface BotCredentialInput {
@@ -317,7 +325,8 @@ export interface BotCredentialInput {
   status?: string;
   allowedModels?: string[];
   excludedModels?: string[];
-  sourceCursorKeyId?: string;
+  sourceCursorKeyId?: string | null;
+  accountEmail?: string | null;
 }
 
 export interface BotStoreOptions {
@@ -367,6 +376,9 @@ export class CursorBotStore {
       ["bot_credentials", "token_type", "TEXT"],
       ["bot_credentials", "expires_at", "TEXT"],
       ["bot_credentials", "source_cursor_key_id", "TEXT"],
+      ["bot_credentials", "account_sub", "TEXT"],
+      ["bot_credentials", "account_user_id", "TEXT"],
+      ["bot_credentials", "account_email", "TEXT"],
       // 包 B：额度桶标记（桶名 → 耗尽截止时间）。可空，老记录读出来是 undefined = 无标记。
       ["bot_credentials", "exhausted_buckets", "TEXT"]
     ];
@@ -385,6 +397,13 @@ export class CursorBotStore {
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_credentials_source_key
          ON bot_credentials(source_cursor_key_id)
          WHERE source_cursor_key_id IS NOT NULL AND source_cursor_key_id != ''`
+      );
+    }
+    if (this.hasColumn("bot_credentials", "account_user_id")) {
+      this.db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_credentials_account_user
+         ON bot_credentials(account_user_id)
+         WHERE account_user_id IS NOT NULL AND account_user_id != ''`
       );
     }
   }
@@ -473,8 +492,11 @@ export class CursorBotStore {
 
   upsertCredential(input: BotCredentialInput): BotCredential {
     const ts = this.iso();
-    const id = input.id ?? this.newId();
-    const existing = input.id ? this.credential(input.id) : undefined;
+    const account = input.sessionToken ? cursorTokenAccount(input.sessionToken) : undefined;
+    const existing =
+      (input.id ? this.credential(input.id) : undefined) ??
+      (!input.id && account ? this.credentialByUserId(account.userId) : undefined);
+    const id = existing?.id ?? input.id ?? this.newId();
     if (existing) {
       const sets: string[] = [];
       const values: Array<string | number | null> = [];
@@ -488,7 +510,11 @@ export class CursorBotStore {
         put("encrypted_session_token", this.protect(input.sessionToken));
         put("token_type", cursorTokenType(input.sessionToken));
         put("expires_at", cursorTokenExpiresAtIso(input.sessionToken) ?? null);
+        put("account_sub", account?.sub ?? null);
+        put("account_user_id", account?.userId ?? null);
       }
+      if (input.accountEmail !== undefined) put("account_email", blankToNull(input.accountEmail));
+      else if (account?.email) put("account_email", account.email);
       put("machine_id", input.machineId);
       put("mac_machine_id", input.macMachineId);
       put("client_version", input.clientVersion);
@@ -502,11 +528,10 @@ export class CursorBotStore {
       put("status", input.status);
       if (input.allowedModels !== undefined) put("allowed_models", JSON.stringify(input.allowedModels));
       if (input.excludedModels !== undefined) put("excluded_models", JSON.stringify(input.excludedModels));
-      const sourceKey = blankToNull(input.sourceCursorKeyId);
-      if (sourceKey) put("source_cursor_key_id", sourceKey);
+      if (input.sourceCursorKeyId !== undefined) put("source_cursor_key_id", blankToNull(input.sourceCursorKeyId));
       put("updated_at", ts);
-      if (sets.length) this.db.prepare(`UPDATE bot_credentials SET ${sets.join(", ")} WHERE id = ?`).run(...values, input.id!);
-      return this.credential(input.id!)!;
+      if (sets.length) this.db.prepare(`UPDATE bot_credentials SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+      return this.credential(id)!;
     }
 
     if (!input.sessionToken) throw new Error("a new Cursor Bot credential needs a session token.");
@@ -516,8 +541,8 @@ export class CursorBotStore {
          (id, label, encrypted_session_token, token_type, expires_at, machine_id, mac_machine_id, client_version,
           client_os, client_arch, client_os_version, device_type, client_key, session_id, timezone,
           status, allowed_models, excluded_models, failure_count, last_used_at, last_error, created_at, updated_at,
-          source_cursor_key_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?)`
+          source_cursor_key_id, account_sub, account_user_id, account_email)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -540,7 +565,10 @@ export class CursorBotStore {
         input.excludedModels ? JSON.stringify(input.excludedModels) : null,
         ts,
         ts,
-        blankToNull(input.sourceCursorKeyId)
+        blankToNull(input.sourceCursorKeyId),
+        account?.sub ?? null,
+        account?.userId ?? null,
+        blankToNull(input.accountEmail) ?? account?.email ?? null
       );
     return this.credential(id)!;
   }
@@ -571,6 +599,17 @@ export class CursorBotStore {
     if (!id) return undefined;
     const row = this.db.prepare("SELECT * FROM bot_credentials WHERE machine_id = ?").get(id);
     return row ? this.mapCredential(row) : undefined;
+  }
+
+  /** 同一 Cursor 账号（JWT `sub` 归一后的 user id）。旧行还没写列时扫 JWT。 */
+  credentialByUserId(userId: string): BotCredential | undefined {
+    const id = cursorAccountUserId(userId);
+    if (!id) return undefined;
+    if (this.hasColumn("bot_credentials", "account_user_id")) {
+      const row = this.db.prepare("SELECT * FROM bot_credentials WHERE account_user_id = ?").get(id);
+      if (row) return this.mapCredential(row);
+    }
+    return this.listCredentials().find((credential) => credential.accountUserId === id);
   }
 
   listCredentials(): BotCredential[] {
@@ -1093,6 +1132,7 @@ export class CursorBotStore {
     // 包 B：先解析额度桶标记，解析不出（脏 JSON / 空列）当无标记，不挡选路。到期判断在选路时做。
     const exhaustedBuckets = parseBuckets(optional(row.exhausted_buckets));
     const sessionToken = this.reveal(row.encrypted_session_token as string);
+    const account = cursorTokenAccount(sessionToken);
     return {
       id: row.id as string,
       label: optional(row.label),
@@ -1118,7 +1158,10 @@ export class CursorBotStore {
       lastError: optional(row.last_error),
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
-      sourceCursorKeyId: optional(row.source_cursor_key_id)
+      sourceCursorKeyId: optional(row.source_cursor_key_id),
+      accountSub: optional(row.account_sub) ?? account?.sub,
+      accountUserId: optional(row.account_user_id) ?? account?.userId,
+      accountEmail: optional(row.account_email) ?? account?.email
     };
   }
 }
@@ -1263,7 +1306,7 @@ function mapSummary(row: Record<string, unknown>): BotSummary {
 }
 
 /** 空串一律当成"没提供"。`?? null` 只挡 undefined，会让一个空字符串抹掉已有的值。 */
-function blankToNull(value: string | undefined): string | null {
+function blankToNull(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
 }

@@ -31,6 +31,7 @@ ENV BUILT_AT=$BUILT_AT
 COPY package.json package-lock.json ./
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY scripts/import-local-grok-bot.mjs ./scripts/import-local-grok-bot.mjs
 
 VOLUME ["/data", "/workspace"]
 EXPOSE 8787

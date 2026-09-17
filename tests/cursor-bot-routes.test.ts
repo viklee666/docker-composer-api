@@ -167,7 +167,7 @@ test("the admin bot panel reports an unconfigured route instead of failing", asy
 
 test("admin endpoints require the admin password, not just any gateway key", async () => {
   const { app } = await buildApp({ withCredential: true });
-  for (const url of ["/admin/api/bot", "/admin/api/bot/models", "/admin/api/bot/runs"]) {
+  for (const url of ["/admin/api/bot", "/admin/api/bot/models", "/admin/api/bot/runs", "/admin/api/bot/grok-bot-token-script"]) {
     assert.equal((await app.inject({ method: "GET", url })).statusCode, 401, `${url} 应拒绝匿名请求`);
     assert.equal(
       (await app.inject({ method: "GET", url, headers: apiAuth })).statusCode,
@@ -377,6 +377,113 @@ test("a desktop session token upserts by machineId and rejects web tokens", asyn
     payload: { sessionToken: first }
   });
   assert.equal(missingMachine.statusCode, 400);
+  await app.close();
+});
+
+test("pasting a session token overwrites the same Cursor account and shows account fields", async () => {
+  const { app, botStore, keyPool } = await buildApp({
+    exchange: { accessToken: jwt({ type: "api_key_token", sub: "auth0|user_01SAME", email: "from-jwt@example.com" }) }
+  });
+  const [key] = await keyPool.list();
+  const fromKey = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id, label: "pro-10.13" }
+  });
+  assert.equal(fromKey.statusCode, 200, fromKey.body);
+  const original = (fromKey.json() as { credential: { id: string; account: { userId: string; email: string | null } } }).credential;
+  assert.equal(original.account.userId, "user_01SAME");
+  assert.equal(original.account.email, "from-jwt@example.com");
+  const machineId = botStore.credential(original.id)?.machineId;
+
+  const desktop = jwt({ type: "session", sub: "auth0|user_01SAME" });
+  const pasted = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials",
+    headers: adminAuth,
+    payload: { sessionToken: desktop }
+  });
+  assert.equal(pasted.statusCode, 200, pasted.body);
+  const next = (pasted.json() as { credential: Record<string, unknown> }).credential;
+  assert.equal(next.id, original.id, "同一账号应覆盖而不是新建");
+  assert.equal(next.tokenType, "session");
+  assert.equal(next.sourceCursorKeyId, null, "桌面长票应摘掉 Key 池绑定，避免自动刷新冲掉");
+  assert.equal(next.label, "pro-10.13", "覆盖时保留原来的备注");
+  assert.equal((next.account as { userId: string }).userId, "user_01SAME");
+  assert.equal(botStore.listCredentials().length, 1);
+  assert.equal(botStore.credential(original.id)?.sessionToken, desktop);
+  assert.equal(botStore.credential(original.id)?.machineId, machineId);
+  assert.ok(!JSON.stringify(pasted.json()).includes(desktop));
+  await app.close();
+});
+
+test("pasting an api_key_token also unlinks Key-pool auto-refresh", async () => {
+  const { app, botStore, keyPool } = await buildApp({
+    exchange: { accessToken: jwt({ type: "api_key_token", sub: "auth0|user_01PASTE" }) }
+  });
+  const [key] = await keyPool.list();
+  const fromKey = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id }
+  });
+  assert.equal(fromKey.statusCode, 200, fromKey.body);
+  const original = (fromKey.json() as { credential: { id: string } }).credential;
+  assert.equal(botStore.credential(original.id)?.sourceCursorKeyId, key.id);
+
+  const pastedToken = jwt({ type: "api_key_token", sub: "auth0|user_01PASTE", exp: Math.floor(Date.now() / 1000) + 3600 });
+  const pasted = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials",
+    headers: adminAuth,
+    payload: { sessionToken: pastedToken }
+  });
+  assert.equal(pasted.statusCode, 200, pasted.body);
+  assert.equal(
+    (pasted.json() as { credential: { sourceCursorKeyId: string | null } }).credential.sourceCursorKeyId,
+    null,
+    "手工粘贴短票也不能继续挂 Key 池，否则自动刷新会兑掉这张票"
+  );
+  assert.equal(botStore.credential(original.id)?.sessionToken, pastedToken);
+  await app.close();
+});
+
+test("manually rotating a from-key token clears the auto-refresh link", async () => {
+  const { app, botStore, keyPool } = await buildApp({
+    exchange: { accessToken: jwt({ type: "api_key_token", sub: "auth0|user_01ROT" }) }
+  });
+  const [key] = await keyPool.list();
+  const fromKey = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-key",
+    headers: adminAuth,
+    payload: { cursorKeyId: key.id }
+  });
+  const id = (fromKey.json() as { credential: { id: string } }).credential.id;
+  const rotated = jwt({ type: "session", sub: "auth0|user_01ROT" });
+  const response = await app.inject({
+    method: "POST",
+    url: `/admin/api/bot/credentials/${id}`,
+    headers: adminAuth,
+    payload: { sessionToken: rotated }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(botStore.credential(id)?.sessionToken, rotated);
+  assert.equal(botStore.credential(id)?.sourceCursorKeyId, undefined);
+  await app.close();
+});
+
+test("admin can download the local Grok Bot token script", async () => {
+  const { app } = await buildApp();
+  const response = await app.inject({ method: "GET", url: "/admin/api/bot/grok-bot-token-script", headers: adminAuth });
+  assert.equal(response.statusCode, 200, response.body);
+  const body = response.json() as { filename: string; script: string };
+  assert.equal(body.filename, "grok-bot-token.mjs");
+  assert.match(body.script, /sand-secrets\.json/);
+  assert.match(body.script, /clip/);
+  assert.doesNotMatch(body.script, /eyJhbGciOi/);
   await app.close();
 });
 
