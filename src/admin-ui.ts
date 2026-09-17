@@ -2583,6 +2583,38 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     });
   });
 
+  $('btn-bot-from-grok').addEventListener('click', function(){
+    var btn = $('btn-bot-from-grok');
+    btn.disabled = true;
+    var prev = btn.textContent;
+    btn.textContent = '导入中…';
+    fetch(GROK_BOT_HELPER + '/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ gatewayUrl: location.origin, adminToken: token }),
+      signal: AbortSignal.timeout(15000)
+    }).then(function(res){
+      return res.json().catch(function(){ return {}; }).then(function(data){
+        if (!res.ok || !data || data.ok === false) {
+          throw new Error((data && data.error) || ('HTTP ' + res.status));
+        }
+        var who = data.email || data.label || 'Grok Bot';
+        toast('已导入本机 Grok Bot：' + who + (data.tokenType ? '（' + data.tokenType + '）' : ''));
+        loadBot();
+      });
+    }).catch(function(err){
+      var message = err && err.name === 'TimeoutError' ? '本机助手超时' : (err && err.message);
+      if (message === 'Failed to fetch' || message === 'NetworkError when attempting to fetch resource.' || !message) {
+        toast('未连上本机助手。先运行 node scripts/import-local-grok-bot.mjs（必须在打开这个后台的这台电脑上）', true);
+        return;
+      }
+      toast('导入失败：' + message, true);
+    }).finally(function(){
+      btn.disabled = false;
+      btn.textContent = prev || '从本机 Grok Bot 导入';
+    });
+  });
+
   $('btn-bot-models').addEventListener('click', function(){ loadBotModels(false); });
   $('btn-bot-models-refresh').addEventListener('click', function(){ loadBotModels(true); });
   $('btn-bot-runs').addEventListener('click', loadBotRuns);
