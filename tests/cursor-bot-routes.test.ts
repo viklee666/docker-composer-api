@@ -482,7 +482,11 @@ test("admin can download the local Grok Bot token script", async () => {
   const body = response.json() as { filename: string; script: string };
   assert.equal(body.filename, "grok-bot-token.mjs");
   assert.match(body.script, /sand-secrets\.json/);
+  assert.match(body.script, /Application Support/);
+  assert.match(body.script, /XDG_CONFIG_HOME/);
   assert.match(body.script, /clip/);
+  assert.match(body.script, /pbcopy/);
+  assert.match(body.script, /wl-copy/);
   assert.doesNotMatch(body.script, /eyJhbGciOi/);
   await app.close();
 });

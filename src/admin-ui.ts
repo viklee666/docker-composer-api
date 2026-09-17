@@ -418,7 +418,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                 <button id="btn-bot-script-download" title="下载在本机运行的取 token 脚本">下载取 token 脚本</button>
                 <button id="btn-bot-script-view">查看脚本</button>
               </div>
-              <p class="note" style="margin-top:0;margin-bottom:8px">在装着 Grok Bot 的电脑上运行 <code>node grok-bot-token.mjs</code>（或双击下载后的脚本）。token 会复制到剪贴板，再粘贴到下面；<strong>同一 Cursor 账号会覆盖</strong>原凭据。网页读不到本机 AppData，所以必须在那台电脑上跑脚本。</p>
+              <p class="note" style="margin-top:0;margin-bottom:8px">在装着 Grok Bot 的 Windows / macOS / Linux 电脑上运行 <code>node grok-bot-token.mjs</code>。脚本找的是 Electron 用户数据目录（Windows：<code>%APPDATA%\Grok Bot</code>；macOS：<code>~/Library/Application Support/Grok Bot</code>；Linux：<code>~/.config/Grok Bot</code>），不是安装目录。macOS 首次可能弹出钥匙串授权。路径不同可设 <code>GROK_BOT_USERDATA</code>。token 会复制到剪贴板，再粘贴到下面；<strong>同一 Cursor 账号会覆盖</strong>原凭据。</p>
               <pre class="mono hidden" id="bot-script-source" style="max-height:360px;overflow:auto;white-space:pre-wrap;font-size:12px;background:var(--panel-2);padding:12px;border-radius:8px;margin:0 0 12px"></pre>
               <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。这类 JWT（<code>api_key_token</code>）约 1 小时过期；默认每分钟巡检，到期前 10 分钟用同一把 Key 自动再兑（过期/401 也会自动再兑），machineId 不变。同一把 key 再拉取也会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token（不会自动刷新）。</p>
               <div class="row" style="margin-bottom:14px">
@@ -2594,7 +2594,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toast('已下载 ' + (data.filename || 'grok-bot-token.mjs') + '，在装着 Grok Bot 的电脑上运行 node grok-bot-token.mjs');
+      toast('已下载 ' + (data.filename || 'grok-bot-token.mjs') + '，在装着 Grok Bot 的电脑上运行 node grok-bot-token.mjs（Windows / macOS / Linux）');
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('下载失败：' + err.message, true);
     }).finally(function(){ btn.disabled = false; });
