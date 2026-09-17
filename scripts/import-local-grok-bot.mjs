@@ -26,7 +26,8 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 export const DEFAULT_HELPER_PORT = 17876;
 const DEFAULT_LABEL = "Grok Bot";
@@ -301,7 +302,18 @@ function serve(port, allowOrigins) {
       return;
     }
     if (request.method === "OPTIONS") {
-      sendJson(response, 204, origin || "", { ok: true });
+      if (origin) {
+        response.writeHead(204, {
+          "access-control-allow-origin": origin,
+          vary: "origin",
+          "access-control-allow-headers": "content-type",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-max-age": "600"
+        });
+      } else {
+        response.writeHead(204);
+      }
+      response.end();
       return;
     }
     const path = new URL(request.url || "/", "http://127.0.0.1").pathname;
@@ -406,7 +418,15 @@ async function main() {
   serve(port, allowOrigins);
 }
 
-const isDirect = process.argv[1] && /import-local-grok-bot\.mjs$/i.test(process.argv[1].replaceAll("\\", "/"));
+const isDirect = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return pathToFileURL(resolve(entry)).href === import.meta.url;
+  } catch {
+    return false;
+  }
+})();
 if (isDirect) {
   main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
 }
