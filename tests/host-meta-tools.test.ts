@@ -153,3 +153,56 @@ test("normalizeToolCallForClient still unwraps custom-user-tools MCP calls to Re
     { id: "call_mcp", name: "Read", arguments: { file_path: "src/index.ts" } }
   );
 });
+
+test("Readfile / ReadFile / functions.ReadFile collapse to the declared Read name", () => {
+  const tools: GatewayTool[] = [
+    { name: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } }
+  ];
+  for (const name of ["Readfile", "ReadFile", "read_file", "functions.ReadFile"]) {
+    assert.deepEqual(
+      normalizeToolCallForClient({ id: "c", name, arguments: { target_file: "a.ts" } }, tools),
+      { id: "c", name: "Read", arguments: { path: "a.ts" } },
+      name
+    );
+  }
+});
+
+test("a custom agent tool gets the same File-suffix collapse, without a hardcoded alias", () => {
+  const tools: GatewayTool[] = [
+    { name: "LookupDoc", inputSchema: { type: "object", properties: { id: { type: "string" } } } }
+  ];
+  assert.deepEqual(
+    normalizeToolCallForClient({ id: "c", name: "LookupDocFile", arguments: { id: "1" } }, tools),
+    { id: "c", name: "LookupDoc", arguments: { id: "1" } }
+  );
+});
+
+test("File-suffix collapse stays put when both the short and long names are declared", () => {
+  const tools: GatewayTool[] = [
+    { name: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+    { name: "ReadFile", inputSchema: { type: "object", properties: { target_file: { type: "string" } } } }
+  ];
+  assert.equal(normalizeToolCallForClient({ id: "c", name: "ReadFile", arguments: { target_file: "a.ts" } }, tools).name, "ReadFile");
+  assert.equal(normalizeToolCallForClient({ id: "c", name: "Read", arguments: { path: "a.ts" } }, tools).name, "Read");
+});
+
+test("an agent that actually declared Readfile keeps that name", () => {
+  const tools: GatewayTool[] = [
+    { name: "Readfile", inputSchema: { type: "object", properties: { target_file: { type: "string" } } } }
+  ];
+  assert.equal(
+    normalizeToolCallForClient({ id: "c", name: "Readfile", arguments: { target_file: "a.ts" } }, tools).name,
+    "Readfile",
+    "声明名原样保留"
+  );
+  assert.equal(
+    normalizeToolCallForClient({ id: "c", name: "ReadFile", arguments: { target_file: "a.ts" } }, tools).name,
+    "Readfile",
+    "只是大小写不同，仍落到声明名"
+  );
+  assert.equal(
+    normalizeToolCallForClient({ id: "c", name: "Read", arguments: { target_file: "a.ts" } }, tools).name,
+    "Read",
+    "不会把短名硬扩成 Readfile"
+  );
+});

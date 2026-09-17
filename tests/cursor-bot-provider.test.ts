@@ -812,6 +812,22 @@ test("tools stay off the wire until sendTools is on; grok never advertises", asy
   assert.equal(composerOn.captured[0].request.tools[0].name, "search");
 });
 
+test("grok injects this request's tool names into SYSTEM instead of advertising tools[]", async () => {
+  const tools = [
+    { name: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+    { name: "LookupDoc", inputSchema: { type: "object", properties: { id: { type: "string" } } } }
+  ];
+  const { instance, captured } = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
+  await instance.run(runRequest({ tools }));
+  assert.deepEqual(captured[0].request.tools, []);
+  const system = captured[0].request.messages.filter((message) => message.role === InferenceMessageRole.SYSTEM);
+  assert.equal(system.length, 1);
+  const text = String(system[0].content.value);
+  assert.match(text, /^- Read — arguments: path$/m);
+  assert.match(text, /^- LookupDoc — arguments: id$/m);
+  assert.doesNotMatch(text, /ReadFile/);
+});
+
 test("grok sendTools still reconstitutes body markers without advertising tools", async () => {
   const marker = '<tool_call>{"name":"search","arguments":{"q":"x"}}</tool_call>';
   const { instance, captured } = provider(

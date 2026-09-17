@@ -226,6 +226,21 @@ test("marker tool calls not declared by the caller are dropped", () => {
   assert.deepEqual(normalizer.result().toolCalls, []);
 });
 
+test("structured Readfile frames collapse to the declared Read tool", () => {
+  const readTool = {
+    name: "Read",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } }
+  };
+  const normalizer = new ResponseNormalizer({ tools: [readTool] });
+  const events = drain(normalizer, [
+    toolFrame({ toolCallId: "c1", toolName: "Readfile", args: '{"target_file":"a.ts"}', isComplete: true })
+  ]);
+  const calls = events.filter((event) => event.type === "tool_call").map((event) => event.toolCall);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "Read");
+  assert.deepEqual(calls[0].arguments, { path: "a.ts" });
+});
+
 test("marker tool call names are alias-normalized (shell → Bash)", () => {
   const normalizer = new ResponseNormalizer({ parseToolMarkers: true, tools: [bashTool] });
   const aliased = OPEN + '{"name":"shell","arguments":{"command":"ls"}}' + CLOSE;

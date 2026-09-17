@@ -106,6 +106,11 @@ export {
 export { ResponseNormalizer, type BotRunState } from "./response-normalizer.js";
 
 export {
+  unadvertisedToolCatalog,
+  withUnadvertisedToolCatalog
+} from "./tool-catalog.js";
+
+export {
   ToolMarkerFilter,
   markerEventsFromText,
   markerFlushEvents,

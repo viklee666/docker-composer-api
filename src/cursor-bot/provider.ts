@@ -14,6 +14,7 @@ import { SAND_CLIENT_TYPE, type CursorBotCredential } from "./credentials.js";
 import type { ConnectCompression } from "./envelope.js";
 import type { ConnectCodec } from "./headers.js";
 import { buildInferenceStreamRequest, type BotConversation, type BotMessage } from "./request-builder.js";
+import { unadvertisedToolCatalog } from "./tool-catalog.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
 import { InferenceStreamRequest } from "./proto/inference_pb.js";
 import type { ConnectFetch } from "./transport.js";
@@ -145,11 +146,17 @@ export class CursorBotProvider implements CursorRunner {
     for (const instruction of this.options.systemInstructions ?? []) {
       if (instruction.trim()) messages.push({ role: "system", text: instruction });
     }
+    // sendTools 只决定要不要把 tools[] 写给上游。本地仍拿客户端工具表做 XML 还原
+    // 与名字归一——grok 不声明也能发起调用，不带这张表就无法把 Readfile 收成 Read。
+    const advertiseTools = this.options.sendTools ? undefined : false;
+    const toolCatalog = unadvertisedToolCatalog(input.tools, input.model, advertiseTools);
+    if (toolCatalog) messages.push({ role: "system", text: toolCatalog });
     messages.push({ role: "user", text: input.prompt, ...(input.images.length ? { images: input.images } : {}) });
 
     return {
       messages,
-      ...(this.options.sendTools && input.tools.length ? { tools: input.tools } : {}),
+      ...(input.tools.length ? { tools: input.tools } : {}),
+      advertiseTools,
       conversationId: conversationIdFor(input),
       invocationId: this.options.newInvocationId?.() ?? randomUUID(),
       requestedModel: resolved.requestedModel,

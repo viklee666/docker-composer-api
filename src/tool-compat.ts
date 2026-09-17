@@ -22,15 +22,21 @@ const TOOL_ALIASES: Record<string, string[]> = {
  */
 const ARG_ALIASES: Record<string, Record<string, string[]>> = {
   Read: {
-    path: ["file_path"]
+    path: ["file_path"],
+    file_path: ["path"],
+    target_file: ["path", "file_path"]
   },
   Write: {
     path: ["file_path"],
+    file_path: ["path"],
+    target_file: ["path", "file_path"],
     fileText: ["content"],
     file_text: ["content"]
   },
   Edit: {
-    path: ["file_path"]
+    path: ["file_path"],
+    file_path: ["path"],
+    target_file: ["path", "file_path"]
   },
   Glob: {
     globPattern: ["pattern"],
@@ -164,17 +170,41 @@ function unwrapMcpToolCall(toolCall: GatewayToolCall): GatewayToolCall {
   return toolCall;
 }
 
+/** Grok / GPT 方言常给工具名加 File、_file、Tool，或加上 `functions.` 前缀。 */
+const NAME_DECORATION = /(_?(file|tool))$/i;
+
 function findClientTool(name: string, tools: GatewayTool[]): GatewayTool | undefined {
-  const exact = tools.find((tool) => tool.name === name);
+  const lookup = stripFunctionsPrefix(name);
+  const exact = tools.find((tool) => tool.name === lookup || tool.name === name);
   if (exact) return exact;
-  const lower = name.toLowerCase();
+  const lower = lookup.toLowerCase();
   const caseInsensitive = tools.find((tool) => tool.name.toLowerCase() === lower);
   if (caseInsensitive) return caseInsensitive;
   for (const tool of tools) {
     const aliases = TOOL_ALIASES[tool.name] ?? [];
     if (aliases.some((alias) => alias.toLowerCase() === lower)) return tool;
   }
-  return undefined;
+  return uniqueDecoratedMatch(lookup, tools);
+}
+
+function stripFunctionsPrefix(name: string): string {
+  const trimmed = name.trim();
+  const prefixed = /^functions\.(.+)$/i.exec(trimmed);
+  return prefixed ? prefixed[1] : trimmed;
+}
+
+/**
+ * 声明表里只有 `Read`、模型却打出 `Readfile` / `ReadFile` / `read_file` 时，
+ * 若去掉 File/_file/Tool 之后**恰好唯一**命中一个声明名，就认成那个。
+ * 声明了 `Read` 和 `ReadFile` 时不猜——精确 / 大小写匹配已经先处理了 `ReadFile`。
+ * 不硬编码 Cursor 工具名，自研 agent 的 `Search` → `SearchFile` 同样能对上。
+ */
+function uniqueDecoratedMatch(name: string, tools: GatewayTool[]): GatewayTool | undefined {
+  const lower = name.toLowerCase();
+  const stripped = lower.replace(NAME_DECORATION, "");
+  if (!stripped || stripped === lower) return undefined;
+  const matches = tools.filter((tool) => tool.name.toLowerCase() === stripped);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function normalizeArguments(toolName: string, args: Record<string, unknown>, inputSchema: unknown): Record<string, unknown> {

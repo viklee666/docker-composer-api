@@ -28,6 +28,7 @@ import {
 import { resolveRequestedModel } from "./catalog.js";
 import { CursorBotClient, DEFAULT_BOT_BASE_URL } from "./client.js";
 import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
+import { withUnadvertisedToolCatalog } from "./tool-catalog.js";
 import type { CursorBotCredential } from "./credentials.js";
 import {
   KEY_TOKEN_REFRESH_INTERVAL_MS,
@@ -600,23 +601,23 @@ export class CursorBotService implements CursorRunner {
   /** 结构化对话。有原始 body 就走 G5 的解析器，否则退回单条 user 文本。 */
   private conversationFor(input: CursorRunRequest, tools: GatewayTool[]): PreparedConversation {
     const conversationId = conversationIdFor(input);
+    const advertiseTools = this.settings.sendTools ? undefined : false;
+    let prepared: PreparedConversation;
     if (input.rawBody && input.inboundProtocol) {
       try {
-        return toPreparedConversation(input.rawBody, input.inboundProtocol, {
+        prepared = toPreparedConversation(input.rawBody, input.inboundProtocol, {
           conversationId,
           tools: [...input.tools, ...tools]
         });
       } catch {
         // 解析失败退回合成 prompt，不能让它把请求打挂。
+        prepared = fallbackConversation(input, tools, conversationId);
       }
+    } else {
+      prepared = fallbackConversation(input, tools, conversationId);
     }
-    return {
-      messages: [{ role: "user", text: input.prompt, ...(input.images.length ? { images: input.images } : {}) }],
-      systemInstructions: [],
-      tools: [...input.tools, ...tools],
-      conversationId,
-      invocationId: randomUUID()
-    };
+    // grok 不声明 tools[]：把本轮真实工具名写进 SYSTEM，自研 agent 只在 tools[] 里声明时也能看见。
+    return withUnadvertisedToolCatalog(prepared, input.model, advertiseTools);
   }
 
   /**
@@ -1227,6 +1228,20 @@ function toProviderCredential(credential: BotCredential): CursorBotCredential {
     ...(credential.clientKey ? { clientKey: credential.clientKey } : {}),
     ...(credential.sessionId ? { sessionId: credential.sessionId } : {}),
     ...(credential.timezone ? { timezone: credential.timezone } : {})
+  };
+}
+
+function fallbackConversation(
+  input: CursorRunRequest,
+  tools: GatewayTool[],
+  conversationId: string
+): PreparedConversation {
+  return {
+    messages: [{ role: "user", text: input.prompt, ...(input.images.length ? { images: input.images } : {}) }],
+    systemInstructions: [],
+    tools: [...input.tools, ...tools],
+    conversationId,
+    invocationId: randomUUID()
   };
 }
 

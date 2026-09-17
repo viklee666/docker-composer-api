@@ -273,11 +273,17 @@ export class ResponseNormalizer {
 
   private completeToolCall(key: string, pending: PendingToolCall): GatewayToolCall {
     this.completed.add(key);
-    const toolCall: GatewayToolCall = {
+    let toolCall: GatewayToolCall = {
       id: pending.id,
       name: pending.name,
       arguments: parseToolArgs(pending.args)
     };
+    const tools = this.declaredTools;
+    // 结构化 tool_call 帧也要走声明侧归一：grok 不声明 tools[] 时仍会打出
+    // Readfile / ReadFile，只处理正文 marker 会漏掉主通道。
+    if (tools?.length && matchesClientTool(toolCall, tools)) {
+      toolCall = normalizeToolCallForClient(toolCall, tools);
+    }
     this.state.toolCalls.push(toolCall);
     return toolCall;
   }
