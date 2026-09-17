@@ -181,6 +181,11 @@ test("admin endpoints require the admin password, not just any gateway key", asy
     (await app.inject({ method: "POST", url: fromKey, headers: apiAuth, payload: { cursorKeyId: "x" } })).statusCode,
     401
   );
+  const fromDesktop = "/admin/api/bot/credentials/from-desktop";
+  assert.equal(
+    (await app.inject({ method: "POST", url: fromDesktop, payload: { sessionToken: "x", machineId: "m" } })).statusCode,
+    401
+  );
   const refresh = "/admin/api/bot/credentials/x/refresh";
   assert.equal((await app.inject({ method: "POST", url: refresh })).statusCode, 401);
   assert.equal((await app.inject({ method: "POST", url: refresh, headers: apiAuth })).statusCode, 401);
@@ -318,6 +323,60 @@ test("importing from a missing Cursor key is 404 and does not invent a credentia
   });
   assert.equal(response.statusCode, 404);
   assert.equal(botStore.listCredentials().length, 0);
+  await app.close();
+});
+
+test("a desktop session token upserts by machineId and rejects web tokens", async () => {
+  const { app, botStore } = await buildApp();
+  const first = jwt({ type: "session", sub: "desktop-acct" });
+  const created = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-desktop",
+    headers: adminAuth,
+    payload: { sessionToken: first, machineId: "grok-machine-1", label: "Grok Bot" }
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const credential = (created.json() as { credential: Record<string, unknown> }).credential;
+  assert.equal(credential.label, "Grok Bot");
+  assert.equal(credential.tokenType, "session");
+  assert.equal(credential.sourceCursorKeyId, null);
+  assert.ok(!JSON.stringify(credential).includes(first));
+  assert.equal(botStore.credential(String(credential.id))?.sessionToken, first);
+  assert.equal(botStore.credential(String(credential.id))?.machineId, "grok-machine-1");
+
+  const second = jwt({ type: "session", sub: "desktop-acct", exp: Math.floor(Date.now() / 1000) + 86_400 });
+  const updated = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-desktop",
+    headers: adminAuth,
+    payload: { sessionToken: second, machineId: "grok-machine-1", label: "Grok Bot · demo" }
+  });
+  assert.equal(updated.statusCode, 200, updated.body);
+  const next = (updated.json() as { credential: { id: string; label: string } }).credential;
+  assert.equal(next.id, credential.id, "同一 machineId 再导入应更新而不是新建");
+  assert.equal(next.label, "Grok Bot · demo");
+  assert.equal(botStore.credential(next.id)?.sessionToken, second);
+  assert.equal(botStore.listCredentials().length, 1);
+  assert.ok(!JSON.stringify(updated.json()).includes(second));
+
+  const web = jwt({ type: "web", sub: "browser" });
+  const rejected = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-desktop",
+    headers: adminAuth,
+    payload: { sessionToken: web, machineId: "grok-machine-1" }
+  });
+  assert.equal(rejected.statusCode, 400);
+  assert.match(rejected.body, /web token/);
+  assert.equal(botStore.credential(String(credential.id))?.sessionToken, second);
+
+  const missingMachine = await app.inject({
+    method: "POST",
+    url: "/admin/api/bot/credentials/from-desktop",
+    headers: adminAuth,
+    payload: { sessionToken: first }
+  });
+  assert.equal(missingMachine.statusCode, 400);
   await app.close();
 });
 

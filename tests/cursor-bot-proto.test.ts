@@ -8,7 +8,9 @@ import { cursorChecksum } from "../src/cursor-bot/checksum.js";
 import {
   assertUsableCredential,
   cursorTokenExpiresAtMs,
+  cursorTokenIssuedAtMs,
   cursorTokenType,
+  keyMintedTokenExpired,
   keyMintedTokenNeedsRefresh,
   KEY_TOKEN_REFRESH_SKEW_MS,
   type CursorBotCredential
@@ -496,6 +498,7 @@ test("api_key_token expiry is read from JWT exp and drives the refresh window", 
   const exp = 1_789_578_074;
   const token = jwt({ type: "api_key_token", exp, time: exp - 3600 });
   assert.equal(cursorTokenExpiresAtMs(token), exp * 1000);
+  assert.equal(cursorTokenIssuedAtMs(token), (exp - 3600) * 1000);
   assert.equal(cursorTokenExpiresAtMs(jwt({ type: "session" })), undefined);
   assert.equal(cursorTokenExpiresAtMs("opaque"), undefined);
 
@@ -503,6 +506,8 @@ test("api_key_token expiry is read from JWT exp and drives the refresh window", 
   assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, now), false);
   assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, exp * 1000 - KEY_TOKEN_REFRESH_SKEW_MS), true);
   assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, exp * 1000 + 1), true);
+  assert.equal(keyMintedTokenExpired({ sessionToken: token }, exp * 1000 - 1), false);
+  assert.equal(keyMintedTokenExpired({ sessionToken: token }, exp * 1000), true);
   assert.equal(
     keyMintedTokenNeedsRefresh(
       { sessionToken: jwt({ type: "api_key_token" }), updatedAt: new Date(now - 10 * 60 * 1000).toISOString() },
@@ -518,6 +523,31 @@ test("api_key_token expiry is read from JWT exp and drives the refresh window", 
     ),
     true,
     "无 exp 超过保守寿命才刷新"
+  );
+});
+
+test("Cursor api_key_token claims accept string seconds (real tokens stringify time)", () => {
+  const exp = 1_789_578_074;
+  const issued = exp - 3600;
+  const token = jwt({
+    type: "api_key_token",
+    time: String(issued),
+    exp: String(exp),
+    randomness: "1e4a73c7-6011-4785"
+  });
+  assert.equal(cursorTokenExpiresAtMs(token), exp * 1000);
+  assert.equal(cursorTokenIssuedAtMs(token), issued * 1000);
+  assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, issued * 1000 + 10 * 60 * 1000), false);
+  assert.equal(keyMintedTokenNeedsRefresh({ sessionToken: token }, exp * 1000 - KEY_TOKEN_REFRESH_SKEW_MS), true);
+  // 无 exp 时回落签发时间，不能被后来的 updatedAt 改写挡住。
+  const noExp = jwt({ type: "api_key_token", time: String(issued) });
+  assert.equal(
+    keyMintedTokenNeedsRefresh(
+      { sessionToken: noExp, updatedAt: new Date(exp * 1000).toISOString() },
+      exp * 1000
+    ),
+    true,
+    "签发已超过保守寿命，即使 updatedAt 被失败计数往后推"
   );
 });
 

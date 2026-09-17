@@ -51,7 +51,9 @@ export {
   credentialClientType,
   cursorTokenExpiresAtIso,
   cursorTokenExpiresAtMs,
+  cursorTokenIssuedAtMs,
   cursorTokenType,
+  keyMintedTokenExpired,
   keyMintedTokenNeedsRefresh,
   type CursorBotCredential,
   type CursorTokenType

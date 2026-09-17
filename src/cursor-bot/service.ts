@@ -33,6 +33,7 @@ import {
   KEY_TOKEN_REFRESH_INTERVAL_MS,
   KEY_TOKEN_REFRESH_RETRY_MS,
   SAND_CLIENT_TYPE,
+  keyMintedTokenExpired,
   keyMintedTokenNeedsRefresh
 } from "./credentials.js";
 import { DEFAULT_READ_MAX_BYTES } from "./envelope.js";
@@ -293,21 +294,45 @@ export class CursorBotService implements CursorRunner {
     // 包 B：整条请求（含失败标桶、成功清标记）都按这个桶算。vendor 推断用目录缓存里的
     // 任意一份——vendor 是模型属性，与用哪把凭据拉到的目录无关。
     const bucket = this.options.quotaBuckets?.resolveBucket(input.model, this.anyVendorIsCursor(input.model));
-    const credential = await this.ensureFreshKeyToken(this.pickCredential(input.model, bucket));
+    let credential = await this.pickFreshKeyToken(input.model, bucket);
+    let yieldedAny = false;
     try {
-      // 网关侧需要代跑工具（本地工具 / 子代理）时走多轮循环；否则单发单收。
-      // 两条路都产出同样的 `CursorStreamEvent`，对外 SSE 层不区分。
-      const orchestrated = this.orchestratedTools(input);
-      if (orchestrated.length) yield* this.streamWithTools(credential, input, orchestrated, signal);
-      else yield* this.streamPlain(credential, input, signal);
+      for await (const event of this.dispatchStream(credential, input, signal)) {
+        yieldedAny = true;
+        yield event;
+      }
       this.options.store.recordCredentialUse(credential.id, bucket);
     } catch (error) {
+      // 短票过期表现为 401/403。还没向客户端吐过事件时，强制再兑一次然后重放整轮。
+      // 已经吐过内容的流绝不重放（客户端已收到一半）。
+      if (!yieldedAny && this.canRetryAuthWithKeyRefresh(credential, error)) {
+        credential = await this.refreshFromSourceKey(credential, { force: true, allowDisabledKey: true });
+        try {
+          for await (const event of this.dispatchStream(credential, input, signal)) {
+            yield event;
+          }
+          this.options.store.recordCredentialUse(credential.id, bucket);
+          return;
+        } catch (retryError) {
+          this.noteFailure(credential, retryError, input.model);
+          throw retryError;
+        }
+      }
       this.noteFailure(credential, error, input.model);
       throw error;
     }
   }
 
-  /** 网关自己负责执行的工具：本地工具 + 子代理。调用方声明的工具不在此列（由调用方自己执行）。 */
+  /** 网关侧需要代跑工具（本地工具 / 子代理）时走多轮循环；否则单发单收。 */
+  private async *dispatchStream(
+    credential: BotCredential,
+    input: CursorRunRequest,
+    signal?: AbortSignal
+  ): AsyncIterable<CursorStreamEvent> {
+    const orchestrated = this.orchestratedTools(input);
+    if (orchestrated.length) yield* this.streamWithTools(credential, input, orchestrated, signal);
+    else yield* this.streamPlain(credential, input, signal);
+  }
 
   /**
    * 单发单收路径。relay 模式下带一次性重试：
@@ -366,6 +391,7 @@ export class CursorBotService implements CursorRunner {
     };
   }
   private orchestratedTools(input: CursorRunRequest): GatewayTool[] {
+    // 网关自己负责执行的工具：本地工具 + 子代理。调用方声明的工具不在此列。
     if (!this.settings.sendTools) return [];
     return [...(this.localTools?.advertise() ?? []), ...(this.settings.subagents ? [subagentTool()] : [])];
   }
@@ -662,7 +688,7 @@ export class CursorBotService implements CursorRunner {
 
   /** 对外模型列表（`/v1/models` 的 Bot 视角）。DISABLED 的不暴露。 */
   async listModels(force = false): Promise<BotModelEntry[]> {
-    const credential = await this.ensureFreshKeyToken(this.pickCredential());
+    const credential = await this.pickFreshKeyToken();
     const catalog = await this.catalog(credential, force);
     return (catalog?.models ?? []).filter((model) => model.degradation !== "disabled");
   }
@@ -690,6 +716,37 @@ export class CursorBotService implements CursorRunner {
       this.noteFailure(credential, error);
       throw error;
     }
+  }
+
+  /**
+   * 写入本机 Grok Bot / Cursor 桌面端的长效 session JWT。
+   * 同一 machineId 再导入只换 token，不换设备身份；不碰 from-key 凭据。
+   */
+  importDesktopSession(input: {
+    sessionToken: string;
+    machineId: string;
+    label?: string;
+  }): BotCredential {
+    const sessionToken = input.sessionToken.trim();
+    const machineId = input.machineId.trim();
+    if (!sessionToken) throw new ApiError("sessionToken is required.", 400, "invalid_request_error", "sessionToken");
+    if (!machineId) throw new ApiError("machineId is required.", 400, "invalid_request_error", "machineId");
+    const existing = this.options.store.credentialByMachineId(machineId);
+    const target = existing && !existing.sourceCursorKeyId ? existing : undefined;
+    const previousToken = target?.sessionToken;
+    const written = this.options.store.upsertCredential({
+      ...(target ? { id: target.id } : {}),
+      label: input.label?.trim() || target?.label || "Grok Bot",
+      sessionToken,
+      machineId: target?.machineId || machineId,
+      clientVersion: this.settings.clientVersion,
+      ...(!target
+        ? { clientOs: process.platform, clientArch: process.arch, deviceType: "desktop" }
+        : {}),
+      status: "active"
+    });
+    if (written.sessionToken !== previousToken) this.boxConnections.invalidate(written.id);
+    return written;
   }
 
   /**
@@ -862,7 +919,7 @@ export class CursorBotService implements CursorRunner {
 
   /**
    * 由 Key 兑换的短票巡检。进程启动时打开；后台改开关立即生效（每次 tick 现查 settings）。
-   * 定时器 unref，不独自拖住进程。
+   * 关停时必须 stopKeyTokenRefresh，否则 interval 会拖住进程。
    */
   startKeyTokenRefresh(): void {
     if (this.keyTokenRefreshTimer) return;
@@ -872,8 +929,8 @@ export class CursorBotService implements CursorRunner {
       });
     };
     this.keyTokenRefreshTimer = setInterval(tick, KEY_TOKEN_REFRESH_INTERVAL_MS);
-    this.keyTokenRefreshTimer.unref?.();
     tick();
+    console.log(`[cursor-bot] key-minted token auto-refresh every ${KEY_TOKEN_REFRESH_INTERVAL_MS / 1000}s`);
   }
 
   stopKeyTokenRefresh(): void {
@@ -882,11 +939,13 @@ export class CursorBotService implements CursorRunner {
     this.keyTokenRefreshTimer = undefined;
   }
 
-  /** 巡检所有 from-key 凭据：到期窗口内的再兑一次。自动刷新关闭时直接返回。 */
+  /** 巡检 from-key 凭据：到期窗口内的再兑一次。自动刷新关闭时直接返回。 */
   async refreshExpiringKeyTokens(): Promise<void> {
     if (!this.settings.autoRefreshFromKey || !this.options.resolveSourceKey) return;
-    for (const credential of this.options.store.activeCredentials()) {
+    for (const credential of this.options.store.listCredentials()) {
       if (!credential.sourceCursorKeyId) continue;
+      // 停用的也扫：过期后 401 曾把凭据自动停掉，只扫 active 会永远兑不到，只能靠按钮。
+      if (credential.status !== "active" && !keyMintedTokenNeedsRefresh(credential, this.nowMs())) continue;
       await this.ensureFreshKeyToken(credential);
     }
   }
@@ -906,11 +965,44 @@ export class CursorBotService implements CursorRunner {
     return (this.options.now?.() ?? new Date()).getTime();
   }
 
+  /**
+   * 选一把活的 from-key 凭据并保证短票未进入到期窗口。
+   * 全部停用时先尝试用源 Key 救活过期的 from-key 凭据，再选一次。
+   */
+  private async pickFreshKeyToken(model?: string, bucket?: QuotaBucket): Promise<BotCredential> {
+    try {
+      return await this.ensureFreshKeyToken(this.pickCredential(model, bucket));
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.statusCode !== 503 || !this.settings.autoRefreshFromKey) throw error;
+      const revived = await this.reviveFromKeyCredentials();
+      if (!revived) throw error;
+      return await this.ensureFreshKeyToken(this.pickCredential(model, bucket));
+    }
+  }
+
+  private async reviveFromKeyCredentials(): Promise<boolean> {
+    if (!this.options.resolveSourceKey) return false;
+    let revived = false;
+    for (const credential of this.options.store.listCredentials()) {
+      if (!credential.sourceCursorKeyId) continue;
+      const next = await this.refreshFromSourceKey(credential, { force: true, allowDisabledKey: true });
+      if (next.status === "active") revived = true;
+    }
+    return revived;
+  }
+
+  private canRetryAuthWithKeyRefresh(credential: BotCredential, error: unknown): boolean {
+    if (!credential.sourceCursorKeyId || !this.options.resolveSourceKey) return false;
+    if (!this.settings.autoRefreshFromKey) return false;
+    return error instanceof ApiError && (error.statusCode === 401 || error.statusCode === 403);
+  }
+
   private async ensureFreshKeyToken(credential: BotCredential): Promise<BotCredential> {
     if (!credential.sourceCursorKeyId || !this.options.resolveSourceKey) return credential;
     if (!this.settings.autoRefreshFromKey) return credential;
     if (!keyMintedTokenNeedsRefresh(credential, this.nowMs())) return credential;
-    return this.refreshFromSourceKey(credential, { force: false, allowDisabledKey: false });
+    const expired = keyMintedTokenExpired(credential, this.nowMs()) || credential.status !== "active";
+    return this.refreshFromSourceKey(credential, { force: expired, allowDisabledKey: expired });
   }
 
   private async refreshFromSourceKey(
@@ -1000,6 +1092,11 @@ export class CursorBotService implements CursorRunner {
     // 只有凭据本身的问题才计数。429/5xx 是上游状态，跟这把 token 的有效性无关，
     // 按失败累计会把一次限流演变成把凭据停掉。
     if (status !== 401 && status !== 403) return;
+    // from-key 短票过期是预期的：记痕迹但不累计、不停用。停用后巡检只扫 active，就只能靠按钮救。
+    if (credential.sourceCursorKeyId && this.settings.autoRefreshFromKey) {
+      this.options.store.setCredentialLastError(credential.id, errorText(error));
+      return;
+    }
     const failures = this.options.store.recordCredentialFailure(credential.id, errorText(error));
     // 包 A：Bot 侧禁用策略独立于 SDK 的 key 池；未覆盖时保持改造前的默认（开、阈值 5）。
     const policy = botAutoDisablePolicy(this.options.config);

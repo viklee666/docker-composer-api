@@ -321,3 +321,169 @@ test("botSettings autoRefreshFromKey is live, not a constructor snapshot", async
   assert.equal(exchanges, 1, "再打开立即生效");
   store.close();
 });
+
+test("auto-refresh revives a disabled from-key credential that is inside the expiry window", async () => {
+  const now = Date.now();
+  const expiring = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 30 });
+  const fresh = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 3600 });
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async () => Response.json({ accessToken: fresh, refreshToken: "r" })
+  });
+  const credential = store.upsertCredential({
+    sessionToken: expiring,
+    machineId: "m",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id,
+    status: "disabled"
+  });
+  await service.refreshExpiringKeyTokens();
+  assert.equal(store.credential(credential.id)?.sessionToken, fresh);
+  assert.equal(store.credential(credential.id)?.status, "active", "再兑成功后应重新启用");
+  store.close();
+});
+
+test("stream 401 on a still-unexpired from-key token re-exchanges once and retries", async () => {
+  const now = Date.now();
+  const stale = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 50 * 60 });
+  const fresh = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 3600 });
+  const seen: string[] = [];
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async (url, init) => {
+      const href = String(url);
+      if (href.includes("/auth/exchange_user_api_key")) {
+        seen.push("exchange");
+        return Response.json({ accessToken: fresh, refreshToken: "r" });
+      }
+      if (href.includes("InferenceService/Stream")) {
+        const headers = init?.headers as Record<string, string> | undefined;
+        if (headers?.authorization === `Bearer ${stale}`) {
+          seen.push("stale");
+          return new Response("expired", { status: 401 });
+        }
+        seen.push("fresh");
+        assert.equal(headers?.authorization, `Bearer ${fresh}`);
+        return streamPong();
+      }
+      return new Response("unexpected", { status: 500 });
+    }
+  });
+  store.upsertCredential({
+    sessionToken: stale,
+    machineId: "m",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id
+  });
+  const result = await service.run(runRequest());
+  assert.equal(result.text, "pong");
+  assert.deepEqual(seen, ["stale", "exchange", "fresh"]);
+  store.close();
+});
+
+test("from-key 401 does not disable the credential or count toward the auto-disable threshold", async () => {
+  const now = Date.now();
+  const token = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 50 * 60 });
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async (url) => {
+      if (String(url).includes("/auth/exchange_user_api_key")) {
+        return Response.json({ accessToken: token, refreshToken: "r" });
+      }
+      return new Response("bad token", { status: 401 });
+    }
+  });
+  const credential = store.upsertCredential({
+    sessionToken: token,
+    machineId: "m",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id
+  });
+  for (let i = 0; i < 5; i += 1) {
+    await assert.rejects(
+      () => service.testCredential(credential.id),
+      (error: unknown) => error instanceof ApiError && error.statusCode === 401
+    );
+  }
+  assert.equal(store.credential(credential.id)?.status, "active", "from-key 短票 401 不得自动停用");
+  assert.equal(store.credential(credential.id)?.failureCount, 0);
+  store.close();
+});
+
+test("startKeyTokenRefresh ticks immediately then can be stopped", async () => {
+  const now = Date.now();
+  const expiring = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 30 });
+  const fresh = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 3600 });
+  let exchanges = 0;
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async () => {
+      exchanges += 1;
+      return Response.json({ accessToken: fresh, refreshToken: "r" });
+    }
+  });
+  store.upsertCredential({
+    sessionToken: expiring,
+    machineId: "m",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id
+  });
+  service.startKeyTokenRefresh();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(exchanges, 1, "启动时应立刻巡检一次");
+  service.stopKeyTokenRefresh();
+  store.close();
+});
+
+test("a 503 from every credential being disabled revives from-key tokens and continues", async () => {
+  const now = Date.now();
+  const expiring = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 30 });
+  const fresh = jwt({ type: "api_key_token", exp: Math.floor(now / 1000) + 3600 });
+  const store = CursorBotStore.open(":memory:");
+  const source = keyRecord();
+  const service = new CursorBotService({
+    store,
+    config: baseConfig(),
+    now: () => new Date(now),
+    resolveSourceKey: async () => source,
+    fetchImpl: async (url) => {
+      if (String(url).includes("/auth/exchange_user_api_key")) {
+        return Response.json({ accessToken: fresh, refreshToken: "r" });
+      }
+      if (String(url).includes("InferenceService/Stream")) return streamPong();
+      return new Response("unexpected", { status: 500 });
+    }
+  });
+  const credential = store.upsertCredential({
+    sessionToken: expiring,
+    machineId: "m",
+    clientVersion: "1",
+    sourceCursorKeyId: source.id,
+    status: "disabled"
+  });
+  const result = await service.run(runRequest());
+  assert.equal(result.text, "pong");
+  assert.equal(store.credential(credential.id)?.status, "active");
+  assert.equal(store.credential(credential.id)?.sessionToken, fresh);
+  store.close();
+});

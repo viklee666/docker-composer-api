@@ -415,8 +415,10 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                   <option value="">选择一把 Cursor Key</option>
                 </select>
                 <button class="primary" id="btn-bot-from-key">从 Key 拉取</button>
+                <button id="btn-bot-from-grok" title="读取这台电脑已登录的 Grok Bot，导入约 60 天的 session JWT">从本机 Grok Bot 导入</button>
               </div>
-              <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。这类 JWT（<code>api_key_token</code>）约 1 小时过期；默认会在到期前用同一把 Key 自动再兑，machineId 不变。同一把 key 再拉取也会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token（不会自动刷新）。</p>
+              <p class="note" style="margin-top:0;margin-bottom:8px" id="bot-grok-helper-hint">Grok Bot 的 token 在本机 AppData 里且已 DPAPI 加密，网页读不到。先在<strong>打开这个后台的这台电脑</strong>运行 <code>node scripts/import-local-grok-bot.mjs</code>（或双击 <code>scripts/import-local-grok-bot.cmd</code>），再点「从本机 Grok Bot 导入」。</p>
+              <p class="note" style="margin-top:0;margin-bottom:12px">用 Key 池里的 <code>crsr_</code> 向 Cursor 兑换 session JWT，不必从桌面端粘贴。这类 JWT（<code>api_key_token</code>）约 1 小时过期；默认每分钟巡检，到期前 10 分钟用同一把 Key 自动再兑（过期/401 也会自动再兑），machineId 不变。同一把 key 再拉取也会换新 token、保持原 machineId。下面的粘贴框只留给没有入池的 token（不会自动刷新）。</p>
               <div class="row" style="margin-bottom:14px">
                 <input id="bot-token" placeholder="粘贴 Cursor session token（JWT）" style="flex:2;min-width:240px" autocomplete="off">
                 <input id="bot-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
@@ -882,7 +884,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                       <option value="on">开启</option>
                       <option value="off">关闭</option>
                     </select>
-                    <div class="hint">只作用于从 Cursor Key 池兑换的 session JWT（约 1 小时过期）。到期前 5 分钟自动再兑，machineId 不变。粘贴的桌面端 token 不受影响。</div>
+                    <div class="hint">只作用于从 Cursor Key 池兑换的 session JWT（约 1 小时过期）。每分钟巡检，到期前 10 分钟自动再兑；过期或上游 401 也会再兑。machineId 不变。粘贴的桌面端 token 不受影响。</div>
                   </div>
                   <div class="setting-field">
                     <label>Bot 上游空闲超时（ms）</label>
@@ -1321,11 +1323,30 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       renderBotSettings(data.settings || {});
       renderBotCredentials(data.credentials || []);
       fillCcKeySelect(Array.isArray(data.cursorKeys) ? data.cursorKeys : lastKeys);
+      probeGrokHelper();
       if (data.status && data.status.available) loadBotModels(false);
       else fillCcChatModels();
     }).catch(function(err){
       $('bot-status-title').textContent = '读取失败';
       $('bot-status-detail').textContent = err.message;
+    });
+  }
+
+  var GROK_BOT_HELPER = 'http://127.0.0.1:17876';
+  function probeGrokHelper(){
+    var hint = $('bot-grok-helper-hint');
+    if (!hint) return;
+    fetch(GROK_BOT_HELPER + '/status', { signal: AbortSignal.timeout(800) }).then(function(res){
+      return res.json().catch(function(){ return {}; }).then(function(data){
+        if (!res.ok || !data || !data.ok) throw new Error('offline');
+        var bits = ['本机助手在线'];
+        if (data.email) bits.push(data.email);
+        if (data.tokenType) bits.push(data.tokenType);
+        if (data.expiresAt) bits.push(tokenExpiryLabel(data.expiresAt));
+        hint.textContent = bits.join(' · ') + '。点「从本机 Grok Bot 导入」即可写入网关。';
+      });
+    }).catch(function(){
+      hint.textContent = '未检测到本机助手。在打开这个后台的这台电脑运行 node scripts/import-local-grok-bot.mjs（或双击 scripts/import-local-grok-bot.cmd），再点导入。Grok Bot 的 token 已 DPAPI 加密，网页读不到。';
     });
   }
 

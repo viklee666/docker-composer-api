@@ -364,6 +364,8 @@ export class CursorBotStore {
       ["bot_tool_calls", "idempotency_key", "TEXT"],
       ["bot_conversations", "latest_event_seq", "INTEGER NOT NULL DEFAULT 0"],
       ["bot_credentials", "note", "TEXT"],
+      ["bot_credentials", "token_type", "TEXT"],
+      ["bot_credentials", "expires_at", "TEXT"],
       ["bot_credentials", "source_cursor_key_id", "TEXT"],
       // 包 B：额度桶标记（桶名 → 耗尽截止时间）。可空，老记录读出来是 undefined = 无标记。
       ["bot_credentials", "exhausted_buckets", "TEXT"]
@@ -563,6 +565,14 @@ export class CursorBotStore {
     return row ? this.mapCredential(row) : undefined;
   }
 
+  /** 桌面端导入按稳定 machineId 去重：同一台 Grok Bot 再导入只换 token。 */
+  credentialByMachineId(machineId: string): BotCredential | undefined {
+    const id = machineId.trim();
+    if (!id) return undefined;
+    const row = this.db.prepare("SELECT * FROM bot_credentials WHERE machine_id = ?").get(id);
+    return row ? this.mapCredential(row) : undefined;
+  }
+
   listCredentials(): BotCredential[] {
     return this.db.prepare("SELECT * FROM bot_credentials ORDER BY created_at").all().map((row) => this.mapCredential(row));
   }
@@ -599,9 +609,10 @@ export class CursorBotStore {
 
   /** 记一次失败并返回累计次数，让调用方决定要不要自动停用。 */
   recordCredentialFailure(id: string, error: string): number {
+    // 不改 updated_at：无 exp 时回落寿命按写入时间算，失败计数不能把时钟往后推，否则永远兑不到。
     this.db
-      .prepare("UPDATE bot_credentials SET failure_count = failure_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
-      .run(error.slice(0, 400), this.iso(), id);
+      .prepare("UPDATE bot_credentials SET failure_count = failure_count + 1, last_error = ? WHERE id = ?")
+      .run(error.slice(0, 400), id);
     return Number(this.db.prepare("SELECT failure_count FROM bot_credentials WHERE id = ?").get(id)?.failure_count ?? 0);
   }
 

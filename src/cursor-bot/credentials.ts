@@ -46,12 +46,12 @@ export interface CursorBotCredential {
  */
 export type CursorTokenType = "session" | "web" | "api_key_token" | "unknown";
 
-/** 到期前这么久就该再兑一次。短票约 1 小时，5 分钟窗口够挡住兑换往返。 */
-export const KEY_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+/** 到期前这么久就该再兑一次。短票约 1 小时；10 分钟窗口覆盖巡检间隔和兑换往返。 */
+export const KEY_TOKEN_REFRESH_SKEW_MS = 10 * 60 * 1000;
 /** 后台巡检间隔。 */
 export const KEY_TOKEN_REFRESH_INTERVAL_MS = 60 * 1000;
 /**
- * JWT 没有 `exp` 时的保守寿命：按上次写入起算。
+ * JWT 没有 `exp` 时的保守寿命：按签发时间（`time` / `iat`）或上次写入起算。
  * 短于实测 1 小时，避免无 exp 的 api_key_token 拖到已经失效才换。
  */
 export const KEY_TOKEN_REFRESH_FALLBACK_TTL_MS = 50 * 60 * 1000;
@@ -86,11 +86,32 @@ export function cursorTokenType(token: string): CursorTokenType {
   return "unknown";
 }
 
-/** JWT `exp`（unix 秒）→ 毫秒时间戳。缺字段 / 非数字 / 非正数视为读不到。 */
+/**
+ * JWT 数字时间 claim → epoch ms。
+ * Cursor 的 `api_key_token` 里 `exp` 是数字秒、`time` 却经常是字符串秒，两种都要认。
+ */
+function jwtUnixMs(value: unknown): number | undefined {
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim()
+        ? Number(value.trim())
+        : Number.NaN;
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const truncated = Math.trunc(n);
+  // 1e12 ms ≈ 2001-09-09。大于这个数的当毫秒，否则当秒。
+  return truncated > 1e12 ? truncated : truncated * 1000;
+}
+
+/** JWT `exp` → 毫秒时间戳。缺字段 / 非数字 / 非正数视为读不到。 */
 export function cursorTokenExpiresAtMs(token: string): number | undefined {
-  const exp = readJwtPayload(token)?.exp;
-  if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) return undefined;
-  return Math.trunc(exp) * 1000;
+  return jwtUnixMs(readJwtPayload(token)?.exp);
+}
+
+/** JWT 签发时间：Cursor 用 `time`，标准 JWT 用 `iat`。 */
+export function cursorTokenIssuedAtMs(token: string): number | undefined {
+  const payload = readJwtPayload(token);
+  return jwtUnixMs(payload?.time) ?? jwtUnixMs(payload?.iat);
 }
 
 export function cursorTokenExpiresAtIso(token: string): string | undefined {
@@ -98,9 +119,22 @@ export function cursorTokenExpiresAtIso(token: string): string | undefined {
   return ms !== undefined ? new Date(ms).toISOString() : undefined;
 }
 
+function resolveExpiryMs(credential: { sessionToken: string; expiresAt?: string }): number | undefined {
+  const fromColumn = credential.expiresAt ? Date.parse(credential.expiresAt) : Number.NaN;
+  if (Number.isFinite(fromColumn)) return fromColumn;
+  return cursorTokenExpiresAtMs(credential.sessionToken);
+}
+
+function resolveIssuedAtMs(credential: { sessionToken: string; updatedAt?: string }): number | undefined {
+  const fromJwt = cursorTokenIssuedAtMs(credential.sessionToken);
+  if (fromJwt !== undefined) return fromJwt;
+  const updatedAt = credential.updatedAt ? Date.parse(credential.updatedAt) : Number.NaN;
+  return Number.isFinite(updatedAt) ? updatedAt : undefined;
+}
+
 /**
  * 由 Key 兑换的 session JWT 是否该再兑一次。
- * 有 `exp` 就按到期前 `skewMs`；没有就按 `updatedAt` + 保守寿命。
+ * 有 `exp` 就按到期前 `skewMs`；没有就按签发时间（JWT `time`/`iat`，否则 `updatedAt`）+ 保守寿命。
  * 粘贴的桌面端 token 没有 source key，调用方根本不该走到这里。
  */
 export function keyMintedTokenNeedsRefresh(
@@ -108,14 +142,23 @@ export function keyMintedTokenNeedsRefresh(
   now = Date.now(),
   skewMs = KEY_TOKEN_REFRESH_SKEW_MS
 ): boolean {
-  const fromColumn = credential.expiresAt ? Date.parse(credential.expiresAt) : Number.NaN;
-  const expiresAt = Number.isFinite(fromColumn) ? fromColumn : cursorTokenExpiresAtMs(credential.sessionToken);
-  if (expiresAt !== undefined && Number.isFinite(expiresAt)) {
-    return expiresAt - now <= skewMs;
-  }
-  const updatedAt = credential.updatedAt ? Date.parse(credential.updatedAt) : Number.NaN;
-  if (!Number.isFinite(updatedAt)) return true;
-  return now - updatedAt >= KEY_TOKEN_REFRESH_FALLBACK_TTL_MS;
+  const expiresAt = resolveExpiryMs(credential);
+  if (expiresAt !== undefined) return expiresAt - now <= skewMs;
+  const issuedAt = resolveIssuedAtMs(credential);
+  if (issuedAt === undefined) return true;
+  return now - issuedAt >= KEY_TOKEN_REFRESH_FALLBACK_TTL_MS;
+}
+
+/** 短票是否已经过期（或无 exp 且已超过保守寿命）。用来决定要不要无视退避、强制再兑。 */
+export function keyMintedTokenExpired(
+  credential: { sessionToken: string; expiresAt?: string; updatedAt?: string },
+  now = Date.now()
+): boolean {
+  const expiresAt = resolveExpiryMs(credential);
+  if (expiresAt !== undefined) return expiresAt <= now;
+  const issuedAt = resolveIssuedAtMs(credential);
+  if (issuedAt === undefined) return false;
+  return now - issuedAt >= KEY_TOKEN_REFRESH_FALLBACK_TTL_MS;
 }
 
 /**

@@ -691,6 +691,33 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   /**
+   * 写入本机 Grok Bot 桌面端的长效 session JWT（type=session，约 60 天）。
+   * 按 machineId 去重：同一台桌面再导入只换 token。必须挂在 `credentials/:id` 之前。
+   */
+  app.post("/admin/api/bot/credentials/from-desktop", async (request) => {
+    requireAdmin(request, deps);
+    const bot = requireBot(deps);
+    const body = objectBody(request.body);
+    const token = typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
+    const machineId = typeof body.machineId === "string" ? body.machineId.trim() : "";
+    if (!token) {
+      throw new ApiError("sessionToken is required.", 400, "invalid_request_error", "sessionToken");
+    }
+    if (!machineId) {
+      throw new ApiError("machineId is required.", 400, "invalid_request_error", "machineId");
+    }
+    if (cursorTokenType(token) === "web") {
+      throw new ApiError("这是浏览器 web token，不是 session token。", 400, "invalid_request_error", "sessionToken");
+    }
+    const record = bot.importDesktopSession({
+      sessionToken: token,
+      machineId,
+      label: typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined
+    });
+    return { credential: publicCredential(record) };
+  });
+
+  /**
    * 用源 Cursor Key 再兑一次 session JWT。只对 from-key 凭据有效；
    * 不看自动刷新开关——运维点按钮就是要现在换。
    */
