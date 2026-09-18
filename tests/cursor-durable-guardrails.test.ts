@@ -704,6 +704,27 @@ test("护栏（tool_results 零交集纯函数）：外来 id 全部对不上 �
   assert.equal(toolResultsForeignToSlot(slot, [{ id: "call_foreign_1" }, { id: "call_mine" }]), false);
   // 空结果列表不算 foreign（由 empty/duplicate 路径处理）。
   assert.equal(toolResultsForeignToSlot(slot, []), false);
+
+  // grok SDK：execute id 带换行，客户端按 64 字符截断回传（快照 65c8b2c2 / c6ed3ee4）。
+  const sdkComposite = "call-ae1e879d-f3ef-4c9e-bc0e-ab5edc79138f-1\nfc_dfca56e0-1050-9e16-b0de-c91782f3f512_0";
+  const truncated = sdkComposite.slice(0, 64);
+  assert.equal(truncated.length, 64);
+  const compositeSlot = createSessionSlot({ agent: dummyAgent(), agentId: "a", apiKey: "k", model: "m" });
+  recordIssuedToolCalls(compositeSlot, [sdkComposite]);
+  assert.equal(toolResultsForeignToSlot(compositeSlot, [{ id: truncated }]), false, "64 字符截断必须命中本槽复合 id");
+  assert.equal(
+    toolResultsForeignToSlot(compositeSlot, [{ id: sdkComposite.split("\n")[0] }]),
+    false,
+    "第一行 call-uuid-N 必须命中"
+  );
+  const sanitizedSlot = createSessionSlot({ agent: dummyAgent(), agentId: "a", apiKey: "k", model: "m" });
+  recordIssuedToolCalls(sanitizedSlot, [sdkComposite.split("\n")[0]]);
+  assert.equal(
+    toolResultsForeignToSlot(sanitizedSlot, [{ id: truncated }]),
+    false,
+    "槽里已是短 id 时，截断复合回传仍算本槽"
+  );
+  assert.equal(toolResultsForeignToSlot(compositeSlot, [{ id: "call_foreign_1" }]), true);
 });
 
 test("护栏（tool_results 零交集）：外来工具结果撞进挂起槽 ⇒ stateless 且不 abort 挂起 execute", async () => {

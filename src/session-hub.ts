@@ -186,6 +186,57 @@ export function createSessionSlot(input: CreateSessionSlotInput): SessionSlot {
   };
 }
 
+/** Anthropic `tool_use.id` / Cursor 回传的实际上限；超长 id 会被截断。 */
+export const CLIENT_TOOL_CALL_ID_MAX = 64;
+
+/**
+ * SDK customTools 的 execute id 经常是 `call-<uuid>-N\nfc_<uuid>_0` 这种带换行的复合串。
+ * 原样发给 Anthropic/Cursor 会被截成 64 字符，回传对不上 pending/issued，durable 误判 foreign。
+ * 对外只保留第一行（通常 ≤64 且无控制字符）。
+ */
+export function sanitizeClientToolCallId(raw: string | undefined): string {
+  if (typeof raw !== "string") return "";
+  const text = raw.trim();
+  if (!text) return raw;
+  const first = (text.split(/[\r\n]+/)[0] ?? "").trim();
+  if (!first) {
+    return `call_${createHash("sha256").update(text).digest("hex").slice(0, 24)}`;
+  }
+  if (first.length <= CLIENT_TOOL_CALL_ID_MAX && !/\p{Cc}/u.test(first)) return first;
+  if (/\p{Cc}/u.test(first)) {
+    const cleaned = first.replace(/\p{Cc}/gu, "");
+    if (cleaned && cleaned.length <= CLIENT_TOOL_CALL_ID_MAX) return cleaned;
+    return `call_${createHash("sha256").update(text).digest("hex").slice(0, 24)}`;
+  }
+  return first.slice(0, CLIENT_TOOL_CALL_ID_MAX);
+}
+
+/**
+ * 把复合 / 截断 / `call_` 别名拆成可精确比对的 token。
+ * 含整串、换行分段、超长时的 64 字符前缀，以及剥掉 `call_` 后的后缀。
+ */
+export function toolCallIdTokens(id: string): string[] {
+  const out = new Set<string>();
+  const add = (value: string): void => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    out.add(trimmed);
+    const stripped = trimmed.replace(/^call_/, "");
+    if (stripped) out.add(stripped);
+  };
+  add(id);
+  for (const part of id.split(/[\r\n]+/)) add(part);
+  if (id.length > CLIENT_TOOL_CALL_ID_MAX) add(id.slice(0, CLIENT_TOOL_CALL_ID_MAX));
+  return [...out];
+}
+
+export function toolCallIdsOverlap(left: string, right: string): boolean {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const rightTokens = new Set(toolCallIdTokens(right));
+  return toolCallIdTokens(left).some((token) => rightTokens.has(token));
+}
+
 /** Responses `call_id`: strip a leading `call_`, then put it back so `foo` and `call_foo` collide. */
 export function responsesCallId(id: string): string {
   const suffix = id.trim().replace(/^call_/, "");
@@ -200,6 +251,10 @@ export function canonicalHoldId(slot: SessionSlot, clientId: string): string | u
   if (aliased && slot.pending.has(aliased)) return aliased;
   for (const pendingId of slot.pending.keys()) {
     if (clientId === responsesCallId(pendingId) || pendingId === responsesCallId(clientId)) return pendingId;
+    if (toolCallIdsOverlap(pendingId, clientId)) return pendingId;
+  }
+  for (const [alias, executeId] of slot.callAliases) {
+    if (slot.pending.has(executeId) && toolCallIdsOverlap(alias, clientId)) return executeId;
   }
   return undefined;
 }
@@ -483,6 +538,9 @@ export class SessionHub {
     }
     slot.pending.set(toolCallId, { name, resolve, reject });
     rememberCallAlias(slot, toolCallId, responsesCallId(toolCallId));
+    for (const token of toolCallIdTokens(toolCallId)) {
+      rememberCallAlias(slot, toolCallId, token);
+    }
   }
 
   resolvePending(sessionId: string, toolCallId: string, result: unknown): boolean {

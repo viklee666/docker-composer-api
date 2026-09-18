@@ -7,7 +7,9 @@ import {
   PARALLEL_TOOL_SETTLE_MS,
   SessionHub,
   TOOL_HOLD_EXPIRED_LOG,
+  canonicalHoldId,
   createSessionSlot,
+  sanitizeClientToolCallId,
   type HubAgent,
   type HubPumpItem,
   type HubRun
@@ -138,6 +140,53 @@ test("resolvePending accepts Responses call_ prefix of the hung execute id", asy
   assert.equal(hub.resolvePending(sessionId, "call_toolu_01abc", { content: [{ type: "text", text: "pong" }] }), true);
   assert.deepEqual(resolved, { content: [{ type: "text", text: "pong" }] });
   assert.equal(hub.get(sessionId)?.pending.size, 0);
+  await hub.dropAll();
+});
+
+test("sanitizeClientToolCallId keeps the first line of an SDK composite execute id", () => {
+  const raw = "call-ae1e879d-f3ef-4c9e-bc0e-ab5edc79138f-1\nfc_dfca56e0-1050-9e16-b0de-c91782f3f512_0";
+  assert.equal(sanitizeClientToolCallId(raw), "call-ae1e879d-f3ef-4c9e-bc0e-ab5edc79138f-1");
+  assert.equal(sanitizeClientToolCallId("call_hold"), "call_hold");
+  assert.ok(sanitizeClientToolCallId(raw).length <= 64);
+  assert.equal(sanitizeClientToolCallId(raw).includes("\n"), false);
+});
+
+test("resolvePending matches a 64-char truncation of a newline composite execute id", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const sessionId = "sess-composite-id";
+  hub.put(sessionId, createSessionSlot({
+    agent: { agentId: "a", send: async () => { throw new Error("unused"); } },
+    agentId: "a",
+    apiKey: "key",
+    model: "grok-4.6"
+  }));
+  const raw = "call-ae1e879d-f3ef-4c9e-bc0e-ab5edc79138f-1\nfc_dfca56e0-1050-9e16-b0de-c91782f3f512_0";
+  const truncated = raw.slice(0, 64);
+  let resolved: unknown;
+  hub.registerHold(sessionId, raw, "Read", (value) => {
+    resolved = value;
+  }, () => undefined);
+  const slot = hub.get(sessionId);
+  assert.ok(slot);
+  assert.equal(canonicalHoldId(slot, truncated), raw);
+  assert.equal(hub.resolvePending(sessionId, truncated, { content: [{ type: "text", text: "ok" }] }), true);
+  assert.deepEqual(resolved, { content: [{ type: "text", text: "ok" }] });
+  await hub.dropAll();
+});
+
+test("resolvePending matches a truncated composite against a sanitized first-line hold", async () => {
+  const hub = new SessionHub({ parallelToolSettleMs: 0 });
+  const sessionId = "sess-sanitized-hold";
+  hub.put(sessionId, createSessionSlot({
+    agent: { agentId: "a", send: async () => { throw new Error("unused"); } },
+    agentId: "a",
+    apiKey: "key",
+    model: "grok-4.6"
+  }));
+  const raw = "call-ae1e879d-f3ef-4c9e-bc0e-ab5edc79138f-1\nfc_dfca56e0-1050-9e16-b0de-c91782f3f512_0";
+  const first = sanitizeClientToolCallId(raw);
+  hub.registerHold(sessionId, first, "Read", () => undefined, () => undefined);
+  assert.equal(hub.resolvePending(sessionId, raw.slice(0, 64), { content: [{ type: "text", text: "ok" }] }), true);
   await hub.dropAll();
 });
 

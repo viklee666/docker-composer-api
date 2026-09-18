@@ -7,6 +7,7 @@ import { durableAgentId, durableSessionId } from "./durable-id.js";
 import { recordDurableDecision } from "./durable-telemetry.js";
 import {
   EventPump,
+  canonicalHoldId,
   createSessionSlot,
   durableSlotReplaceReason,
   inboundAssistantTextMismatch,
@@ -16,6 +17,8 @@ import {
   recordIssuedToolCalls,
   rememberCallAlias,
   responsesCallId,
+  toolCallIdTokens,
+  toolCallIdsOverlap,
   touchSlotHistory,
   type HubPumpItem,
   type SessionHub,
@@ -1267,9 +1270,9 @@ export class CursorSdkRunner implements CursorRunner {
       // 出现在两个 assistant 轮）。该 id 仍挂在 pending（SDK 对新调用复用了同一 id）时必须
       // 放行重发，否则那个 execute 会无人解决、挂到 hold TTL 把槽拖死。
       if (
-        slot.issuedToolCallIds?.includes(normalized.id)
-        && !slot.pending.has(normalized.id)
-        && !slot.pending.has(responsesCallId(normalized.id))
+        (slot.issuedToolCallIds?.includes(normalized.id)
+          || slot.issuedToolCallIds?.some((id) => toolCallIdsOverlap(id, normalized.id)))
+        && !canonicalHoldId(slot, normalized.id)
       ) {
         console.error(`[durable] dropped already-issued tool call id=${normalized.id} name=${normalized.name} session=${sessionId.slice(0, 12)}`);
         return undefined;
@@ -1277,6 +1280,9 @@ export class CursorSdkRunner implements CursorRunner {
       pushToolCall(toolCalls, normalized);
       rememberCallAlias(slot, normalized.id, responseCallIds(normalized).callId);
       rememberCallAlias(slot, normalized.id, responsesCallId(normalized.id));
+      for (const token of toolCallIdTokens(normalized.id)) {
+        rememberCallAlias(slot, normalized.id, token);
+      }
       return normalized;
     };
 
@@ -2549,10 +2555,14 @@ function issuedIdsWithAliases(slot: SessionSlot, toolCalls: GatewayToolCall[]): 
   const ids: string[] = [];
   for (const toolCall of toolCalls) {
     ids.push(toolCall.id);
+    ids.push(...toolCallIdTokens(toolCall.id));
     ids.push(responsesCallId(toolCall.id));
     ids.push(responseCallIds(toolCall).callId);
     rememberCallAlias(slot, toolCall.id, responsesCallId(toolCall.id));
     rememberCallAlias(slot, toolCall.id, responseCallIds(toolCall).callId);
+    for (const token of toolCallIdTokens(toolCall.id)) {
+      rememberCallAlias(slot, toolCall.id, token);
+    }
   }
   return ids;
 }
@@ -2569,21 +2579,14 @@ export function toolResultsForeignToSlot(
   toolResults: Array<{ id: string }>
 ): boolean {
   if (!toolResults.length) return false;
-  // 两侧都剥掉 call_ 前缀后比对（与 canonicalHoldId 的 responsesCallId 口径同源）：
-  // Responses 会把 execute id 重写成 call_ 别名、Chat/Anthropic 原样回显，
-  // 裸后缀是唯一稳定可比的形态。
-  const known = new Set<string>();
-  const addKnown = (id: string): void => {
-    const suffix = id.trim().replace(/^call_/, "");
-    if (suffix) known.add(suffix);
-  };
-  for (const id of slot.issuedToolCallIds ?? []) addKnown(id);
-  for (const id of slot.pending.keys()) addKnown(id);
-  if (!known.size) return false;
+  // 两侧按 token 交集比对：剥 call_、拆换行复合 id、以及 64 字符截断前缀。
+  // SDK execute id 常为 `call-<uuid>-N\nfc_<uuid>_0`，客户端回传会被截成 64 字符，
+  // 只做整串/剥前缀相等会把本槽续聊误判成外来结果。
+  const known = [...(slot.issuedToolCallIds ?? []), ...slot.pending.keys()].filter(Boolean);
+  if (!known.length) return false;
   return toolResults.every((result) => {
     if (!result.id) return true;
-    const suffix = result.id.trim().replace(/^call_/, "");
-    return !suffix || !known.has(suffix);
+    return !known.some((id) => toolCallIdsOverlap(id, result.id));
   });
 }
 
