@@ -27,6 +27,7 @@ export function unadvertisedToolCatalog(
     "CLIENT TOOLS: call these exact names. Do not rename, translate, camelCase-join, or append File / Tool / _file.",
     "A listed tool is provided by the caller and is available. Never substitute a different name for it.",
     ...lines,
+    "Never emit to=Name, to=Read code, or any other ad-hoc call syntax in assistant text.",
     'Call through the structured tool interface, or with ONLY: <tool_call>{"name":"EXACT_NAME","arguments":{}}</tool_call>'
   ].join("\n");
 }

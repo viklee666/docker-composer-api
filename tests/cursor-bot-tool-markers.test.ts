@@ -83,6 +83,65 @@ test("a custom id is preserved instead of being regenerated", () => {
   assert.equal(parsed.toolCalls[0].id, "toolu_01ABC");
 });
 
+const leakedLuna =
+  "我先读取并梳理这份计划，随后用中文概括目标、实施步骤、涉及文件和潜在风险。" +
+  ' to=Read 代上 code: {"path":"E:\\\\docker-composer-api\\\\grok-500k-context\\\\docker-composer-api-500k-plan.md"}' +
+  "嗷 to=Read code: {\"path\":\"E:\\\\docker-composer-api\\\\grok-500k-context\\\\docker-composer-api-500k-plan.md\"}" +
+  " у to=Read (json在线观看中文字幕) {\"path\":\"E:\\\\docker-composer-api\\\\grok-500k-context\\\\docker-composer-api-500k-plan.md\"}";
+
+test("to=Read junk {json} is stripped from the body and becomes a tool call", () => {
+  const parsed = parseToolMarkers(leakedLuna);
+  assert.equal(parsed.toolCalls.length, 3);
+  assert.ok(parsed.toolCalls.every((call) => call.name === "Read"));
+  assert.equal(
+    parsed.toolCalls[0].arguments.path,
+    "E:\\docker-composer-api\\grok-500k-context\\docker-composer-api-500k-plan.md"
+  );
+  assert.equal(parsed.text.includes("to="), false);
+  assert.match(parsed.text, /我先读取并梳理这份计划/);
+});
+
+test("to=functions.Read drops the functions. prefix", () => {
+  const parsed = parseToolMarkers('go to=functions.Read code {"path":"a.ts"}');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "Read");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "a.ts" });
+});
+
+test("streaming: to=Read split across chunks is reassembled and not leaked", () => {
+  const filter = new ToolMarkerFilter();
+  const events = [
+    ...markerEventsFromText(filter, "先看 "),
+    ...markerEventsFromText(filter, "to=Re"),
+    ...markerEventsFromText(filter, 'ad code: {"path":"a.md"}'),
+    ...markerFlushEvents(filter)
+  ];
+  const calls = events.filter((event) => event.type === "tool_call");
+  const text = events.filter((event) => event.type === "text").map((event) => event.text).join("");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].toolCall.name, "Read");
+  assert.deepEqual(calls[0].toolCall.arguments, { path: "a.md" });
+  assert.equal(text.includes("to="), false);
+  assert.equal(text.trim(), "先看");
+});
+
+test("normalizer drops a structured Read that duplicates an earlier to=Read", () => {
+  const readTool = {
+    name: "Read",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } }
+  };
+  const normalizer = new ResponseNormalizer({ parseToolMarkers: true, tools: [readTool] });
+  const events = drain(normalizer, [
+    textFrame('先看 to=Read code: {"path":"a.md"}'),
+    toolFrame({ toolCallId: "c1", toolName: "Read", args: '{"path":"a.md"}', isComplete: true })
+  ]);
+  const calls = events.filter((event) => event.type === "tool_call");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].toolCall.name, "Read");
+  assert.equal(normalizer.state.text.includes("to="), false);
+  assert.match(normalizer.state.text, /先看/);
+});
+
 /* -------------------------------------------------------------- 流式过滤 */
 
 test("streaming: marker split across chunks is reassembled", () => {

@@ -78,6 +78,8 @@ export class ResponseNormalizer {
    * 完成之后迟到的 args 增量还会新建一个 name 为空的幽灵调用，在 flush 时冒出来。
    */
   private readonly completed = new Set<string>();
+  /** 同一轮里 `to=Read {path}` 与结构化 tool_call_part 常成对出现，按 name+args 去重。 */
+  private readonly seenToolFingerprints = new Set<string>();
 
   /** 收到过 extended_usage 之后，粗口径的 usage 帧不再回写。 */
   private hasExtendedUsage = false;
@@ -101,7 +103,7 @@ export class ResponseNormalizer {
                 // 包 F 复审：marker 还原出的调用与 SDK 侧同口径——未声明的工具名不转发，
                 // 命中声明的做别名归一与参数键改名后再下发。
                 const toolCall = this.admitMarkerToolCall(event.toolCall);
-                if (!toolCall) continue;
+                if (!toolCall || this.rememberToolFingerprint(toolCall) === "dup") continue;
                 this.state.toolCalls.push(toolCall);
                 yield { type: "tool_call", toolCall };
               } else if (event.type === "text") {
@@ -192,7 +194,8 @@ export class ResponseNormalizer {
   *flush(): Generator<CursorStreamEvent> {
     for (const [key, pending] of [...this.pending]) {
       this.pending.delete(key);
-      yield { type: "tool_call", toolCall: this.completeToolCall(key, pending) };
+      const toolCall = this.completeToolCall(key, pending);
+      if (toolCall) yield { type: "tool_call", toolCall };
     }
     // 标记过滤器的收尾：held 正文与未闭合的尾部作为普通文本放行，不能凭空蒸发。
     // 放行的同时记进 state.text——这些内容已经作为事件下发了，聚合口径（result()）
@@ -271,7 +274,7 @@ export class ResponseNormalizer {
     return undefined;
   }
 
-  private completeToolCall(key: string, pending: PendingToolCall): GatewayToolCall {
+  private completeToolCall(key: string, pending: PendingToolCall): GatewayToolCall | undefined {
     this.completed.add(key);
     let toolCall: GatewayToolCall = {
       id: pending.id,
@@ -284,8 +287,16 @@ export class ResponseNormalizer {
     if (tools?.length && matchesClientTool(toolCall, tools)) {
       toolCall = normalizeToolCallForClient(toolCall, tools);
     }
+    if (this.rememberToolFingerprint(toolCall) === "dup") return undefined;
     this.state.toolCalls.push(toolCall);
     return toolCall;
+  }
+
+  private rememberToolFingerprint(toolCall: GatewayToolCall): "new" | "dup" {
+    const key = `${toolCall.name}\0${JSON.stringify(toolCall.arguments)}`;
+    if (this.seenToolFingerprints.has(key)) return "dup";
+    this.seenToolFingerprints.add(key);
+    return "new";
   }
 }
 
