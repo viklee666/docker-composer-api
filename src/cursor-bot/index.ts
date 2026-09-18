@@ -95,6 +95,7 @@ export {
   toStruct,
   toValue,
   type BotConversation as BotRequestConversation,
+  type BotInferenceRoute,
   type BotMessage,
   type BotModelConfig,
   type BotReasoningPart,

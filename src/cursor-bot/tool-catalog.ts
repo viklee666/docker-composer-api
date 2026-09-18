@@ -1,11 +1,11 @@
 import type { GatewayTool } from "../types.js";
-import { shouldAdvertiseBotTools } from "./request-builder.js";
+import { shouldAdvertiseBotTools, type BotInferenceRoute } from "./request-builder.js";
 
 /**
- * Grok 不能把 `tools[]` 写进 InferenceService（一声明就 `resource_exhausted`）。
+ * 不能把 `tools[]` 写进 InferenceService 时（grok；以及 api2 直连的所有模型），
  * 自研 agent / byok 以外的客户端通常也**只**在入站 `tools[]` 里声明工具，
- * 不会再把清单抄进 system。composer / luna 靠结构化 `tools[]` 能看见这些名字；
- * grok 看不见，就会退回训练先验（ReadFile 等），把 `Read` 叫成 `Readfile`。
+ * 不会再把清单抄进 system。结构化 `tools[]` 能看见这些名字；
+ * 看不见时就会退回训练先验（ReadFile 等），把 `Read` 叫成 `Readfile`。
  *
  * 这份卡片按**本轮真实工具表**生成，不硬编码 Cursor 工具名。
  * 只在「本轮不会向上游声明 tools[]」时注入。
@@ -13,10 +13,11 @@ import { shouldAdvertiseBotTools } from "./request-builder.js";
 export function unadvertisedToolCatalog(
   tools: GatewayTool[] | undefined,
   modelId: string,
-  advertiseOverride?: boolean
+  advertiseOverride?: boolean,
+  route?: BotInferenceRoute
 ): string | undefined {
   if (!tools?.length) return undefined;
-  if (shouldAdvertiseBotTools(modelId, advertiseOverride)) return undefined;
+  if (shouldAdvertiseBotTools(modelId, advertiseOverride, route)) return undefined;
   const lines = tools.flatMap((tool) => {
     const name = tool.name?.trim();
     return name ? [`- ${name}${argumentHint(tool)}`] : [];
@@ -33,9 +34,10 @@ export function unadvertisedToolCatalog(
 export function withUnadvertisedToolCatalog<T extends { systemInstructions: string[]; tools: GatewayTool[] }>(
   conversation: T,
   modelId: string,
-  advertiseOverride?: boolean
+  advertiseOverride?: boolean,
+  route?: BotInferenceRoute
 ): T {
-  const text = unadvertisedToolCatalog(conversation.tools, modelId, advertiseOverride);
+  const text = unadvertisedToolCatalog(conversation.tools, modelId, advertiseOverride, route);
   if (!text) return conversation;
   return { ...conversation, systemInstructions: [...conversation.systemInstructions, text] };
 }

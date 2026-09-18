@@ -25,6 +25,11 @@ test("composer still advertises tools[] so it does not get the shadow catalog", 
   );
 });
 
+test("composer on the direct route gets the shadow catalog", () => {
+  const text = unadvertisedToolCatalog([{ name: "search" }], "composer-2.5", undefined, "direct");
+  assert.ok(text?.includes("- search"));
+});
+
 test("forcing advertise off still injects the catalog for non-grok models", () => {
   const text = unadvertisedToolCatalog([{ name: "search" }], "composer-2.5", false);
   assert.ok(text?.includes("- search"));

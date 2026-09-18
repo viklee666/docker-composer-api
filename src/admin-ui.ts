@@ -859,7 +859,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                       <option value="on">开启</option>
                       <option value="off">关闭</option>
                     </select>
-                    <div class="hint">开启后 Bot 路线才会把客户端 tools 发给上游（工具循环的前提）。改完立即生效。</div>
+                    <div class="hint">开启后 Bot 路线才会走工具循环。api2 直连不能把 tools[] 写进上游（会资源耗尽），改为在 SYSTEM 里列出工具名；Box relay 上非 grok 仍声明 tools[]。改完立即生效。</div>
                   </div>
                   <div class="setting-field">
                     <label>请求体编码 <span class="env">CURSOR_BOT_CODEC</span></label>
@@ -874,10 +874,10 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                     <label>推理出口 <span class="env">CURSOR_BOT_INFERENCE_ROUTE</span></label>
                     <select id="bot-inference-route">
                       <option value="">跟随 env / 公共默认</option>
-                      <option value="direct">api2 直连（0.44 前老路径）</option>
+                      <option value="direct">api2 直连</option>
                       <option value="relay">Box relay（自动取连接，推荐）</option>
                     </select>
-                    <div class="hint">0.44 起直连会被上游拒绝，Bot 路线要用 relay。切换后到「Bot 凭据」页点 Relay 检查装配状态。</div>
+                    <div class="hint">api2 直连已恢复；直连上声明 tools[] 会资源耗尽，网关改为在 SYSTEM 里列出工具名。Box 重建后若走 relay，到「Bot 凭据」页点 Relay 检查装配。</div>
                   </div>
                   <div class="setting-field">
                     <label>自动刷新 Key 兑换的凭据 <span class="env">CURSOR_BOT_AUTO_REFRESH_FROM_KEY</span></label>

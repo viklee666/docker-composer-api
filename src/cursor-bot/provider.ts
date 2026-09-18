@@ -13,7 +13,12 @@ import { CursorBotClient, type CursorBotClientOptions } from "./client.js";
 import { SAND_CLIENT_TYPE, type CursorBotCredential } from "./credentials.js";
 import type { ConnectCompression } from "./envelope.js";
 import type { ConnectCodec } from "./headers.js";
-import { buildInferenceStreamRequest, type BotConversation, type BotMessage } from "./request-builder.js";
+import {
+  buildInferenceStreamRequest,
+  type BotConversation,
+  type BotInferenceRoute,
+  type BotMessage
+} from "./request-builder.js";
 import { unadvertisedToolCatalog } from "./tool-catalog.js";
 import { ResponseNormalizer } from "./response-normalizer.js";
 import { InferenceStreamRequest } from "./proto/inference_pb.js";
@@ -44,9 +49,12 @@ export interface CursorBotProviderOptions {
   /**
    * 是否把调用方的工具表纳入本轮对话（解析 XML / 过滤未声明调用）。
    * 默认 false。真正写进上游 `tools[]` 还要过 `shouldAdvertiseBotTools`：
-   * grok 家族即使这里为 true 也不会声明——它不声明也能发起调用，一声明反而 `resource_exhausted`。
+   * api2 直连一律不声明；Box relay 上 grok 不声明。不声明也能发起调用，
+   * 一声明反而 `resource_exhausted`。
    */
   sendTools?: boolean;
+  /** 推理出口。直连时所有模型都不把 tools[] 写给上游。 */
+  inferenceRoute?: BotInferenceRoute;
   /** 供测试注入。 */
   newInvocationId?: () => string;
   nowMs?: () => number;
@@ -147,9 +155,14 @@ export class CursorBotProvider implements CursorRunner {
       if (instruction.trim()) messages.push({ role: "system", text: instruction });
     }
     // sendTools 只决定要不要把 tools[] 写给上游。本地仍拿客户端工具表做 XML 还原
-    // 与名字归一——grok 不声明也能发起调用，不带这张表就无法把 Readfile 收成 Read。
+    // 与名字归一——不声明也能发起调用，不带这张表就无法把 Readfile 收成 Read。
     const advertiseTools = this.options.sendTools ? undefined : false;
-    const toolCatalog = unadvertisedToolCatalog(input.tools, input.model, advertiseTools);
+    const toolCatalog = unadvertisedToolCatalog(
+      input.tools,
+      input.model,
+      advertiseTools,
+      this.options.inferenceRoute
+    );
     if (toolCatalog) messages.push({ role: "system", text: toolCatalog });
     messages.push({ role: "user", text: input.prompt, ...(input.images.length ? { images: input.images } : {}) });
 
@@ -157,6 +170,7 @@ export class CursorBotProvider implements CursorRunner {
       messages,
       ...(input.tools.length ? { tools: input.tools } : {}),
       advertiseTools,
+      ...(this.options.inferenceRoute ? { inferenceRoute: this.options.inferenceRoute } : {}),
       conversationId: conversationIdFor(input),
       invocationId: this.options.newInvocationId?.() ?? randomUUID(),
       requestedModel: resolved.requestedModel,

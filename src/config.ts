@@ -89,8 +89,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     // Box relay 场景：注入 x-anyrun-network-token 等路由凭据（JSON 对象，键值都是字符串）。
     // 解析失败按空处理并告警——一个写错的 env 不该让网关起不来。
     botExtraHeaders: parseExtraHeaders(env.CURSOR_BOT_EXTRA_HEADERS),
-    // 推理出口：relay = 经 Box relay（自动 EnsureSandBox）；直连路径 0.44 起已被上游拒绝，
-    // 默认仍取 direct 保持行为兼容，部署时显式开 relay。
+    // 推理出口：relay = 经 Box relay（自动 EnsureSandBox）；direct = api2 直连。
+    // 直连恢复后可用，但不能把 tools[] 写进上游（会 resource_exhausted）。
     botInferenceRoute: env.CURSOR_BOT_INFERENCE_ROUTE?.trim().toLowerCase() === "relay" ? "relay" : "direct",
     // 由 Key 兑换的 session JWT 约 1 小时过期；默认到期前自动再兑。粘贴的桌面端 token 不走这条。
     botAutoRefreshFromKey: booleanValue(env.CURSOR_BOT_AUTO_REFRESH_FROM_KEY, true),

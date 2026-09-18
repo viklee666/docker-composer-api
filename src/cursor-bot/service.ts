@@ -27,7 +27,7 @@ import {
 } from "./relay-provision.js";
 import { resolveRequestedModel } from "./catalog.js";
 import { CursorBotClient, DEFAULT_BOT_BASE_URL } from "./client.js";
-import { toPreparedConversation, type PreparedConversation } from "./conversation.js";
+import { conversationMessages, toPreparedConversation, type PreparedConversation } from "./conversation.js";
 import { withUnadvertisedToolCatalog } from "./tool-catalog.js";
 import type { CursorBotCredential } from "./credentials.js";
 import {
@@ -72,8 +72,9 @@ export interface BotSettings {
   /** 额外出站头（`CURSOR_BOT_EXTRA_HEADERS`）：Box relay 的路由凭据等。 */
   extraHeaders: Record<string, string>;
   /**
-   * 推理出口：`direct` = api2 直连（0.44 前的老路径，现在会被上游以 unauthenticated 拒）；
-   * `relay` = 经 Box relay（EnsureSandBox 自动取连接，token 失效自动重取重试）。
+   * 推理出口：`direct` = api2 直连；`relay` = 经 Box relay
+   * （EnsureSandBox 自动取连接，token 失效自动重取重试）。
+   * 直连上所有模型都不能把 tools[] 写进上游，会改走未声明工具名。
    */
   inferenceRoute: "direct" | "relay";
   /**
@@ -553,10 +554,27 @@ export class CursorBotService implements CursorRunner {
   }
 
   private async runChild(credential: BotCredential, context: SubagentRunContext): Promise<{ text: string; isError?: boolean; usage?: RequestUsage }> {
+    const advertiseTools = this.settings.sendTools ? undefined : false;
+    const prepared = withUnadvertisedToolCatalog(
+      {
+        systemInstructions: [],
+        tools: context.tools,
+        messages: [{ role: "user", text: context.prompt }]
+      },
+      context.requestedModel.modelId,
+      advertiseTools,
+      this.settings.inferenceRoute
+    );
     const request = buildInferenceStreamRequest({
-      messages: [{ role: "user", text: context.prompt }],
+      messages: conversationMessages({
+        ...prepared,
+        conversationId: context.conversationId,
+        invocationId: context.invocationId
+      }),
       // child 默认不继承父的工具，`tools` 由 scheduler 按 childTools 决定。
       ...(context.tools.length ? { tools: context.tools } : {}),
+      advertiseTools,
+      inferenceRoute: this.settings.inferenceRoute,
       conversationId: context.conversationId,
       invocationId: context.invocationId,
       requestedModel: context.requestedModel
@@ -616,8 +634,12 @@ export class CursorBotService implements CursorRunner {
     } else {
       prepared = fallbackConversation(input, tools, conversationId);
     }
-    // grok 不声明 tools[]：把本轮真实工具名写进 SYSTEM，自研 agent 只在 tools[] 里声明时也能看见。
-    return withUnadvertisedToolCatalog(prepared, input.model, advertiseTools);
+    // 不能声明 tools[] 时（直连全部模型 / relay 的 grok）：把本轮真实工具名写进 SYSTEM。
+    return {
+      ...withUnadvertisedToolCatalog(prepared, input.model, advertiseTools, this.settings.inferenceRoute),
+      advertiseTools,
+      inferenceRoute: this.settings.inferenceRoute
+    };
   }
 
   /**
@@ -889,6 +911,7 @@ export class CursorBotService implements CursorRunner {
       codec: this.settings.codec,
       readMaxBytes: this.settings.readMaxBytes,
       sendTools: this.settings.sendTools,
+      inferenceRoute: this.settings.inferenceRoute,
       extraHeaders: target.extraHeaders,
       ...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {}),
       // 目录喂给参数解析：`parameter_definitions` 是参数 id 与值域的权威来源，

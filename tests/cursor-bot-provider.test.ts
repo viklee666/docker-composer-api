@@ -159,6 +159,7 @@ test("grok keeps client tools off the wire; other models still advertise", () =>
     requestedModel: { modelId: "grok-4.6" }
   });
   assert.deepEqual(grok.tools, []);
+  assert.deepEqual(grok.acceptedUnadvertisedToolNames, ["search"]);
 
   const composer = buildInferenceStreamRequest({
     messages: [{ role: "user", text: "hi" }],
@@ -168,6 +169,7 @@ test("grok keeps client tools off the wire; other models still advertise", () =>
     requestedModel: { modelId: "composer-2.5" }
   });
   assert.equal(composer.tools[0].name, "search");
+  assert.deepEqual(composer.acceptedUnadvertisedToolNames, []);
 
   const forced = buildInferenceStreamRequest({
     messages: [{ role: "user", text: "hi" }],
@@ -178,6 +180,43 @@ test("grok keeps client tools off the wire; other models still advertise", () =>
     requestedModel: { modelId: "grok-4.6" }
   });
   assert.equal(forced.tools[0].name, "search");
+});
+
+test("direct route never advertises tools[] and lists accepted unadvertised names", () => {
+  const tools = [{ name: "search", description: "d", inputSchema: { type: "object" } }];
+  const composerDirect = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    inferenceRoute: "direct",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "composer-2.5" }
+  });
+  assert.deepEqual(composerDirect.tools, []);
+  assert.deepEqual(composerDirect.acceptedUnadvertisedToolNames, ["search"]);
+
+  const relayComposer = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    inferenceRoute: "relay",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "composer-2.5" }
+  });
+  assert.equal(relayComposer.tools[0].name, "search");
+  assert.deepEqual(relayComposer.acceptedUnadvertisedToolNames, []);
+
+  const sendToolsOff = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    advertiseTools: false,
+    inferenceRoute: "direct",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "composer-2.5" }
+  });
+  assert.deepEqual(sendToolsOff.tools, []);
+  assert.deepEqual(sendToolsOff.acceptedUnadvertisedToolNames, []);
 });
 
 /* ---------------------------------------------------------- response normalizer */
@@ -806,10 +845,32 @@ test("tools stay off the wire until sendTools is on; grok never advertises", asy
   const grokOn = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
   await grokOn.instance.run(runRequest({ tools }));
   assert.deepEqual(grokOn.captured[0].request.tools, [], "grok 不声明 tools[] 也能调工具");
+  assert.deepEqual(grokOn.captured[0].request.acceptedUnadvertisedToolNames, ["search"]);
 
   const composerOn = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
   await composerOn.instance.run(runRequest({ model: "composer-2.5", tools }));
   assert.equal(composerOn.captured[0].request.tools[0].name, "search");
+
+  const composerDirect = provider([messageFrame(textFrame("ok")), endFrame()], {
+    sendTools: true,
+    inferenceRoute: "direct"
+  });
+  await composerDirect.instance.run(runRequest({ model: "composer-2.5", tools }));
+  assert.deepEqual(composerDirect.captured[0].request.tools, [], "直连所有模型都不写 tools[]");
+  assert.deepEqual(composerDirect.captured[0].request.acceptedUnadvertisedToolNames, ["search"]);
+});
+
+test("composer on the direct route gets the same SYSTEM catalog as grok", async () => {
+  const tools = [{ name: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } }];
+  const { instance, captured } = provider([messageFrame(textFrame("ok")), endFrame()], {
+    sendTools: true,
+    inferenceRoute: "direct"
+  });
+  await instance.run(runRequest({ model: "composer-2.5", tools }));
+  assert.deepEqual(captured[0].request.tools, []);
+  assert.deepEqual(captured[0].request.acceptedUnadvertisedToolNames, ["Read"]);
+  const system = captured[0].request.messages.filter((message) => message.role === InferenceMessageRole.SYSTEM);
+  assert.match(String(system[0]?.content.value), /^- Read — arguments: path$/m);
 });
 
 test("grok injects this request's tool names into SYSTEM instead of advertising tools[]", async () => {
@@ -820,6 +881,7 @@ test("grok injects this request's tool names into SYSTEM instead of advertising 
   const { instance, captured } = provider([messageFrame(textFrame("ok")), endFrame()], { sendTools: true });
   await instance.run(runRequest({ tools }));
   assert.deepEqual(captured[0].request.tools, []);
+  assert.deepEqual(captured[0].request.acceptedUnadvertisedToolNames, ["Read", "LookupDoc"]);
   const system = captured[0].request.messages.filter((message) => message.role === InferenceMessageRole.SYSTEM);
   assert.equal(system.length, 1);
   const text = String(system[0].content.value);

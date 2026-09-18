@@ -316,7 +316,7 @@ function isDirectRun() {
   }
 }
 
-function main() {
+export function loadGrokBotSession() {
   const candidates = grokUserDataCandidates();
   const root = findGrokUserData();
   if (!root) {
@@ -354,24 +354,35 @@ function main() {
   const exp = typeof payload.exp === "number" ? new Date(payload.exp * 1000).toISOString() : "";
   if (type === "web") fail("读出来的是浏览器 web token，不能当作 Bot session。");
 
+  const machineId =
+    (typeof account["machine-id"] === "string" && account["machine-id"].trim()) ||
+    (typeof account.machineId === "string" && account.machineId.trim()) ||
+    (typeof secrets["machine-id"] === "string" && secrets["machine-id"].trim()) ||
+    "";
+
+  return { root, token, email, name, userId, sub, type, exp, machineId };
+}
+
+function main() {
+  const session = loadGrokBotSession();
   let copied = false;
   try {
-    copied = copyToClipboard(token);
+    copied = copyToClipboard(session.token);
   } catch {
     copied = false;
   }
 
-  console.log(`数据目录: ${root}`);
-  console.log(`账号: ${email || "(token 里没有邮箱)"}`);
-  if (name) console.log(`名称: ${name}`);
-  console.log(`user: ${userId || sub || "?"}`);
-  console.log(`type: ${type}`);
-  if (exp) console.log(`过期: ${exp}`);
+  console.log(`数据目录: ${session.root}`);
+  console.log(`账号: ${session.email || "(token 里没有邮箱)"}`);
+  if (session.name) console.log(`名称: ${session.name}`);
+  console.log(`user: ${session.userId || session.sub || "?"}`);
+  console.log(`type: ${session.type}`);
+  if (session.exp) console.log(`过期: ${session.exp}`);
   console.log("");
   if (copied) console.log("已复制 token 到剪贴板。去网关后台 Bot 凭据里粘贴即可（同一账号会覆盖）。");
   else console.log("自动复制失败，请手动复制下面的 token：");
   console.log("");
-  console.log(token);
+  console.log(session.token);
 }
 
 if (isDirectRun()) main();

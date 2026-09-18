@@ -146,8 +146,9 @@ export interface GatewayConfig {
    */
   botExtraHeaders?: Record<string, string>;
   /**
-   * Bot 路线的推理出口：`direct` = api2 直连（0.44 前的老路径，现在被上游拒绝）；
-   * `relay` = 经 Box relay（自动 EnsureSandBox 取连接）。后台「运行设置」可覆盖。
+   * Bot 路线的推理出口：`direct` = api2 直连；`relay` = 经 Box relay（自动 EnsureSandBox 取连接）。
+   * 直连上声明 tools[] 会 resource_exhausted，网关改为 accepted_unadvertised_tool_names。
+   * 后台「运行设置」可覆盖。
    * env: CURSOR_BOT_INFERENCE_ROUTE。
    */
   botInferenceRoute?: "direct" | "relay";
@@ -521,8 +522,8 @@ export interface ProviderRunOverrides {
   codec?: "proto" | "json";
   /**
    * Bot 路线：推理出口（顶层 botInferenceRoute 的覆盖）。
-   * `direct` = api2 直连（0.44 前老路径）；`relay` = 经 Box relay，连接由
-   * EnsureSandBox 自动获取、失效自动重取。
+   * `direct` = api2 直连；`relay` = 经 Box relay，连接由
+   * EnsureSandBox 自动获取、失效自动重取。直连不把 tools[] 写给上游。
    */
   inferenceRoute?: "direct" | "relay";
   /**

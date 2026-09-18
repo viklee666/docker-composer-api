@@ -216,18 +216,28 @@ test("bot sendTools takes effect at runtime without rebuilding the service", asy
 
   for await (const _ of service.stream(run)) void _;
   assert.equal(upstream[0].tools.length, 0, "env 默认（false）时不向上游声明工具");
+  assert.deepEqual(upstream[0].acceptedUnadvertisedToolNames, []);
 
   // 后台保存 Bot 覆盖 = 写回 config.botOverrides；service 每次 stream 现查，立即生效。
+  // 默认推理出口是 direct：sendTools 打开也不写 tools[]，改走未声明工具名。
   config.botOverrides = { sendTools: true };
   for await (const _ of service.stream(run)) void _;
-  assert.equal(upstream[1].tools.length, 1, "运行期改 sendTools=true 后同一请求带上 tools");
+  assert.equal(upstream[1].tools.length, 0, "直连即使 sendTools=true 也不写 tools[]");
+  assert.deepEqual(upstream[1].acceptedUnadvertisedToolNames, ["get_weather"]);
 
   for await (const _ of service.stream({ ...run, model: "grok-4.6" })) void _;
   assert.equal(upstream[2].tools.length, 0, "grok 即使 sendTools=true 也不向上游声明 tools[]");
+  assert.deepEqual(upstream[2].acceptedUnadvertisedToolNames, ["get_weather"]);
+
+  config.botOverrides = { sendTools: true, inferenceRoute: "relay" };
+  for await (const _ of service.stream(run)) void _;
+  assert.equal(upstream[3].tools.length, 1, "relay 上 composer 仍声明 tools[]");
+  assert.deepEqual(upstream[3].acceptedUnadvertisedToolNames, []);
 
   config.botOverrides = { sendTools: false };
   for await (const _ of service.stream(run)) void _;
-  assert.equal(upstream[3].tools.length, 0, "改回 false 同样立即生效");
+  assert.equal(upstream[4].tools.length, 0, "改回 false 同样立即生效");
+  assert.deepEqual(upstream[4].acceptedUnadvertisedToolNames, []);
   store.close();
 });
 

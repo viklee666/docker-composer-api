@@ -115,6 +115,8 @@ export async function* runToolLoop(
     const request = buildInferenceStreamRequest({
       messages,
       tools: options.conversation.tools,
+      advertiseTools: options.conversation.advertiseTools,
+      inferenceRoute: options.conversation.inferenceRoute,
       conversationId: options.conversation.conversationId,
       ...(options.conversation.conversationGroupId
         ? { conversationGroupId: options.conversation.conversationGroupId }
@@ -131,7 +133,7 @@ export async function* runToolLoop(
     }
 
     const normalizer = new ResponseNormalizer({
-      // 本轮本地有工具表才解析正文标记（包 F）。grok 不把 tools[] 发给上游，
+      // 本轮本地有工具表才解析正文标记（包 F）。直连 / grok 不把 tools[] 发给上游，
       // 但仍靠这里把正文 XML / 结构化帧还原成 tool_call。
       parseToolMarkers: (options.conversation.tools?.length ?? 0) > 0,
       tools: options.conversation.tools

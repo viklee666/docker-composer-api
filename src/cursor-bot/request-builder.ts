@@ -20,6 +20,7 @@ import {
 } from "./proto/inference_pb.js";
 
 export type BotRole = "system" | "user" | "assistant" | "tool";
+export type BotInferenceRoute = "direct" | "relay";
 
 const ROLE_ENUM: Record<BotRole, InferenceMessageRole> = {
   system: InferenceMessageRole.SYSTEM,
@@ -79,12 +80,15 @@ export interface BotConversation {
   messages: BotMessage[];
   tools?: GatewayTool[];
   /**
-   * 是否把 `tools[]` 写进上游请求。缺省按模型：grok 家族不声明，其余声明。
-   * 显式 `true` / `false` 盖过模型默认（排障用）。
+   * 是否把 `tools[]` 写进上游请求。缺省按模型 + 出口：
+   * api2 直连一律不声明；Box relay 上 grok 不声明、其余声明。
+   * 显式 `true` / `false` 盖过默认（排障用）。
    *
-   * 网关本地仍拿 `tools` 做 XML 还原与未声明过滤——grok 不声明也能发起调用。
+   * 网关本地仍拿 `tools` 做 XML 还原与未声明过滤——不声明也能发起调用。
    */
   advertiseTools?: boolean;
+  /** 推理出口。缺省按「非直连」处理，保持单测与旧调用点行为。 */
+  inferenceRoute?: BotInferenceRoute;
   /** 同一段对话内保持稳定。 */
   conversationId: string;
   conversationGroupId?: string;
@@ -95,13 +99,24 @@ export interface BotConversation {
 }
 
 /**
- * Grok 走 InferenceService 时不要把 `tools[]` 写进请求。
- * 实测：一声明就 `resource_exhausted`；不声明时 grok 仍会打结构化 `tool_call` 帧
- * 或正文 `<tool_call>` XML。composer / luna 仍要声明，否则不会走工具。
+ * 走 InferenceService 时不要轻易把 `tools[]` 写进请求。
+ *
+ * 实测：
+ * - grok（relay / 直连）：一声明就 `resource_exhausted`；不声明仍会打结构化
+ *   `tool_call` 帧或正文 `<tool_call>` XML。
+ * - api2 直连：所有模型一声明都 `resource_exhausted`（与 grok 同症状）。
+ * - Box relay 上 composer / luna：仍要声明，否则不会走工具。
+ *
+ * 不声明时把名字写进 `accepted_unadvertised_tool_names`，让上游仍接受这些调用。
  */
-export function shouldAdvertiseBotTools(modelId: string, override?: boolean): boolean {
+export function shouldAdvertiseBotTools(
+  modelId: string,
+  override?: boolean,
+  route?: BotInferenceRoute
+): boolean {
   if (override === false) return false;
   if (override === true) return true;
+  if (route === "direct") return false;
   return !/grok/i.test(modelId.trim());
 }
 
@@ -116,11 +131,16 @@ export function buildInferenceStreamRequest(conversation: BotConversation): Infe
     invocationId: conversation.invocationId
   });
   if (conversation.conversationGroupId) request.conversationGroupId = conversation.conversationGroupId;
+  const toolNames = uniqueToolNames(conversation.tools);
   if (
     conversation.tools?.length &&
-    shouldAdvertiseBotTools(conversation.requestedModel.modelId, conversation.advertiseTools)
+    shouldAdvertiseBotTools(conversation.requestedModel.modelId, conversation.advertiseTools, conversation.inferenceRoute)
   ) {
     request.tools = conversation.tools.map(buildAgentTool);
+  } else if (toolNames.length && conversation.advertiseTools !== false) {
+    // sendTools 开着、但这条路不能写 tools[]：用协议自带的未声明工具名列表，
+    // 否则上游只认训练先验（ReadFile 等），客户端的 Read 会对不上。
+    request.acceptedUnadvertisedToolNames = toolNames;
   }
   const modelConfig = buildModelConfig(conversation.modelConfig);
   if (modelConfig) request.modelConfig = modelConfig;
@@ -240,6 +260,11 @@ function buildAgentTool(tool: GatewayTool): InferenceAgentTool {
     description: tool.description ?? "",
     parameters: toStruct(tool.inputSchema)
   });
+}
+
+function uniqueToolNames(tools: GatewayTool[] | undefined): string[] {
+  const names = (tools ?? []).map((tool) => tool.name?.trim()).filter((name): name is string => Boolean(name));
+  return [...new Set(names)];
 }
 
 /**

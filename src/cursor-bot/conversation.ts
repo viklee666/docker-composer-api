@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 import type { GatewayImage, GatewayTool, GatewayToolCall } from "../types.js";
-import type { BotMessage, BotReasoningPart, BotToolResult } from "./request-builder.js";
+import type { BotInferenceRoute, BotMessage, BotReasoningPart, BotToolResult } from "./request-builder.js";
 
 /**
  * Cursor Bot 路线的结构化上下文（计划 §G5）。
@@ -17,6 +17,10 @@ export interface PreparedConversation {
   /** system / developer 指令单独保留，构造请求时映射到 role=SYSTEM(4)。 */
   systemInstructions: string[];
   tools: GatewayTool[];
+  /** 是否把 tools[] 写进上游。undefined = 按模型 + 出口默认。 */
+  advertiseTools?: boolean;
+  /** 推理出口，传给 request-builder 决定能不能声明 tools[]。 */
+  inferenceRoute?: BotInferenceRoute;
   /** 同一段对话内保持稳定。 */
   conversationId: string;
   conversationGroupId?: string;
