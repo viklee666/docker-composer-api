@@ -241,6 +241,29 @@ test("direct route never advertises tools[] and lists accepted unadvertised name
   assert.deepEqual(claudeRelay.acceptedUnadvertisedToolNames, []);
 });
 
+test("claude direct omits reasoning parts; gpt direct still replays them", () => {
+  const messages = [
+    { role: "assistant" as const, text: "ok", reasoning: [{ text: "thought", signature: "sig-1" }] }
+  ];
+  const claude = buildInferenceStreamRequest({
+    messages,
+    inferenceRoute: "direct",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "claude-sonnet-5" }
+  });
+  assert.equal(claude.messages[0].reasoningParts.length, 0);
+
+  const gpt = buildInferenceStreamRequest({
+    messages,
+    inferenceRoute: "direct",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "gpt-5.6-luna" }
+  });
+  assert.equal(gpt.messages[0].reasoningParts[0]?.signature, "sig-1");
+});
+
 /* ---------------------------------------------------------- response normalizer */
 
 function textFrame(text: string, isFinal = false): InferenceStreamResponse {

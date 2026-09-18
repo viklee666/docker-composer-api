@@ -859,7 +859,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                       <option value="on">开启</option>
                       <option value="off">关闭</option>
                     </select>
-                    <div class="hint">开启后 Bot 路线才会走工具循环。api2 直连不能把 tools[] 写进上游（会资源耗尽）：GPT / grok 改走未声明工具名 + SYSTEM 目录，Claude 这两样都不发。Box relay 上非 grok 仍声明 tools[]。改完立即生效。</div>
+                    <div class="hint">开启后 Bot 路线才会走工具循环。api2 直连不能把 tools[] 写进上游（会资源耗尽）：GPT / grok 改走未声明工具名 + SYSTEM 目录，Claude 这两样都不发，上一轮 thinking 也不回放。Box relay 上非 grok 仍声明 tools[]。改完立即生效。</div>
                   </div>
                   <div class="setting-field">
                     <label>请求体编码 <span class="env">CURSOR_BOT_CODEC</span></label>

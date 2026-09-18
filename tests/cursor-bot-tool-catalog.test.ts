@@ -13,7 +13,9 @@ test("grok gets a catalog of the actual client tools, not a hardcoded Cursor lis
   assert.ok(text);
   assert.match(text, /CLIENT TOOLS/);
   assert.match(text, /^- Read — arguments: path$/m);
-  assert.match(text, /^- LookupDoc — arguments: id, lang$/m);
+  assert.match(text, /^- LookupDoc — arguments: id$/m);
+  assert.doesNotMatch(text, /notify_on_output/);
+  assert.doesNotMatch(text, /to=/);
   assert.doesNotMatch(text, /ReadFile/);
   assert.doesNotMatch(text, /Reads a file/);
 });
@@ -40,6 +42,31 @@ test("claude on the direct route does not get the shadow catalog", () => {
     unadvertisedToolCatalog([{ name: "search" }], "claude-sonnet-5", undefined, "direct"),
     undefined
   );
+});
+
+test("shell catalog lists command, not notify_on_output", () => {
+  const text = unadvertisedToolCatalog(
+    [
+      {
+        name: "Shell",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+            notify_on_output: { type: "object" },
+            working_directory: { type: "string" }
+          },
+          required: ["command"]
+        }
+      }
+    ],
+    "gpt-5.6-luna",
+    undefined,
+    "direct"
+  );
+  assert.ok(text);
+  assert.match(text, /^- Shell — arguments: command$/m);
+  assert.doesNotMatch(text, /notify_on_output/);
 });
 
 test("withUnadvertisedToolCatalog appends after existing system text", () => {

@@ -116,6 +116,9 @@ export function isClaudeFamily(modelId: string): boolean {
  *
  * 不声明时，grok / GPT 把名字写进 `accepted_unadvertised_tool_names`。
  * Claude 直连连这份名单也会 `resource_exhausted`（同包 GPT 能过、无工具 ping 能过）。
+ *
+ * 后续轮次回放 thinking 时，Claude 直连还会把网关自造的 signature 写进
+ * `reasoning_parts`，api2 同样用 `resource_exhausted` 拒（首轮没有这段历史就能过）。
  */
 export function shouldAdvertiseBotTools(
   modelId: string,
@@ -140,10 +143,25 @@ export function shouldSendUnadvertisedToolNames(
   return true;
 }
 
+/**
+ * 要不要把上一轮 thinking 写进 `reasoning_parts`。
+ * Claude 直连拒网关自造的 88 字节 signature（Connect `resource_exhausted`）；
+ * GPT / grok 同一字段能过。thinking 仍下发给客户端展示，只是回上游时剥掉。
+ */
+export function shouldReplayReasoningParts(modelId: string, route?: BotInferenceRoute): boolean {
+  return !(route === "direct" && isClaudeFamily(modelId));
+}
+
 export function buildInferenceStreamRequest(conversation: BotConversation): InferenceStreamRequest {
   const requestedModel = buildRequestedModel(conversation.requestedModel);
+  const replayReasoning = shouldReplayReasoningParts(
+    conversation.requestedModel.modelId,
+    conversation.inferenceRoute
+  );
   const request = new InferenceStreamRequest({
-    messages: conversation.messages.map(buildCoreMessage),
+    messages: conversation.messages.map((message) =>
+      buildCoreMessage(replayReasoning || !message.reasoning?.length ? message : { ...message, reasoning: undefined })
+    ),
     requestedModel,
     // model_id 与 requested_model.model_id 是两个字段，客户端两处都填同一个值。
     modelId: requestedModel.modelId,

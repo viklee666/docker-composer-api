@@ -30,9 +30,8 @@ export function unadvertisedToolCatalog(
     "CLIENT TOOLS: call these exact names. Do not rename, translate, camelCase-join, or append File / Tool / _file.",
     "A listed tool is provided by the caller and is available. Never substitute a different name for it.",
     ...lines,
-    "Never emit to=Name, <|recipient|>Name, bare argument JSON, or any other ad-hoc call syntax in assistant text.",
-    "Never say a tool call was already sent unless you emitted a structured call or <tool_call>.",
-    'Call through the structured tool interface, or with ONLY: <tool_call>{"name":"EXACT_NAME","arguments":{}}</tool_call>'
+    "When you need a tool, emit a structured tool call, or ONLY: <tool_call>{\"name\":\"EXACT_NAME\",\"arguments\":{}}</tool_call>",
+    "Then stop. Do not keep writing after the call."
   ].join("\n");
 }
 
@@ -52,6 +51,14 @@ function argumentHint(tool: GatewayTool): string {
   return keys.length ? ` — arguments: ${keys.join(", ")}` : "";
 }
 
+/** 可选对象字段。列进目录会被 Luna 填成 false / {}，Cursor 再以 schema 错误打回。 */
+const CATALOG_TRAP_KEYS = new Set([
+  "notify_on_output",
+  "request_smart_mode_approval",
+  "required_permissions",
+  "smart_mode_block_reason"
+]);
+
 function schemaKeys(inputSchema: unknown): string[] {
   if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return [];
   const schema = inputSchema as Record<string, unknown>;
@@ -62,7 +69,8 @@ function schemaKeys(inputSchema: unknown): string[] {
   const required = Array.isArray(schema.required)
     ? schema.required.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
-  // 必填键在前，其余按 schema 原序；上限只是防一份巨型 JSON schema 把 system 撑爆。
-  const ordered = [...required.filter((key) => properties.includes(key)), ...properties.filter((key) => !required.includes(key))];
-  return ordered.slice(0, 8);
+  // 只列必填键。把 notify_on_output 这类可选对象写进目录，Luna 会按扁平值乱填。
+  const ordered = required.filter((key) => properties.includes(key) && !CATALOG_TRAP_KEYS.has(key));
+  if (ordered.length) return ordered.slice(0, 8);
+  return properties.filter((key) => !CATALOG_TRAP_KEYS.has(key)).slice(0, 4);
 }

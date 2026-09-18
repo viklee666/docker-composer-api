@@ -148,7 +148,7 @@ export interface GatewayConfig {
   /**
    * Bot 路线的推理出口：`direct` = api2 直连；`relay` = 经 Box relay（自动 EnsureSandBox 取连接）。
    * 直连上声明 tools[] 会 resource_exhausted；grok / GPT 改走 accepted_unadvertised_tool_names，
-   * Claude 连这份名单和 SYSTEM 目录也拒，只靠本地 XML / 正文还原。
+   * Claude 连这份名单、SYSTEM 目录和上一轮 thinking 回放也拒，只靠本地 XML / 正文还原。
    * 后台「运行设置」可覆盖。
    * env: CURSOR_BOT_INFERENCE_ROUTE。
    */

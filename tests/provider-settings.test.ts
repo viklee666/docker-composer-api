@@ -12,6 +12,7 @@ import type { CursorRunRequest, CursorRunner, CursorStreamEvent, GatewayConfig }
 import { encodeEnvelope } from "../src/cursor-bot/envelope.js";
 import { ProviderRoutingRunner } from "../src/cursor-bot/routing-runner.js";
 import { InferenceStreamRequest, InferenceStreamResponse, InferenceTextStreamPart } from "../src/cursor-bot/proto/inference_pb.js";
+import { EnsureSandBoxResponse, SandBoxRunState } from "../src/cursor-bot/proto/grokbot_service_pb.js";
 import { botAutoDisablePolicy, botSettings, CursorBotService } from "../src/cursor-bot/service.js";
 import { CursorBotStore } from "../src/cursor-bot/store.js";
 import {
@@ -196,7 +197,20 @@ test("bot sendTools takes effect at runtime without rebuilding the service", asy
   const service = new CursorBotService({
     store,
     config,
-    fetchImpl: async (_url, init) => {
+    fetchImpl: async (url, init) => {
+      // relay 会先打一元 EnsureSandBox（无 Connect 信封），再打 Stream。
+      if (String(url).includes("EnsureSandBox")) {
+        return new Response(
+          new EnsureSandBoxResponse({
+            cluster: "us10",
+            gatewayUrl: "https://box-gateway.test/pod-1",
+            gatewayToken: "box-token-1",
+            networkToken: "nto-token-1",
+            runState: SandBoxRunState.RUNNING
+          }).toBinary(),
+          { status: 200 }
+        );
+      }
       // 剥掉 Connect 信封的 5 字节帧头，剩下的就是 InferenceStreamRequest 的 proto 编码。
       const body = init.body as Uint8Array;
       upstream.push(InferenceStreamRequest.fromBinary(body.subarray(5)));

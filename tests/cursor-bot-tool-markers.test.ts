@@ -153,6 +153,27 @@ test("<|recipient|>Shell {json} is stripped and becomes a Shell call", () => {
   assert.match(parsed.text, /先执行/);
 });
 
+test("<|recipient|>Glob<|content|>{json}<|end|> is stripped and becomes a Glob call", () => {
+  const parsed = parseToolMarkers(
+    '<|recipient|>Glob<|content|>{"glob_pattern":"README*","path":"E:\\\\docker-composer-api"}<|end|>'
+  );
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "Glob");
+  assert.equal(parsed.toolCalls[0].arguments.glob_pattern, "README*");
+  assert.equal(parsed.text.includes("<|recipient|>"), false);
+  assert.equal(parsed.text.includes("<|content|>"), false);
+});
+
+test("to=Shell envelope JSON unwraps to the inner arguments", () => {
+  const parsed = parseToolMarkers(
+    'to=Shell junk {"name":"Shell","arguments":{"command":"Get-Location","working_directory":"E:\\\\docker-composer-api"}}'
+  );
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "Shell");
+  assert.equal(parsed.toolCalls[0].arguments.command, "Get-Location");
+  assert.equal(parsed.toolCalls[0].arguments.name, undefined);
+});
+
 test("bare argument JSON without a name tag infers Shell and Read", () => {
   const parsed = parseToolMarkers(
     '正在执行只读目录检查。{"command":"Get-Location","block_until_ms":1000}{"path":"E:\\\\docker-composer-api\\\\package.json","limit":40}'

@@ -206,3 +206,34 @@ test("an agent that actually declared Readfile keeps that name", () => {
     "不会把短名硬扩成 Readfile"
   );
 });
+
+test("normalizeToolCallForClient unwraps a name/arguments envelope and drops a boolean notify_on_output", () => {
+  const tools: GatewayTool[] = [
+    {
+      name: "Shell",
+      inputSchema: {
+        type: "object",
+        properties: { command: { type: "string" }, notify_on_output: { type: "object" } },
+        required: ["command"]
+      }
+    }
+  ];
+  const unwrapped = normalizeToolCallForClient(
+    {
+      id: "c1",
+      name: "Shell",
+      arguments: { name: "Shell", arguments: { command: "Get-Location", notify_on_output: false } }
+    },
+    tools
+  );
+  assert.equal(unwrapped.name, "Shell");
+  assert.equal(unwrapped.arguments.command, "Get-Location");
+  assert.equal(unwrapped.arguments.notify_on_output, undefined);
+  assert.equal(unwrapped.arguments.name, undefined);
+
+  const kept = normalizeToolCallForClient(
+    { id: "c2", name: "Shell", arguments: { command: "pwd", notify_on_output: { pattern: "ok" } } },
+    tools
+  );
+  assert.deepEqual(kept.arguments.notify_on_output, { pattern: "ok" });
+});

@@ -93,6 +93,7 @@ export {
   buildRequestedModel,
   isClaudeFamily,
   shouldAdvertiseBotTools,
+  shouldReplayReasoningParts,
   shouldSendUnadvertisedToolNames,
   toStruct,
   toValue,

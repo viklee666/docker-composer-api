@@ -17,8 +17,8 @@ const RECIPIENT_OPEN = "<|recipient|>";
 const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]*/;
 /** 工具名与 JSON 之间夹的胡话上限（实测 `代上 code:` / `(json在线观看中文字幕)` 都远短于此）。 */
 const TO_EQUALS_JUNK_MAX = 160;
-/** Harmony 标签后通常直接跟 JSON，胡话留白很短。 */
-const RECIPIENT_JUNK_MAX = 16;
+/** Harmony 标签后通常直接跟 JSON；`<|constrain|>json<|content|>` 也要能跨过去。 */
+const RECIPIENT_JUNK_MAX = 48;
 
 /**
  * Bot 通道的正文工具标记还原（计划包 F 第 3 条）。
@@ -91,20 +91,22 @@ function findPrefixedJsonCall(text: string, from: number, prefix: string, junkMa
     if (start < 0) return { status: "none" };
     const afterEq = start + prefix.length;
     const nameMatch = TOOL_NAME_RE.exec(text.slice(afterEq));
-    if (!nameMatch) {
+    if (!nameMatch || /^multi_tool_use\.parallel$/i.test(nameMatch[0])) {
       if (afterEq >= text.length) return { status: "incomplete", start };
       searchFrom = afterEq;
       continue;
     }
     const afterName = afterEq + nameMatch[0].length;
     if (afterName >= text.length) return { status: "incomplete", start };
-    const braceAt = text.indexOf("{", afterName);
+    const afterTags = skipHarmonyTags(text, afterName);
+    if (afterTags >= text.length) return { status: "incomplete", start };
+    const braceAt = text.indexOf("{", afterTags);
     if (braceAt < 0) {
-      if (text.length - afterName <= junkMax) return { status: "incomplete", start };
+      if (text.length - afterTags <= junkMax) return { status: "incomplete", start };
       searchFrom = afterEq;
       continue;
     }
-    if (braceAt - afterName > junkMax) {
+    if (braceAt - afterTags > junkMax) {
       searchFrom = afterEq;
       continue;
     }
@@ -145,8 +147,10 @@ function findBareToolJson(text: string, from: number): ExtractFind {
       return { status: "incomplete", start };
     }
     const args = parseObjectJson(json.raw);
-    const name = args ? inferToolFromArgs(args) : undefined;
-    if (!args || !name) {
+    const unwrapped = args ? unwrapEnvelopeArgs(args) : undefined;
+    const named = typeof args?.name === "string" ? args.name.trim() : "";
+    const name = named || (unwrapped ? inferToolFromArgs(unwrapped) : undefined);
+    if (!unwrapped || !name) {
       searchFrom = json.end;
       continue;
     }
@@ -154,7 +158,7 @@ function findBareToolJson(text: string, from: number): ExtractFind {
       status: "hit",
       start,
       end: absorbCrumbs(text, json.end),
-      call: makeToolCall(name, args)
+      call: makeToolCall(name, unwrapped)
     };
   }
   return { status: "none" };
@@ -182,12 +186,13 @@ function parseObjectJson(raw: string): Record<string, unknown> | undefined {
 }
 
 function makeToolCall(rawName: string, args: Record<string, unknown>): GatewayToolCall {
+  const unwrapped = unwrapEnvelopeArgs(args);
   const mapped =
-    "file_path" in args && !("path" in args)
-      ? { ...args, path: args.file_path }
-      : "target_file" in args && !("path" in args)
-        ? { ...args, path: args.target_file }
-        : args;
+    "file_path" in unwrapped && !("path" in unwrapped)
+      ? { ...unwrapped, path: unwrapped.file_path }
+      : "target_file" in unwrapped && !("path" in unwrapped)
+        ? { ...unwrapped, path: unwrapped.target_file }
+        : unwrapped;
   return {
     id: `call_${randomUUID().replaceAll("-", "")}`,
     name: rawName.replace(/^functions\./i, ""),
@@ -195,14 +200,37 @@ function makeToolCall(rawName: string, args: Record<string, unknown>): GatewayTo
   };
 }
 
+/** `to=Shell {"name":"Shell","arguments":{command}}` 要把内层对象拆出来，否则 Cursor 报缺 command。 */
+function unwrapEnvelopeArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const nested = asRecord(args.arguments) ?? asRecord(args.input);
+  if (!nested) return args;
+  const keys = Object.keys(args);
+  if (keys.every((key) => key === "name" || key === "arguments" || key === "input" || key === "id")) return nested;
+  return args;
+}
+
+/** Harmony 在工具名和 JSON 之间会插 `<|content|>` / `<|constrain|>json` 这类标签。 */
+function skipHarmonyTags(text: string, from: number): number {
+  let index = from;
+  for (;;) {
+    while (index < text.length && /\s/.test(text[index] ?? "")) index += 1;
+    if (!text.startsWith("<|", index)) break;
+    const close = text.indexOf("|>", index + 2);
+    if (close < 0 || close - index > 40) break;
+    index = close + 2;
+  }
+  return index;
+}
+
 function absorbCrumbs(text: string, end: number): number {
-  const nexts = [text.indexOf(TO_EQUALS, end), text.indexOf(RECIPIENT_OPEN, end), text.indexOf("{", end)].filter(
+  let cursor = skipHarmonyTags(text, end);
+  const nexts = [text.indexOf(TO_EQUALS, cursor), text.indexOf(RECIPIENT_OPEN, cursor), text.indexOf("{", cursor)].filter(
     (index) => index >= 0
   );
-  if (!nexts.length) return end;
+  if (!nexts.length) return cursor;
   const next = Math.min(...nexts);
-  const between = text.slice(end, next);
-  return between.length <= 12 && !/[\n。！？]/.test(between) ? next : end;
+  const between = text.slice(cursor, next);
+  return between.length <= 12 && !/[\n。！？]/.test(between) ? next : cursor;
 }
 
 function findBalancedJson(text: string, braceStart: number): { end: number; raw: string } | undefined {

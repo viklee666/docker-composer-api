@@ -150,10 +150,11 @@ export function normalizeToolCallsForClient(toolCalls: GatewayToolCall[], tools:
 }
 
 function unwrapMcpToolCall(toolCall: GatewayToolCall): GatewayToolCall {
-  const args = toolCall.arguments;
+  const envelope = unwrapCallEnvelope(toolCall);
+  const args = envelope.arguments;
   const toolName = stringValue(args.toolName ?? args.tool_name ?? args.name);
   const provider = stringValue(args.providerIdentifier ?? args.provider_identifier ?? args.server);
-  if (toolName && (provider === "custom-user-tools" || toolCall.name === "mcp" || toolCall.name === "CallMcpTool")) {
+  if (toolName && (provider === "custom-user-tools" || envelope.name === "mcp" || envelope.name === "CallMcpTool")) {
     const nestedRaw = args.args ?? args.arguments ?? args.input;
     const nestedArgs = recordValue(nestedRaw);
     // 嵌套参数存在但无法解析（畸形 JSON 字符串等）时不能静默降级成 {}——那会给客户端发缺参调用。
@@ -164,10 +165,24 @@ function unwrapMcpToolCall(toolCall: GatewayToolCall): GatewayToolCall {
     return { ...toolCall, name: toolName, arguments: nestedArgs ?? {} };
   }
   const customPrefix = "custom-user-tools-";
-  if (toolCall.name.startsWith(customPrefix)) {
-    return { ...toolCall, name: toolCall.name.slice(customPrefix.length), arguments: args };
+  if (envelope.name.startsWith(customPrefix)) {
+    return { ...envelope, name: envelope.name.slice(customPrefix.length), arguments: args };
   }
-  return toolCall;
+  return envelope;
+}
+
+/** `to=Shell {"name":"Shell","arguments":{command}}` 不能把外壳当参数交给 Cursor。 */
+function unwrapCallEnvelope(toolCall: GatewayToolCall): GatewayToolCall {
+  const args = toolCall.arguments;
+  const nested = recordValue(args.arguments ?? args.input);
+  if (!nested) return toolCall;
+  const keys = Object.keys(args);
+  if (!keys.every((key) => key === "name" || key === "arguments" || key === "input" || key === "id")) return toolCall;
+  return {
+    ...toolCall,
+    name: stringValue(args.name) ?? toolCall.name,
+    arguments: nested
+  };
 }
 
 /** Grok / GPT 方言常给工具名加 File、_file、Tool，或加上 `functions.` 前缀。 */
@@ -208,13 +223,14 @@ function uniqueDecoratedMatch(name: string, tools: GatewayTool[]): GatewayTool |
 }
 
 function normalizeArguments(toolName: string, args: Record<string, unknown>, inputSchema: unknown): Record<string, unknown> {
+  const cleaned = dropInvalidNotifyOnOutput(args);
   const aliases = ARG_ALIASES[toolName];
-  if (!aliases) return args;
+  if (!aliases) return cleaned;
   const properties = schemaProperties(inputSchema);
-  const normalized: Record<string, unknown> = { ...args };
+  const normalized: Record<string, unknown> = { ...cleaned };
   for (const [from, targets] of Object.entries(aliases)) {
     // 只对“原始参数里就存在”的键改名，禁止对上一轮改名结果再改名（链式改写）。
-    if (!(from in args)) continue;
+    if (!(from in cleaned)) continue;
     // 来源键本身就在客户端 schema 里 → 已是合法键名，保持不动。
     if (properties.size && properties.has(from)) continue;
     // 有 schema 时选第一个真实存在于客户端 schema 的目标键；
@@ -223,11 +239,27 @@ function normalizeArguments(toolName: string, args: Record<string, unknown>, inp
       ? targets.find((candidate) => properties.has(candidate))
       : targets.find((candidate) => !candidate.startsWith("-"));
     if (!to || to === from) continue;
-    if (normalized[to] === undefined) normalized[to] = args[from];
+    if (normalized[to] === undefined) normalized[to] = cleaned[from];
     // 目标已有值（如 fileText/file_text 同义键并存）时也要删掉 schema 外的冗余来源键，严格 schema 客户端会拒绝多余键。
     delete normalized[from];
   }
   return normalized;
+}
+
+/**
+ * Cursor 的 Shell.notify_on_output 必须是带 pattern 的对象。
+ * Luna 常填 false / {} / {enabled:false}，会被客户端直接打回，模型再改用 Harmony 重试。
+ * 非法值直接丢掉，等价于 Grok 从不填这个字段。
+ */
+function dropInvalidNotifyOnOutput(args: Record<string, unknown>): Record<string, unknown> {
+  if (!("notify_on_output" in args)) return args;
+  const value = args.notify_on_output;
+  if (value && typeof value === "object" && !Array.isArray(value) && typeof (value as { pattern?: unknown }).pattern === "string") {
+    return args;
+  }
+  const next = { ...args };
+  delete next.notify_on_output;
+  return next;
 }
 
 function schemaProperties(inputSchema: unknown): Set<string> {
