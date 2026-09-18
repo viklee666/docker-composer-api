@@ -1,5 +1,5 @@
 import type { GatewayTool } from "../types.js";
-import { shouldAdvertiseBotTools, type BotInferenceRoute } from "./request-builder.js";
+import { isClaudeFamily, shouldAdvertiseBotTools, type BotInferenceRoute } from "./request-builder.js";
 
 /**
  * 不能把 `tools[]` 写进 InferenceService 时（grok；以及 api2 直连的所有模型），
@@ -9,6 +9,8 @@ import { shouldAdvertiseBotTools, type BotInferenceRoute } from "./request-build
  *
  * 这份卡片按**本轮真实工具表**生成，不硬编码 Cursor 工具名。
  * 只在「本轮不会向上游声明 tools[]」时注入。
+ * api2 直连的 Claude 连这份 SYSTEM 目录也会 resource_exhausted（同包 GPT 能过、
+ * 无工具 ping 能过；探针 sand_api_probe.py 也不发工具相关字段）。
  */
 export function unadvertisedToolCatalog(
   tools: GatewayTool[] | undefined,
@@ -18,6 +20,7 @@ export function unadvertisedToolCatalog(
 ): string | undefined {
   if (!tools?.length) return undefined;
   if (shouldAdvertiseBotTools(modelId, advertiseOverride, route)) return undefined;
+  if (route === "direct" && isClaudeFamily(modelId)) return undefined;
   const lines = tools.flatMap((tool) => {
     const name = tool.name?.trim();
     return name ? [`- ${name}${argumentHint(tool)}`] : [];
@@ -27,7 +30,8 @@ export function unadvertisedToolCatalog(
     "CLIENT TOOLS: call these exact names. Do not rename, translate, camelCase-join, or append File / Tool / _file.",
     "A listed tool is provided by the caller and is available. Never substitute a different name for it.",
     ...lines,
-    "Never emit to=Name, to=Read code, or any other ad-hoc call syntax in assistant text.",
+    "Never emit to=Name, <|recipient|>Name, bare argument JSON, or any other ad-hoc call syntax in assistant text.",
+    "Never say a tool call was already sent unless you emitted a structured call or <tool_call>.",
     'Call through the structured tool interface, or with ONLY: <tool_call>{"name":"EXACT_NAME","arguments":{}}</tool_call>'
   ].join("\n");
 }

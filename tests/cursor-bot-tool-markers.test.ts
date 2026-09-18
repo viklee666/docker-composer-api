@@ -142,6 +142,27 @@ test("normalizer drops a structured Read that duplicates an earlier to=Read", ()
   assert.match(normalizer.state.text, /先看/);
 });
 
+test("<|recipient|>Shell {json} is stripped and becomes a Shell call", () => {
+  const parsed = parseToolMarkers(
+    '先执行。<|recipient|>Shell {"command":"Get-Location","working_directory":"E:\\\\docker-composer-api"}'
+  );
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "Shell");
+  assert.equal(parsed.toolCalls[0].arguments.command, "Get-Location");
+  assert.equal(parsed.text.includes("<|recipient|>"), false);
+  assert.match(parsed.text, /先执行/);
+});
+
+test("bare argument JSON without a name tag infers Shell and Read", () => {
+  const parsed = parseToolMarkers(
+    '正在执行只读目录检查。{"command":"Get-Location","block_until_ms":1000}{"path":"E:\\\\docker-composer-api\\\\package.json","limit":40}'
+  );
+  assert.deepEqual(parsed.toolCalls.map((call) => call.name), ["Shell", "Read"]);
+  assert.equal(parsed.toolCalls[1].arguments.path, "E:\\docker-composer-api\\package.json");
+  assert.equal(parsed.text.includes("{"), false);
+  assert.match(parsed.text, /正在执行只读目录检查/);
+});
+
 /* -------------------------------------------------------------- 流式过滤 */
 
 test("streaming: marker split across chunks is reassembled", () => {

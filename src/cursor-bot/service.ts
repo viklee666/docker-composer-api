@@ -74,7 +74,7 @@ export interface BotSettings {
   /**
    * 推理出口：`direct` = api2 直连；`relay` = 经 Box relay
    * （EnsureSandBox 自动取连接，token 失效自动重取重试）。
-   * 直连上所有模型都不能把 tools[] 写进上游，会改走未声明工具名。
+   * 直连上所有模型都不能把 tools[] 写进上游；grok / GPT 改走未声明工具名，Claude 连名单和 SYSTEM 目录都不发。
    */
   inferenceRoute: "direct" | "relay";
   /**

@@ -98,6 +98,13 @@ export interface BotConversation {
   modelConfig?: BotModelConfig;
 }
 
+/** 与 model-params 家族兜底同一口径：这些模型走 Anthropic 后端。 */
+const CLAUDE_FAMILY = /claude|opus|sonnet|haiku|fable/i;
+
+export function isClaudeFamily(modelId: string): boolean {
+  return CLAUDE_FAMILY.test(modelId.trim());
+}
+
 /**
  * 走 InferenceService 时不要轻易把 `tools[]` 写进请求。
  *
@@ -107,7 +114,8 @@ export interface BotConversation {
  * - api2 直连：所有模型一声明都 `resource_exhausted`（与 grok 同症状）。
  * - Box relay 上 composer / luna：仍要声明，否则不会走工具。
  *
- * 不声明时把名字写进 `accepted_unadvertised_tool_names`，让上游仍接受这些调用。
+ * 不声明时，grok / GPT 把名字写进 `accepted_unadvertised_tool_names`。
+ * Claude 直连连这份名单也会 `resource_exhausted`（同包 GPT 能过、无工具 ping 能过）。
  */
 export function shouldAdvertiseBotTools(
   modelId: string,
@@ -118,6 +126,18 @@ export function shouldAdvertiseBotTools(
   if (override === true) return true;
   if (route === "direct") return false;
   return !/grok/i.test(modelId.trim());
+}
+
+/** 不能写 tools[] 时，要不要改走 accepted_unadvertised_tool_names。 */
+export function shouldSendUnadvertisedToolNames(
+  modelId: string,
+  override?: boolean,
+  route?: BotInferenceRoute
+): boolean {
+  if (override === false) return false;
+  if (shouldAdvertiseBotTools(modelId, override, route)) return false;
+  if (route === "direct" && isClaudeFamily(modelId)) return false;
+  return true;
 }
 
 export function buildInferenceStreamRequest(conversation: BotConversation): InferenceStreamRequest {
@@ -137,9 +157,17 @@ export function buildInferenceStreamRequest(conversation: BotConversation): Infe
     shouldAdvertiseBotTools(conversation.requestedModel.modelId, conversation.advertiseTools, conversation.inferenceRoute)
   ) {
     request.tools = conversation.tools.map(buildAgentTool);
-  } else if (toolNames.length && conversation.advertiseTools !== false) {
+  } else if (
+    toolNames.length &&
+    shouldSendUnadvertisedToolNames(
+      conversation.requestedModel.modelId,
+      conversation.advertiseTools,
+      conversation.inferenceRoute
+    )
+  ) {
     // sendTools 开着、但这条路不能写 tools[]：用协议自带的未声明工具名列表，
     // 否则上游只认训练先验（ReadFile 等），客户端的 Read 会对不上。
+    // Claude 直连连这份名单也拒，不发；工具靠本地 XML / 正文还原。
     request.acceptedUnadvertisedToolNames = toolNames;
   }
   const modelConfig = buildModelConfig(conversation.modelConfig);

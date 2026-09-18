@@ -35,6 +35,13 @@ test("forcing advertise off still injects the catalog for non-grok models", () =
   assert.ok(text?.includes("- search"));
 });
 
+test("claude on the direct route does not get the shadow catalog", () => {
+  assert.equal(
+    unadvertisedToolCatalog([{ name: "search" }], "claude-sonnet-5", undefined, "direct"),
+    undefined
+  );
+});
+
 test("withUnadvertisedToolCatalog appends after existing system text", () => {
   const next = withUnadvertisedToolCatalog(
     { systemInstructions: ["be terse"], tools: [{ name: "search" }] },

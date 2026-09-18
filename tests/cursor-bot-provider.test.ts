@@ -217,6 +217,28 @@ test("direct route never advertises tools[] and lists accepted unadvertised name
   });
   assert.deepEqual(sendToolsOff.tools, []);
   assert.deepEqual(sendToolsOff.acceptedUnadvertisedToolNames, []);
+
+  const claudeDirect = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    inferenceRoute: "direct",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "claude-sonnet-5" }
+  });
+  assert.deepEqual(claudeDirect.tools, []);
+  assert.deepEqual(claudeDirect.acceptedUnadvertisedToolNames, []);
+
+  const claudeRelay = buildInferenceStreamRequest({
+    messages: [{ role: "user", text: "hi" }],
+    tools,
+    inferenceRoute: "relay",
+    conversationId: "c",
+    invocationId: "i",
+    requestedModel: { modelId: "claude-sonnet-5" }
+  });
+  assert.equal(claudeRelay.tools[0].name, "search");
+  assert.deepEqual(claudeRelay.acceptedUnadvertisedToolNames, []);
 });
 
 /* ---------------------------------------------------------- response normalizer */
@@ -871,6 +893,19 @@ test("composer on the direct route gets the same SYSTEM catalog as grok", async 
   assert.deepEqual(captured[0].request.acceptedUnadvertisedToolNames, ["Read"]);
   const system = captured[0].request.messages.filter((message) => message.role === InferenceMessageRole.SYSTEM);
   assert.match(String(system[0]?.content.value), /^- Read — arguments: path$/m);
+});
+
+test("claude on the direct route omits accepted names and the SYSTEM catalog", async () => {
+  const tools = [{ name: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } }];
+  const { instance, captured } = provider([messageFrame(textFrame("ok")), endFrame()], {
+    sendTools: true,
+    inferenceRoute: "direct"
+  });
+  await instance.run(runRequest({ model: "claude-sonnet-5", tools }));
+  assert.deepEqual(captured[0].request.tools, []);
+  assert.deepEqual(captured[0].request.acceptedUnadvertisedToolNames, []);
+  const system = captured[0].request.messages.filter((message) => message.role === InferenceMessageRole.SYSTEM);
+  assert.equal(system.length, 0);
 });
 
 test("grok injects this request's tool names into SYSTEM instead of advertising tools[]", async () => {

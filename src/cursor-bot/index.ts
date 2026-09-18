@@ -91,7 +91,9 @@ export {
 export {
   buildInferenceStreamRequest,
   buildRequestedModel,
+  isClaudeFamily,
   shouldAdvertiseBotTools,
+  shouldSendUnadvertisedToolNames,
   toStruct,
   toValue,
   type BotConversation as BotRequestConversation,

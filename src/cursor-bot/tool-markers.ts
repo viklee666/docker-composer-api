@@ -11,18 +11,23 @@ const MAX_MARKER_BUFFER = 64 * 1024;
 const MARKER_RE = new RegExp(escapeRegExp(MARKER_OPEN) + "([\\s\\S]*?)" + escapeRegExp(MARKER_CLOSE), "g");
 /** Luna / 直连未声明 tools[] 时会把调用糊成 `to=Read junk {...}` 正文，而不是 `<tool_call>`。 */
 const TO_EQUALS = "to=";
-/** `to=` 后面允许的工具名（含 `functions.Read`）。 */
-const TO_EQUALS_NAME = /^[A-Za-z][A-Za-z0-9_.]*/;
+/** GPT Harmony：`<|recipient|>Shell {json}`。 */
+const RECIPIENT_OPEN = "<|recipient|>";
+/** `to=` / `<|recipient|>` 后面允许的工具名（含 `functions.Read`）。 */
+const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]*/;
 /** 工具名与 JSON 之间夹的胡话上限（实测 `代上 code:` / `(json在线观看中文字幕)` 都远短于此）。 */
 const TO_EQUALS_JUNK_MAX = 160;
+/** Harmony 标签后通常直接跟 JSON，胡话留白很短。 */
+const RECIPIENT_JUNK_MAX = 16;
 
 /**
  * Bot 通道的正文工具标记还原（计划包 F 第 3 条）。
  *
  * 上游（Cursor Inference Stream）在未拿到结构化 tools[] 时会把工具调用当正文吐出。
- * 常见两种：`<tool_call>{...}</tool_call>`（Claude Code / 目录卡片），以及直连 Luna
- * 的 `to=Read junk {...}`。SDK 路线只处理前者；这里两种都还原，但不共用 SDK 过滤器——
- * 那边耦合着 park / held 等状态，照搬会把那些概念一起带进 bot。
+ * 常见几种：`<tool_call>{...}</tool_call>`、直连 Luna 的 `to=Read junk {...}`、
+ * GPT Harmony 的 `<|recipient|>Shell {json}`，以及剥掉标签后剩下的裸参数 JSON。
+ * SDK 路线只处理第一种；这里都还原，但不共用 SDK 过滤器——那边耦合着 park / held
+ * 等状态，照搬会把那些概念一起带进 bot。
  *
  * 与 SDK 侧的差异（有意为之）：
  * - 流式过滤挂在 ResponseNormalizer 的 textPart 事件上，而不是单独一层 runner；
@@ -41,16 +46,16 @@ export function parseToolMarkers(text: string): { text: string; toolCalls: Gatew
     toolCalls.push(parsed);
     return "";
   });
-  const cleaned = stripToEqualsCalls(withoutXml, toolCalls).trim();
+  const cleaned = stripTextToolCalls(withoutXml, toolCalls).trim();
   return { text: cleaned, toolCalls };
 }
 
-function stripToEqualsCalls(text: string, sink: GatewayToolCall[]): string {
+function stripTextToolCalls(text: string, sink: GatewayToolCall[]): string {
   let out = "";
   let cursor = 0;
   for (;;) {
-    const found = findToEqualsCall(text, cursor);
-    if (found.status === "none" || found.status === "incomplete") {
+    const found = nextTextToolCall(text, cursor);
+    if (!found || found.status !== "hit") {
       out += text.slice(cursor);
       break;
     }
@@ -61,18 +66,31 @@ function stripToEqualsCalls(text: string, sink: GatewayToolCall[]): string {
   return out;
 }
 
-type ToEqualsFind =
+type ExtractFind =
   | { status: "none" }
   | { status: "incomplete"; start: number }
   | { status: "hit"; start: number; end: number; call: GatewayToolCall };
 
-function findToEqualsCall(text: string, from = 0): ToEqualsFind {
+type LocatedFind = Exclude<ExtractFind, { status: "none" }>;
+
+function nextTextToolCall(text: string, from: number): LocatedFind | undefined {
+  const candidates = [
+    findPrefixedJsonCall(text, from, RECIPIENT_OPEN, RECIPIENT_JUNK_MAX),
+    findPrefixedJsonCall(text, from, TO_EQUALS, TO_EQUALS_JUNK_MAX),
+    findBareToolJson(text, from)
+  ].filter((item): item is LocatedFind => item.status !== "none");
+  if (!candidates.length) return undefined;
+  candidates.sort((a, b) => a.start - b.start);
+  return candidates[0];
+}
+
+function findPrefixedJsonCall(text: string, from: number, prefix: string, junkMax: number): ExtractFind {
   let searchFrom = from;
   while (searchFrom < text.length) {
-    const start = text.indexOf(TO_EQUALS, searchFrom);
+    const start = text.indexOf(prefix, searchFrom);
     if (start < 0) return { status: "none" };
-    const afterEq = start + TO_EQUALS.length;
-    const nameMatch = TO_EQUALS_NAME.exec(text.slice(afterEq));
+    const afterEq = start + prefix.length;
+    const nameMatch = TOOL_NAME_RE.exec(text.slice(afterEq));
     if (!nameMatch) {
       if (afterEq >= text.length) return { status: "incomplete", start };
       searchFrom = afterEq;
@@ -82,11 +100,11 @@ function findToEqualsCall(text: string, from = 0): ToEqualsFind {
     if (afterName >= text.length) return { status: "incomplete", start };
     const braceAt = text.indexOf("{", afterName);
     if (braceAt < 0) {
-      if (text.length - afterName <= TO_EQUALS_JUNK_MAX) return { status: "incomplete", start };
+      if (text.length - afterName <= junkMax) return { status: "incomplete", start };
       searchFrom = afterEq;
       continue;
     }
-    if (braceAt - afterName > TO_EQUALS_JUNK_MAX) {
+    if (braceAt - afterName > junkMax) {
       searchFrom = afterEq;
       continue;
     }
@@ -98,35 +116,93 @@ function findToEqualsCall(text: string, from = 0): ToEqualsFind {
       }
       return { status: "incomplete", start };
     }
-    let args: Record<string, unknown> | undefined;
-    try {
-      args = asRecord(JSON.parse(json.raw) as unknown);
-    } catch {
-      args = undefined;
-    }
+    const args = parseObjectJson(json.raw);
     if (!args) {
       searchFrom = json.end;
       continue;
     }
-    let end = json.end;
-    const next = text.indexOf(TO_EQUALS, end);
-    if (next >= 0) {
-      const between = text.slice(end, next);
-      if (between.length <= 12 && !/[\n。！？]/.test(between)) end = next;
-    }
-    const name = nameMatch[0].replace(/^functions\./i, "");
     return {
       status: "hit",
       start,
-      end,
-      call: {
-        id: `call_${randomUUID().replaceAll("-", "")}`,
-        name,
-        arguments: args
-      }
+      end: absorbCrumbs(text, json.end),
+      call: makeToolCall(nameMatch[0], args)
     };
   }
   return { status: "none" };
+}
+
+function findBareToolJson(text: string, from: number): ExtractFind {
+  let searchFrom = from;
+  while (searchFrom < text.length) {
+    const start = text.indexOf("{", searchFrom);
+    if (start < 0) return { status: "none" };
+    const json = findBalancedJson(text, start);
+    if (!json) {
+      if (text.length - start > MAX_MARKER_BUFFER) {
+        searchFrom = start + 1;
+        continue;
+      }
+      return { status: "incomplete", start };
+    }
+    const args = parseObjectJson(json.raw);
+    const name = args ? inferToolFromArgs(args) : undefined;
+    if (!args || !name) {
+      searchFrom = json.end;
+      continue;
+    }
+    return {
+      status: "hit",
+      start,
+      end: absorbCrumbs(text, json.end),
+      call: makeToolCall(name, args)
+    };
+  }
+  return { status: "none" };
+}
+
+function inferToolFromArgs(args: Record<string, unknown>): string | undefined {
+  const keys = new Set(Object.keys(args));
+  if (keys.size === 0) return undefined;
+  if (keys.has("old_string") && keys.has("new_string")) return "StrReplace";
+  if (keys.has("glob_pattern")) return "Glob";
+  if (keys.has("command")) return "Shell";
+  if (keys.has("todos")) return "TodoWrite";
+  if (keys.has("target_notebook")) return "EditNotebook";
+  if (keys.has("pattern") && (keys.has("glob") || keys.has("path") || keys.has("file_path"))) return "Grep";
+  if (keys.has("path") || keys.has("file_path") || keys.has("target_file")) return "Read";
+  return undefined;
+}
+
+function parseObjectJson(raw: string): Record<string, unknown> | undefined {
+  try {
+    return asRecord(JSON.parse(raw) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+function makeToolCall(rawName: string, args: Record<string, unknown>): GatewayToolCall {
+  const mapped =
+    "file_path" in args && !("path" in args)
+      ? { ...args, path: args.file_path }
+      : "target_file" in args && !("path" in args)
+        ? { ...args, path: args.target_file }
+        : args;
+  return {
+    id: `call_${randomUUID().replaceAll("-", "")}`,
+    name: rawName.replace(/^functions\./i, ""),
+    arguments: mapped
+  };
+}
+
+function absorbCrumbs(text: string, end: number): number {
+  const nexts = [text.indexOf(TO_EQUALS, end), text.indexOf(RECIPIENT_OPEN, end), text.indexOf("{", end)].filter(
+    (index) => index >= 0
+  );
+  if (!nexts.length) return end;
+  const next = Math.min(...nexts);
+  const between = text.slice(end, next);
+  return between.length <= 12 && !/[\n。！？]/.test(between) ? next : end;
 }
 
 function findBalancedJson(text: string, braceStart: number): { end: number; raw: string } | undefined {
@@ -206,14 +282,15 @@ export class ToolMarkerFilter {
     };
     for (;;) {
       const xmlStart = this.buffer.indexOf(MARKER_OPEN);
-      const toStart = this.buffer.indexOf(TO_EQUALS);
-      if (xmlStart < 0 && toStart < 0) {
+      const textCall = nextTextToolCall(this.buffer, 0);
+      const textStart = textCall ? textCall.start : -1;
+      if (xmlStart < 0 && textStart < 0) {
         const hold = this.holdFrom();
         append(this.buffer.slice(0, hold));
         this.buffer = this.buffer.slice(hold);
         break;
       }
-      if (xmlStart >= 0 && (toStart < 0 || xmlStart <= toStart)) {
+      if (xmlStart >= 0 && (textStart < 0 || xmlStart <= textStart)) {
         const end = this.buffer.indexOf(MARKER_CLOSE, xmlStart + MARKER_OPEN.length);
         if (end < 0) {
           // marker 已开但长时间不闭合：超过上限（按 UTF-16 code unit 计）当普通文本放行，避免无界缓冲。
@@ -235,25 +312,20 @@ export class ToolMarkerFilter {
         else append(MARKER_OPEN + raw + MARKER_CLOSE);
         continue;
       }
-      const found = findToEqualsCall(this.buffer, toStart);
-      if (found.status === "incomplete") {
-        if (this.buffer.length - found.start > MAX_MARKER_BUFFER) {
+      if (!textCall || textCall.status !== "hit") {
+        const holdAt = textCall?.start ?? 0;
+        if (this.buffer.length - holdAt > MAX_MARKER_BUFFER) {
           append(this.buffer);
           this.buffer = "";
           break;
         }
-        append(this.buffer.slice(0, found.start));
-        this.buffer = this.buffer.slice(found.start);
+        append(this.buffer.slice(0, holdAt));
+        this.buffer = this.buffer.slice(holdAt);
         break;
       }
-      if (found.status === "none") {
-        append(this.buffer.slice(0, toStart + TO_EQUALS.length));
-        this.buffer = this.buffer.slice(toStart + TO_EQUALS.length);
-        continue;
-      }
-      append(this.buffer.slice(0, found.start));
-      this.buffer = this.buffer.slice(found.end);
-      this.pendingToolCalls.push(found.call);
+      append(this.buffer.slice(0, textCall.start));
+      this.buffer = this.buffer.slice(textCall.end);
+      this.pendingToolCalls.push(textCall.call);
     }
     return out;
   }
@@ -282,7 +354,7 @@ export class ToolMarkerFilter {
 
   /** buffer 尾部可能是 `<tool_call>` 或 `to=` 前缀的最早位置。 */
   private holdFrom(): number {
-    const prefixes = [MARKER_OPEN, TO_EQUALS];
+    const prefixes = [MARKER_OPEN, TO_EQUALS, RECIPIENT_OPEN];
     let earliest = this.buffer.length;
     for (const prefix of prefixes) {
       const max = Math.min(this.buffer.length, prefix.length - 1);
