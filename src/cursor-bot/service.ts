@@ -557,20 +557,18 @@ export class CursorBotService implements CursorRunner {
     const advertiseTools = this.settings.sendTools ? undefined : false;
     const prepared = withUnadvertisedToolCatalog(
       {
-        systemInstructions: [],
+        conversationId: context.conversationId,
+        invocationId: context.invocationId,
+        systemInstructions: [] as string[],
         tools: context.tools,
-        messages: [{ role: "user", text: context.prompt }]
+        messages: [{ role: "user" as const, text: context.prompt }]
       },
       context.requestedModel.modelId,
       advertiseTools,
       this.settings.inferenceRoute
     );
     const request = buildInferenceStreamRequest({
-      messages: conversationMessages({
-        ...prepared,
-        conversationId: context.conversationId,
-        invocationId: context.invocationId
-      }),
+      messages: conversationMessages(prepared),
       // child 默认不继承父的工具，`tools` 由 scheduler 按 childTools 决定。
       ...(context.tools.length ? { tools: context.tools } : {}),
       advertiseTools,
