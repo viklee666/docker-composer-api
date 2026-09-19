@@ -1,3 +1,6 @@
+import { ADMIN_STYLES } from './admin-ui-styles.js';
+import { ADMIN_UX_SCRIPT } from './admin-ui-ux.js';
+
 /**
  * /admin 单页管理后台。
  * 纯内联 HTML/CSS/JS，无外部资源依赖（容器离线也可用）。
@@ -12,221 +15,20 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 <meta name="robots" content="noindex,nofollow">
 <link rel="icon" href="data:,">
 <title>Composer API 管理后台</title>
-<style>
-:root{
-  --bg:#f0f2f5;--panel:#ffffff;--panel-2:#f7f8fa;--border:#e4e7ed;
-  --text:#303133;--muted:#909399;--accent:#409eff;--accent-2:#36cfc9;
-  --green:#67c23a;--red:#f56c6c;--yellow:#e6a23c;
-  --radius:10px;--radius-lg:16px;--mono:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
-  --sidebar:220px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,.04);--shadow-md:0 2px 8px rgba(0,0,0,.06);--shadow-lg:0 4px 16px rgba(0,0,0,.08);
-  --glass-bg:rgba(255,255,255,.85);--glass-blur:16px;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{
-  background:var(--bg);
-  color:var(--text);min-height:100vh;font-size:14px;line-height:1.6;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-}
-a{color:var(--accent)}
-.hidden{display:none!important}
-button{
-  font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);
-  border-radius:6px;padding:6px 16px;cursor:pointer;transition:.15s;font-size:13px;line-height:1.5;
-}
-button:hover{border-color:var(--accent);color:var(--accent)}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500}
-button.primary:hover{filter:brightness(1.08);color:#fff}
-button.danger{border-color:var(--red);color:var(--red)}
-button.danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
-button:disabled{opacity:.5;cursor:not-allowed}
-input,select,textarea{
-  font:inherit;color:var(--text);background:#f5f7fa;border:1px solid var(--border);
-  border-radius:6px;padding:8px 12px;font-size:13px;outline:none;transition:.15s;line-height:1.5;
-}
-input:focus,select:focus,textarea:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 2px rgba(64,158,255,.1)}
-textarea{width:100%;min-height:120px;resize:vertical;line-height:1.6}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow-sm)}
-.card .k{color:var(--muted);font-size:12px;margin-bottom:8px;display:flex;align-items:center;gap:6px;font-weight:500}
-.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--text)}
-.card .d{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.5}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:20px;overflow:hidden;box-shadow:var(--shadow-sm)}
-.panel>.head{display:flex;align-items:center;gap:10px;padding:14px 20px;border-bottom:1px solid var(--border);flex-wrap:wrap;background:var(--panel-2)}
-.panel>.head h2{font-size:14px;font-weight:600}
-.panel>.head .hint{color:var(--muted);font-size:12px}
-.panel>.body{padding:20px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{color:var(--muted);text-align:left;font-weight:500;padding:10px 12px;border-bottom:2px solid var(--border);white-space:nowrap;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
-td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tbody tr:hover{background:#f5f7fa}
-tbody tr:nth-child(even){background:#fafbfc}
-tbody tr:nth-child(even):hover{background:#f0f2f5}
-td.mono,.mono{font-family:var(--mono);font-size:12px}
-.badge{display:inline-block;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:500;line-height:1.5}
-.badge.active,.badge.success{background:rgba(103,194,58,.1);color:var(--green)}
-.badge.disabled,.badge.danger{background:rgba(245,108,108,.1);color:var(--red)}
-.badge.gateway,.badge.sdk{background:rgba(64,158,255,.1);color:var(--accent)}
-.badge.direct,.badge.estimated{background:rgba(230,162,60,.12);color:var(--yellow)}
-.badge.admin{background:rgba(54,207,201,.1);color:var(--accent-2)}
-.badge.sand{background:rgba(168,130,255,.12);color:#7c5ce0}
-.badge.inherit,.badge.missing{background:rgba(144,147,153,.1);color:var(--muted)}
-.badge.s2xx{background:rgba(103,194,58,.1);color:var(--green)}
-.badge.s4xx{background:rgba(230,162,60,.12);color:var(--yellow)}
-.badge.s5xx{background:rgba(245,108,108,.1);color:var(--red)}
-.badge.warn{background:rgba(230,162,60,.12);color:var(--yellow)}
-.badge.ok{background:rgba(103,194,58,.1);color:var(--green)}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.muted{color:var(--muted)}
-.small{font-size:12px}
-.err-text{color:var(--red);font-size:12px;word-break:break-all;line-height:1.5}
-.empty{color:var(--muted);text-align:center;padding:32px 0;font-size:13px}
-.actions{display:flex;gap:6px;flex-wrap:wrap}
-.actions button{padding:4px 10px;font-size:12px;border-radius:5px;white-space:nowrap}
-.chip{border:1px solid var(--border);background:var(--panel);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:4px}
-.chip.ok{color:var(--green);border-color:rgba(103,194,58,.3)}
-.chip.bad{color:var(--red);border-color:rgba(245,108,108,.3)}
-.chip.warn{color:var(--yellow);border-color:rgba(230,162,60,.3)}
-.spacer{flex:1}
-.logo{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#66b1ff);
-  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#fff;flex-shrink:0}
-#test-result,#bot-chat-result{margin-top:12px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;
-  padding:14px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all;line-height:1.6}
-.table-scroll{overflow-x:auto;border-radius:8px;border:1px solid var(--border)}
-.table-scroll table{width:auto;min-width:100%}
-.table-scroll td{white-space:nowrap}
-.table-scroll td .err-text{white-space:normal;display:inline-block;max-width:300px}
-label.toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer;user-select:none}
-.callout{background:#f0f7ff;border:1px solid #d3e5f8;border-left:3px solid var(--accent);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;color:var(--text)}
-.callout strong{color:var(--text)}
-.callout.warn{background:#fdf6ec;border-color:#f5dab1;border-left-color:var(--yellow)}
-.settings-block{margin:0 0 24px;padding:20px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius)}
-.settings-block:last-child{margin-bottom:0}
-.settings-block h3{font-size:14px;font-weight:600;margin:0 0 6px;color:var(--text)}
-.settings-block .lede{color:var(--muted);font-size:12px;line-height:1.6;margin-bottom:14px}
-.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px 20px}
-.setting-field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:500}
-.setting-field .env{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400}
-.setting-field .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
-.setting-field input[type="number"],.setting-field input[type="text"],.setting-field select{width:100%;max-width:100%}
-.setting-check{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--text);cursor:pointer}
-.setting-check input{margin-top:3px}
-.warn-loud{background:#fdf6ec;border:1px solid #f5dab1;color:#8a6d1a;
-  border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13px;line-height:1.6}
-.warn-loud strong{color:#7c5e10}
-.note{color:var(--muted);font-size:12.5px;line-height:1.6;margin-top:8px}
-.secret-box{background:rgba(103,194,58,.06);border:1px solid rgba(103,194,58,.3);border-radius:10px;padding:14px 18px;margin-bottom:16px}
-.secret-box .mono{font-size:13.5px;word-break:break-all}
-.config-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.config-item{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
-.config-item .k{font-size:11.5px;color:var(--muted);margin-bottom:4px;font-weight:500}
-.config-item .v{font-size:13.5px}
-.weight-input{width:72px;padding:4px 8px;font-size:12px;text-align:center}
-.scope-chip{cursor:help;border-bottom:1px dashed var(--border)}
-.scope-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.scope-list{max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--panel-2)}
-.scope-list label{display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:13px;color:var(--text)}
-.bind-list{max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--panel-2)}
-.bind-list label{display:flex;align-items:flex-start;gap:8px;padding:5px 0;font-size:13px;color:var(--text)}
-#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:50}
-.login-card{width:min(400px,92vw);background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);padding:36px 32px;box-shadow:var(--shadow-lg)}
-.login-card .logo{width:48px;height:48px;font-size:20px;margin-bottom:18px}
-.login-card h1{font-size:20px;margin-bottom:6px;font-weight:600}
-.login-card p{color:var(--muted);font-size:13px;margin-bottom:22px}
-.login-card input{width:100%;margin-bottom:14px;padding:10px 14px}
-.login-card button{width:100%;padding:10px;font-size:14px}
-.login-err{color:var(--red);font-size:12.5px;min-height:18px;margin-bottom:8px}
-#toast{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:99}
-.toast{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);
-  border-radius:8px;padding:10px 16px;font-size:13px;box-shadow:var(--shadow-lg);animation:in .2s ease;color:var(--text)}
-.toast.bad{border-left-color:var(--red)}
-@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-#app{min-height:100vh}
-.app-shell{display:flex;min-height:100vh}
-.sidebar{
-  width:var(--sidebar);flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);
-  display:flex;flex-direction:column;position:sticky;top:0;height:100vh;z-index:30;
-}
-.sidebar-brand{display:flex;align-items:center;gap:10px;padding:18px 16px 14px;border-bottom:1px solid var(--border)}
-.sidebar-brand h1{font-size:14px;font-weight:600;letter-spacing:.2px;line-height:1.3}
-.sidebar-brand .sub{color:var(--muted);font-size:11.5px;margin-top:2px}
-.nav{flex:1;overflow:auto;padding:8px 0 12px}
-.nav-group{padding:14px 18px 4px;font-size:11px;color:var(--muted);letter-spacing:.06em;font-weight:500;text-transform:uppercase}
-.nav-item{
-  display:flex;align-items:center;gap:8px;width:calc(100% - 16px);margin:1px 8px;padding:8px 12px;border:0;background:transparent;
-  text-align:left;border-radius:6px;color:var(--text);font-size:13px;cursor:pointer;transition:.15s;
-}
-.nav-item:hover{background:var(--panel-2);color:var(--text)}
-.nav-item.active{background:#ecf5ff;color:var(--accent);font-weight:500}
-.nav-item .nav-icon{width:18px;height:18px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
-.sidebar-foot{padding:12px 16px 16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.6}
-.main{flex:1;min-width:0;display:flex;flex-direction:column}
-.topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--glass-bg);backdrop-filter:blur(var(--glass-blur));-webkit-backdrop-filter:blur(var(--glass-blur));position:sticky;top:0;z-index:20}
-.topbar h2{font-size:16px;font-weight:600}
-.topbar .chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.content{padding:20px 24px 60px;flex:1}
-.menu-btn{display:none;width:36px;height:36px;padding:0;align-items:center;justify-content:center;font-size:18px;border-radius:6px}
-.sidebar-mask{display:none}
-.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
-.log-detail{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:8px;font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-all;line-height:1.6}
-#modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{width:min(720px,96vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg)}
-.modal .head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--border)}
-.modal .head h2{font-size:15px;font-weight:600}
-.modal .body{padding:20px}
-.modal .foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border)}
-details.help-details{margin-top:12px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
-details.help-details summary{padding:10px 14px;cursor:pointer;font-size:13px;color:var(--muted);background:var(--panel-2);user-select:none}
-details.help-details summary:hover{color:var(--text)}
-details.help-details .detail-body{padding:14px;font-size:12.5px;line-height:1.7;color:var(--muted)}
-/* 展开的行内详情面板 */
-tr.log-expand-row td{padding:0!important;border-bottom:1px solid var(--border)}
-tr.log-expand-row .expand-panel{background:var(--panel-2);padding:16px 20px;border-top:1px dashed var(--border)}
-tr.log-expand-row .expand-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px;margin-bottom:12px}
-tr.log-expand-row .expand-grid .ek{font-size:11px;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.03em}
-tr.log-expand-row .expand-grid .ev{font-size:13px;margin-top:2px}
-tr.log-expand-row .expand-error{margin-top:10px;padding:10px 14px;background:#fef0f0;border:1px solid #fde2e2;border-radius:8px;font-size:12px;color:var(--red);white-space:pre-wrap;word-break:break-all;line-height:1.6}
-tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
-/* Bot 覆盖区视觉区分 */
-.settings-block.bot-override{border-left:3px solid var(--accent);background:#f8fbff}
-/* toggle switch */
-.toggle-switch{position:relative;display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)}
-.toggle-switch input{position:absolute;opacity:0;width:0;height:0}
-.toggle-slider{width:36px;height:20px;background:#dcdfe6;border-radius:10px;position:relative;transition:.2s;flex-shrink:0}
-.toggle-slider::after{content:'';position:absolute;width:16px;height:16px;background:#fff;border-radius:50%;top:2px;left:2px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15)}
-.toggle-switch input:checked + .toggle-slider{background:var(--accent)}
-.toggle-switch input:checked + .toggle-slider::after{left:18px}
-@media (max-width:900px){
-  .sidebar{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s ease;box-shadow:var(--shadow-lg)}
-  .sidebar.open{transform:none}
-  .sidebar-mask{display:block;position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:25}
-  .sidebar-mask.hidden{display:none}
-  .menu-btn{display:inline-flex}
-  .topbar .chips .chip-extra{display:none}
-  .scope-grid{grid-template-columns:1fr}
-  .content{padding:14px 14px 48px}
-  .settings-grid{grid-template-columns:1fr}
-}
-@media (max-width:600px){
-  .grid{grid-template-columns:1fr 1fr}
-  .card .v{font-size:18px}
-  .topbar .chips{display:none}
-  .settings-grid{grid-template-columns:1fr}
-}
-</style>
+<style>${ADMIN_STYLES}</style>
 </head>
 <body>
 
 <div id="login">
   <div class="login-card">
     <div class="logo">C</div>
-    <h1>Composer API 管理后台</h1>
-    <p>请输入管理密码（ADMIN_PASSWORD，未设置时为 GATEWAY_API_KEY）</p>
+    <h1>登录管理控制台</h1>
+    <p>管理模型连接、客户端密钥与运行状态。</p>
     <div class="login-err" id="login-err"></div>
-    <input id="login-pass" type="password" placeholder="管理密码" autocomplete="current-password">
-    <button class="primary" id="login-btn">登 录</button>
+    <label for="login-pass" class="small">管理密码</label>
+    <input id="login-pass" type="password" placeholder="请输入管理密码" autocomplete="current-password">
+    <button class="primary" id="login-btn">进入控制台</button>
+    <details class="field-help"><summary>在哪里设置管理密码？</summary><p>使用 ADMIN_PASSWORD；未配置时使用 GATEWAY_API_KEY。</p></details>
   </div>
 </div>
 
@@ -241,20 +43,19 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
           <div class="sub">管理后台</div>
         </div>
       </div>
-      <nav class="nav" id="nav">
-        <div class="nav-group">概览</div>
-        <button type="button" class="nav-item" data-nav="dashboard">概览</button>
-        <div class="nav-group">密钥</div>
-        <button type="button" class="nav-item" data-nav="keys">Cursor Key 池</button>
-        <button type="button" class="nav-item" data-nav="gateway-keys">网关密钥</button>
-        <button type="button" class="nav-item" data-nav="bot">Bot 凭据</button>
-        <div class="nav-group">策略</div>
-        <button type="button" class="nav-item" data-nav="routing">取用策略与会话粘性</button>
-        <button type="button" class="nav-item" data-nav="system-prompt">默认系统提示词</button>
-        <button type="button" class="nav-item" data-nav="proxy">代理设置</button>
-        <div class="nav-group">运维</div>
-        <button type="button" class="nav-item" data-nav="history">请求历史</button>
-        <button type="button" class="nav-item" data-nav="diagnostics">联通性测试</button>
+      <nav class="nav" id="nav" aria-label="主导航">
+        <div class="nav-group">工作空间</div>
+        <button type="button" class="nav-item" data-nav="dashboard">工作台</button>
+        <button type="button" class="nav-item" data-nav="history">请求记录</button>
+        <div class="nav-group">接入与使用</div>
+        <button type="button" class="nav-item" data-nav="keys">上游凭据</button>
+        <button type="button" class="nav-item" data-nav="gateway-keys">客户端密钥</button>
+        <button type="button" class="nav-item" data-nav="diagnostics">连接测试</button>
+        <button type="button" class="nav-item" data-nav="bot">Bot 通道</button>
+        <div class="nav-group">配置</div>
+        <button type="button" class="nav-item" data-nav="routing">路由策略</button>
+        <button type="button" class="nav-item" data-nav="system-prompt">系统提示词</button>
+        <button type="button" class="nav-item" data-nav="proxy">网络代理</button>
         <button type="button" class="nav-item" data-nav="settings">运行设置</button>
       </nav>
       <div class="sidebar-foot">
@@ -265,43 +66,60 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     <div class="main">
       <header class="topbar">
         <button type="button" class="menu-btn" id="btn-menu" aria-label="打开导航">☰</button>
-        <h2 id="crumb">概览</h2>
-        <div class="chips">
-          <span class="chip ok" id="chip-status">● 运行中</span>
-          <span class="chip chip-extra" id="chip-version">v-</span>
-          <span class="chip chip-extra" id="chip-uptime">运行 -</span>
-          <span class="chip chip-extra" id="chip-direct">直传 key：-</span>
-          <span class="chip" id="chip-session">会话：-</span>
-          <span class="chip" id="chip-http1">HTTP：-</span>
-          <span class="chip" id="chip-autodisable">自动禁用：-</span>
-        </div>
+        <h2 id="crumb">工作台</h2>
+        <span class="chip" id="chip-status" role="status">正在连接</span>
         <div class="spacer"></div>
-        <label class="toggle"><input type="checkbox" id="auto-refresh" checked> 10s 自动刷新</label>
-        <button id="btn-refresh">刷新</button>
-        <button id="btn-logout" class="danger">退出</button>
+        <label class="toggle"><input type="checkbox" id="auto-refresh" checked> 自动刷新</label>
+        <button id="btn-refresh">刷新数据</button>
+        <button id="btn-logout">退出登录</button>
       </header>
-      <div class="content">
+      <main class="content" id="main-content">
+        <div id="global-error" class="global-error hidden" role="alert"><span id="global-error-text"></span><button type="button" id="retry-load">重试</button></div>
+        <div class="page-heading">
+          <div><div class="eyebrow">COMPOSER API / CONSOLE</div><h1 id="page-title" tabindex="-1">工作台</h1><p id="page-description">从接入到运行，每一步都清楚。</p></div>
+          <div class="page-actions" id="page-actions"></div>
+        </div>
 
-        <section id="sec-dashboard" data-section="dashboard">
-          <div class="grid">
-            <div class="card"><div class="k">Cursor Key（可用 / 总数）</div><div class="v" id="st-keys">-</div><div class="d" id="st-keys-d">-</div></div>
-            <div class="card hidden" id="card-gw"><div class="k">网关密钥（可用 / 总数）</div><div class="v" id="st-gw">-</div><div class="d" id="st-gw-d">-</div></div>
-            <div class="card"><div class="k">总请求数</div><div class="v" id="st-total">-</div><div class="d" id="st-total-d">-</div></div>
-            <div class="card"><div class="k">近 24 小时</div><div class="v" id="st-24h">-</div><div class="d" id="st-24h-d">-</div></div>
-            <div class="card"><div class="k">平均耗时</div><div class="v" id="st-avg">-</div><div class="d">仅统计已完成请求</div></div>
-            <div class="card"><div class="k">Token 实测（累计）</div><div class="v" id="st-tokens">-</div><div class="d" id="st-tokens-d">-</div></div>
-            <div class="card"><div class="k">Token 估算（累计）</div><div class="v" id="st-estimated-tokens">-</div><div class="d" id="st-estimated-tokens-d">-</div></div>
-            <div class="card"><div class="k">实际花费 chargedCents</div><div class="v" id="st-cost">-</div><div class="d" id="st-cost-d">-</div></div>
-          </div>
-          <div class="panel">
-            <div class="head"><h2>当前配置</h2><span class="hint">来自 overview.config，改完到对应页面保存</span></div>
-            <div class="body">
-              <div class="config-list" id="cfg-summary"></div>
-              <p class="note">chargedCents 单位是美分浮点数（USD cent）。套餐内 / BYOK / 赠额用量的 chargedCents 为 0 是正常现象，不是统计漏记。</p>
+        <section id="sec-dashboard" data-section="dashboard" aria-label="工作台">
+          <div class="onboarding">
+            <div class="onboarding-head"><div><h2>开始使用</h2><p>三步完成接入。已配置的项目会自动标记。</p></div><span id="setup-progress" class="muted small">读取接入状态中</span></div>
+            <div class="setup-steps">
+              <button class="setup-step" id="setup-upstream" data-go="keys"><span class="step-number">01</span><span class="step-copy"><strong>添加上游凭据</strong><span>让网关能够调用 Cursor 模型</span></span><span class="step-state">前往配置 →</span></button>
+              <button class="setup-step" id="setup-client" data-go="gateway-keys"><span class="step-number">02</span><span class="step-copy"><strong>创建客户端密钥</strong><span>将网关密钥填入你的客户端</span></span><span class="step-state">前往配置 →</span></button>
+              <button class="setup-step" id="setup-test" data-go="diagnostics"><span class="step-number">03</span><span class="step-copy"><strong>验证连接</strong><span>选择模型，确认能收到回复</span></span><span class="step-state">发送测试 →</span></button>
             </div>
           </div>
-          <div class="panel">
-            <div class="head"><h2>Durable 会话</h2><span class="hint">进程内计数，重启清零；不含提示词与完整会话 id</span></div>
+          <div class="status-line"><h2>运行概况</h2><span class="muted small" id="last-updated">等待首次加载</span></div>
+          <div class="grid" id="primary-metrics">
+            <div class="card"><div class="k">可用上游凭据</div><div class="v" id="st-keys">—</div><div class="d" id="st-keys-d">正在读取 Cursor Key 池</div></div>
+            <div class="card"><div class="k">近 24 小时请求</div><div class="v" id="st-24h">—</div><div class="d" id="st-24h-d">正在读取请求记录</div></div>
+            <div class="card"><div class="k">平均响应耗时</div><div class="v" id="st-avg">—</div><div class="d">已完成请求的平均值</div></div>
+            <div class="card"><div class="k">累计实际花费 · USD</div><div class="v" id="st-cost">—</div><div class="d" id="st-cost-d">实付金额，非模型标价</div></div>
+          </div>
+          <div class="quick-links"><button data-go="history">查看请求记录 →</button><button data-go="diagnostics">测试连接 →</button><button data-go="settings">调整运行设置 →</button></div>
+          <details class="advanced-details">
+            <summary>累计用量与客户端密钥<span class="muted small">查看 Token 与累计请求统计</span></summary>
+            <div class="grid secondary-metrics">
+              <div class="card hidden" id="card-gw"><div class="k">可用客户端密钥 / 总数</div><div class="v" id="st-gw">—</div><div class="d" id="st-gw-d">—</div></div>
+              <div class="card"><div class="k">累计请求</div><div class="v" id="st-total">—</div><div class="d" id="st-total-d">—</div></div>
+              <div class="card"><div class="k">实测 Token · 累计</div><div class="v" id="st-tokens">—</div><div class="d" id="st-tokens-d">—</div></div>
+              <div class="card"><div class="k">估算 Token · 累计</div><div class="v" id="st-estimated-tokens">—</div><div class="d" id="st-estimated-tokens-d">—</div></div>
+            </div>
+          </details>
+          <details class="advanced-details">
+            <summary>当前配置<span class="muted small">会话、路由与网络状态</span></summary>
+            <div class="body">
+              <div class="row" style="margin-bottom:16px">
+                <span class="chip" id="chip-version">v-</span><span class="chip" id="chip-uptime">运行 -</span>
+                <span class="chip" id="chip-direct">直传 key：-</span><span class="chip" id="chip-session">会话：-</span>
+                <span class="chip" id="chip-http1">HTTP：-</span><span class="chip" id="chip-autodisable">自动禁用：-</span>
+              </div>
+              <div class="config-list" id="cfg-summary"></div>
+              <p class="note">实际花费按美元展示。套餐内、赠额或自带密钥的请求可能为 $0；详细计费字段可在请求记录中查看。</p>
+            </div>
+          </details>
+          <details class="advanced-details">
+            <summary>持久会话与缓存<span class="muted small">高级诊断 · 进程重启后计数清零</span></summary>
             <div class="body">
               <div class="config-list" id="durable-summary"></div>
               <p class="note" id="durable-identity"></p>
@@ -312,34 +130,41 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                 </table>
               </div>
             </div>
-          </div>
+          </details>
         </section>
 
         <section id="sec-keys" class="hidden" data-section="keys">
           <div class="panel">
             <div class="head">
               <h2>Cursor Key 池</h2>
-              <span class="hint">按下表顺序取第一个可用 key（↑↓ 可调整）；额度不足/失效连续达到阈值才自动禁用并切换下一个，上游临时报错只换下一个不禁用；被禁用的 key 需手动启用。权重仅在 round-robin 策略下生效。</span>
+              <span class="hint">网关调用模型所用的凭据。默认优先使用列表中的第一把可用 Key。</span>
             </div>
             <div class="body">
-              <div class="row" style="margin-bottom:14px">
-                <input id="new-key" placeholder="粘贴 Cursor API Key（crsr_...）" style="flex:2;min-width:220px" autocomplete="off">
-                <input id="new-label" placeholder="备注（可选）" style="flex:1;min-width:120px" autocomplete="off">
-                <input id="new-weight" class="weight-input" type="number" min="1" max="1000000" step="1" value="1" title="权重，仅 round-robin 生效" style="width:88px">
-                <button class="primary" id="btn-add-key">添加 Key</button>
-              </div>
-              <div class="row" style="margin-bottom:14px">
-                <input id="new-allowed" placeholder="初始白名单（可选，逗号分隔模型 id）" style="flex:1;min-width:200px" autocomplete="off">
-                <input id="new-excluded" placeholder="初始黑名单（可选，逗号分隔模型 id）" style="flex:1;min-width:200px" autocomplete="off">
-              </div>
-              <div class="row" style="margin-bottom:14px">
-                <select id="key-test-model" style="min-width:200px" title="行内「测试」按钮使用的模型"></select>
-                <span class="hint">行内「测试」使用上面选中的模型</span>
+              <details class="form-disclosure" id="add-key-form">
+                <summary>添加上游凭据<span class="muted small">Cursor API Key</span></summary>
+                <div class="disclosure-body">
+                  <div class="settings-grid">
+                    <div class="setting-field"><label for="new-label">名称 / 备注</label><input id="new-label" placeholder="例如：主账号" autocomplete="off"></div>
+                    <div class="setting-field"><label for="new-key">Cursor API Key <span class="muted">必填</span></label><input id="new-key" type="password" placeholder="crsr_..." autocomplete="off"></div>
+                  </div>
+                  <details class="advanced-details"><summary>高级选项<span class="muted small">可选 · 权重与模型范围</span></summary><div class="settings-grid">
+                    <div class="setting-field"><label for="new-weight">轮询权重</label><input id="new-weight" class="weight-input" type="number" min="1" max="1000000" step="1" value="1"><p class="hint">仅在按权重轮询策略下生效。</p></div>
+                    <div class="setting-field"><label for="new-allowed">允许的模型</label><input id="new-allowed" placeholder="留空不限制，多个 ID 用逗号分隔" autocomplete="off"></div>
+                    <div class="setting-field"><label for="new-excluded">排除的模型</label><input id="new-excluded" placeholder="可选，多个 ID 用逗号分隔" autocomplete="off"></div>
+                  </div></details>
+                  <div class="row"><button class="primary" id="btn-add-key">添加 Key</button><button type="button" data-close-disclosure="add-key-form">取消</button><span class="muted small">添加后可前往连接测试验证可用性。</span></div>
+                </div>
+              </details>
+              <div class="page-tools">
+                <input id="key-search" type="search" placeholder="搜索名称或密钥掩码" aria-label="搜索上游凭据">
+                <div class="spacer"></div><label for="key-test-model" class="muted small">测试模型</label>
+                <select id="key-test-model" title="行内测试使用的模型" aria-label="行内测试模型"></select>
+                <span class="muted small">测试会消耗额度</span>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead><tr>
-                    <th>优先级</th><th>备注</th><th>掩码 key</th><th>状态</th><th>可用模型范围</th><th>权重</th><th>请求数</th><th>失败数</th><th>最后使用</th><th>最后错误</th><th>操作</th>
+                    <th>名称 / 密钥</th><th>状态</th><th>模型范围</th><th>请求 / 最近使用</th><th>操作</th>
                   </tr></thead>
                   <tbody id="keys-body"></tbody>
                 </table>
@@ -375,15 +200,19 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
                     <button type="button" id="btn-hide-gw">我已保存</button>
                   </div>
                 </div>
-                <div class="row" style="margin-bottom:14px">
-                  <input id="new-gw-label" placeholder="备注（可选）" style="flex:1;min-width:140px" autocomplete="off">
-                  <input id="new-gw-key" placeholder="粘贴自定义密钥；留空则自动生成" style="flex:2;min-width:220px" autocomplete="off">
-                  <button class="primary" id="btn-add-gw">创建网关密钥</button>
-                </div>
+                <details class="form-disclosure" id="add-gw-form"><summary>创建客户端密钥<span class="muted small">默认自动生成</span></summary><div class="disclosure-body">
+                  <div class="settings-grid">
+                    <div class="setting-field"><label for="new-gw-label">名称 / 备注</label><input id="new-gw-label" placeholder="例如：我的聊天客户端" autocomplete="off"></div>
+                    <div class="setting-field"><label for="new-gw-key">自定义密钥 <span class="muted">可选</span></label><input id="new-gw-key" type="password" placeholder="留空自动生成安全密钥" autocomplete="off"></div>
+                  </div>
+                  <div class="row" style="margin-top:18px"><button class="primary" id="btn-add-gw">创建网关密钥</button><button type="button" data-close-disclosure="add-gw-form">取消</button></div>
+                  <p class="note">创建后请立即复制并妥善保存完整密钥。</p>
+                </div></details>
+                <div class="connection-info"><span>客户端 API 地址</span><code id="client-base-url"></code><button type="button" id="copy-base-url">复制地址</button><p class="note">OpenAI 兼容客户端使用此地址；Anthropic 客户端通常填写服务根地址，具体以客户端要求为准。</p></div>
                 <div class="table-scroll">
                   <table>
                     <thead><tr>
-                      <th>备注</th><th>掩码 key</th><th>状态</th><th>来源</th><th>可用 Cursor Key</th><th>模型范围</th><th>请求数</th><th>最后使用</th><th>操作</th>
+                      <th>名称 / 密钥</th><th>状态</th><th>访问范围</th><th>请求 / 最近使用</th><th>操作</th>
                     </tr></thead>
                     <tbody id="gw-body"></tbody>
                   </table>
@@ -1007,7 +836,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
           </div>
         </section>
 
-      </div>
+      </main>
     </div>
   </div>
 </div>
@@ -1065,6 +894,8 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     settings: '运行设置'
   };
 
+  ${ADMIN_UX_SCRIPT}
+
   function $(id){ return document.getElementById(id); }
   function esc(value){
     return String(value == null ? '' : value)
@@ -1079,6 +910,8 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     setTimeout(function(){ box.remove(); }, 3600);
   }
   function api(method, path, body){
+    var saveTarget = uiSaveTarget(path, body);
+    var saveRevision = uiRevision[saveTarget] || 0;
     var options = { method: method, headers: { 'authorization': 'Bearer ' + token } };
     if (method === 'POST' || body !== undefined) {
       options.headers['content-type'] = 'application/json';
@@ -1091,6 +924,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
           var message = data && data.error && data.error.message ? data.error.message : ('HTTP ' + res.status);
           throw new Error(message);
         }
+        if (saveTarget && (uiRevision[saveTarget] || 0) === saveRevision) setUiDirty(saveTarget, false);
         return data;
       });
     });
@@ -1098,6 +932,8 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
 
   function showLogin(message){
     stopTimer();
+    closeModal();
+    closeMenu();
     $('app').classList.add('hidden');
     $('login').classList.remove('hidden');
     $('login-err').textContent = message || '';
@@ -1108,17 +944,26 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     $('app').classList.remove('hidden');
   }
   function login(){
+    var button = $('login-btn');
+    if (button.disabled) return;
     var pass = $('login-pass').value.trim();
     if (!pass) { $('login-err').textContent = '请输入密码'; return; }
+    button.disabled = true;
+    button.textContent = '正在登录…';
+    $('login-err').textContent = '';
     token = pass;
     api('POST', '/admin/api/login').then(function(){
       localStorage.setItem(TOKEN_KEY, token);
+      $('login-pass').value = '';
       showApp();
       applyInitialSection();
       loadAll();
       startTimer();
     }).catch(function(err){
       if (err.message !== 'unauthorized') $('login-err').textContent = err.message;
+    }).finally(function(){
+      button.disabled = false;
+      button.textContent = '进入控制台';
     });
   }
 
@@ -1273,6 +1118,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       navs[j].classList.toggle('active', navs[j].getAttribute('data-nav') === name);
     }
     $('crumb').textContent = SECTIONS[name];
+    uiPageChanged(name);
     closeMenu();
     if (name === 'system-prompt') hydrateSystemPrompt();
     if (name === 'history') loadLogs();
@@ -1287,9 +1133,10 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   function loadQuotaBuckets(force){
     var box = $('quota-buckets-json');
     if (!box) return;
-    if (!force && document.activeElement === box) return;
+    if (!force && (isUiDirty('quota') || document.activeElement === box)) return;
+    var revision = uiRevision.quota || 0;
     api('GET', '/admin/api/quota-buckets').then(function(data){
-      if (force && document.activeElement === box) return;
+      if (isUiDirty('quota') || (uiRevision.quota || 0) !== revision || document.activeElement === box) return;
       var table = data.table || {};
       var models = table.models || {};
       var lines = Object.keys(models).sort().map(function(model){
@@ -1594,12 +1441,15 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         + (selected.indexOf(id) !== -1 ? ' checked' : '') + '> ' + esc(id) + '</label>';
     });
     list.innerHTML = html;
+    if (typeof filterPolicyModels === 'function') filterPolicyModels(dim);
   }
   function addPolicyModel(dim){
     var input = $(dim + '-models-extra');
     var id = input.value.trim();
     if (!id) return;
+    syncPolicySelection(dim);
     if (policySelected[dim].indexOf(id) === -1) policySelected[dim].push(id);
+    setUiDirty('settings', true);
     input.value = '';
     renderPolicyModels(dim);
   }
@@ -1624,7 +1474,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   function applySettingsForm(cfg, force){
     if (!cfg) return;
     var el = document.activeElement;
-    if (!force && el && el.closest && el.closest('#sec-settings')) return;
+    if (!force && ((typeof isUiDirty === 'function' && isUiDirty('settings')) || (el && el.closest && el.closest('#sec-settings')))) return;
     applyHttp1Form(cfg);
     http1ModeDirty = false;
     applyPolicyForm('fast', cfg.cursorFastPolicy, cfg.cursorFastModels);
@@ -1691,7 +1541,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   function applyRoutingForm(cfg){
     if (!cfg) return;
     var el = document.activeElement;
-    if (el && el.closest && el.closest('#sec-routing')) return;
+    if ((typeof isUiDirty === 'function' && isUiDirty('routing')) || (el && el.closest && el.closest('#sec-routing'))) return;
     var radios = document.querySelectorAll('input[name="routing-strategy"]');
     for (var i = 0; i < radios.length; i++) radios[i].checked = radios[i].value === (cfg.routingStrategy || 'fill-first');
     $('affinity-toggle').checked = !!cfg.sessionAffinity;
@@ -1700,7 +1550,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   function applySysForm(cfg){
     if (!cfg) return;
     var el = document.activeElement;
-    if (el && el.closest && el.closest('#sec-system-prompt')) return;
+    if ((typeof isUiDirty === 'function' && isUiDirty('system-prompt')) || (el && el.closest && el.closest('#sec-system-prompt'))) return;
     // 只同步模式。正文由 hydrateSystemPrompt 走专门的读接口负责，
     // 这里别碰它——overview 每 10 秒轮询一次，覆写会把用户刚载入或正在改的内容抹掉。
     $('sys-mode').value = cfg.systemPromptMode || 'off';
@@ -1772,6 +1622,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
 
     renderDurable(data.durable);
     renderGwAvailability();
+    uiOverview(data);
   }
   function renderDurable(durable){
     durable = durable || {};
@@ -1880,7 +1731,6 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         + '<button data-action="down" data-id="' + esc(key.id) + '" title="下移（降低优先级）"' + (index === lastKeys.length - 1 ? ' disabled' : '') + '>↓</button>'
         + '</div>';
       var actions = '<button data-action="copy" data-id="' + esc(key.id) + '" title="复制完整 key 到剪贴板（页面不显示明文）">复制</button>';
-      actions += '<button data-action="test" data-id="' + esc(key.id) + '">测试</button>';
       actions += '<button data-action="models" data-id="' + esc(key.id) + '">模型范围</button>';
       actions += '<button data-action="bot-import" data-id="' + esc(key.id) + '" title="用这把 key 向 Cursor 兑换 Bot session token">拉取 Bot</button>';
       if (key.status === 'active') {
@@ -1893,21 +1743,22 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         actions += '<button data-action="clear-quota" data-id="' + esc(key.id) + '" title="清除额度桶耗尽标记（不改变 key 的启用状态）">清除额度标记</button>';
       }
       actions += '<button class="danger" data-action="delete" data-id="' + esc(key.id) + '">删除</button>';
-      html += '<tr>'
-        + '<td>' + order + '</td>'
-        + '<td>' + esc(key.label) + '</td>'
-        + '<td class="mono">' + esc(key.maskedKey) + '</td>'
-        + '<td><span class="badge ' + esc(key.status) + '">' + (key.status === 'active' ? '可用' : '已禁用') + '</span></td>'
+      html += '<tr data-key-search="' + esc((key.label || '') + ' ' + (key.maskedKey || '')) + '">'
+        + '<td class="key-identity"><strong>' + esc(key.label || '未命名凭据') + '</strong><small class="mono">' + esc(key.maskedKey) + '</small></td>'
+        + '<td><span class="badge ' + esc(key.status) + '">' + (key.status === 'active' ? '可用' : '已禁用') + '</span>'
+        + (reason ? '<small class="muted">详情见管理</small>' : '') + '</td>'
         + '<td>' + scopeSummary(key.modelScope) + '</td>'
-        + '<td><input class="weight-input" type="number" min="1" max="1000000" step="1" data-action="weight" data-id="' + esc(key.id) + '" value="' + esc(key.weight || 1) + '" title="仅 round-robin 生效"></td>'
-        + '<td>' + fmtNum(key.requestCount) + '</td>'
-        + '<td>' + fmtNum(key.failureCount) + '</td>'
-        + '<td class="muted small">' + fmtTime(key.lastUsedAt) + '</td>'
-        + '<td>' + (reason || '<span class="muted">—</span>') + '</td>'
-        + '<td><div class="actions">' + actions + '</div></td>'
+        + '<td class="usage-summary"><strong>' + fmtNum(key.requestCount) + ' 次</strong><small class="muted">' + fmtTime(key.lastUsedAt) + '</small></td>'
+        + '<td><div class="actions"><button data-action="test" data-id="' + esc(key.id) + '">测试</button>'
+        + '<details class="row-details"><summary>管理</summary><div class="row-details-body">'
+        + '<div class="detail-grid"><div><span class="muted small">取用优先级</span>' + order + '</div>'
+        + '<label>轮询权重 <input aria-label="轮询权重" class="weight-input" type="number" min="1" max="1000000" step="1" data-action="weight" data-id="' + esc(key.id) + '" value="' + esc(key.weight || 1) + '" title="仅 round-robin 生效"></label></div>'
+        + '<p class="note">连续失败 ' + fmtNum(key.failureCount) + ' 次</p>' + reason
+        + '<div class="actions">' + actions + '</div></div></details></div></td>'
         + '</tr>';
     });
     body.innerHTML = html;
+    filterKeyRows();
     fillLogKeyFilters();
     fillTestKeySelect();
     updateTestRouteHint();
@@ -1946,17 +1797,11 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
         actions += '<button class="danger" data-action="delete" data-id="' + esc(key.id) + '">删除</button>';
       }
       html += '<tr>'
-        + '<td>' + esc(key.label) + '</td>'
-        + '<td class="mono">' + esc(key.maskedKey) + '</td>'
+        + '<td class="key-identity"><strong>' + esc(key.label || '未命名密钥') + '</strong><small class="mono">' + esc(key.maskedKey) + '</small></td>'
         + '<td><span class="badge ' + esc(key.status) + '">' + (key.status === 'active' ? '可用' : '已禁用') + '</span></td>'
-        + '<td>' + (fromEnv
-          ? '<span class="badge inherit" title="由 GATEWAY_API_KEY 播种，只能停用不能删除">env</span>'
-          : '<span class="badge sdk">后台</span>') + '</td>'
-        + '<td>' + bindSummary(key.allowedCursorKeyIds) + '</td>'
-        + '<td>' + scopeSummary(key.modelScope) + '</td>'
-        + '<td>' + fmtNum(key.requestCount) + '</td>'
-        + '<td class="muted small">' + fmtTime(key.lastUsedAt) + '</td>'
-        + '<td><div class="actions">' + actions + '</div></td>'
+        + '<td><div>上游 ' + bindSummary(key.allowedCursorKeyIds) + '</div><small class="muted">模型 ' + scopeSummary(key.modelScope) + '</small></td>'
+        + '<td class="usage-summary"><strong>' + fmtNum(key.requestCount) + ' 次</strong><small class="muted">' + fmtTime(key.lastUsedAt) + '</small></td>'
+        + '<td><details class="row-details"><summary>管理</summary><div class="row-details-body"><p class="note">来源：' + (fromEnv ? '环境变量 GATEWAY_API_KEY（只能停用）' : '后台创建') + '</p><div class="actions">' + actions + '</div></div></details></td>'
         + '</tr>';
     });
     body.innerHTML = html;
@@ -2245,10 +2090,13 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   }
   // 纯读接口。别用「POST 一次设置再看回显」来取正文：那是拿写操作做读操作，
   // 每次进页面都会白写一遍库，还会顺带重新应用一次设置。
-  function hydrateSystemPrompt(){
+  function hydrateSystemPrompt(force){
     var el = document.activeElement;
-    if (el && el.closest && el.closest('#sec-system-prompt')) return;
+    if (force !== true && ((typeof isUiDirty === 'function' && isUiDirty('system-prompt')) || (el && el.closest && el.closest('#sec-system-prompt')))) return;
+    var revision = uiRevision['system-prompt'] || 0;
     return api('GET', '/admin/api/system-prompt').then(function(data){
+      if ((uiRevision['system-prompt'] || 0) !== revision) return;
+      if (force === true) setUiDirty('system-prompt', false);
       $('sys-mode').value = data.mode || 'off';
       $('sys-text').value = data.text || '';
       $('sys-set-hint').textContent = (data.text || '').trim() ? '已载入已保存正文' : '尚未设置正文';
@@ -2262,6 +2110,9 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
   function loadAll(){
     var gen = ++loadGen;
     loading = true;
+    $('btn-refresh').disabled = true;
+    $('btn-refresh').textContent = '刷新中…';
+    $('main-content').setAttribute('aria-busy', 'true');
     Promise.all([
       api('GET', '/admin/api/overview'),
       api('GET', '/admin/api/models'),
@@ -2289,16 +2140,26 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       return Promise.all(extra);
     }).catch(function(err){
       if (gen !== loadGen) return;
-      if (err.message !== 'unauthorized') toast('加载失败：' + err.message, true);
+      if (err.message !== 'unauthorized') {
+        $('global-error-text').textContent = '数据更新失败，当前内容可能不是最新状态。' + err.message;
+        $('global-error').classList.remove('hidden');
+        $('chip-status').textContent = '更新失败';
+        $('chip-status').className = 'chip bad';
+      }
     }).finally(function(){
-      if (gen === loadGen) loading = false;
+      if (gen === loadGen) {
+        loading = false;
+        $('btn-refresh').disabled = false;
+        $('btn-refresh').textContent = '刷新数据';
+        $('main-content').setAttribute('aria-busy', 'false');
+      }
     });
   }
 
   function startTimer(){
     stopTimer();
     timer = setInterval(function(){
-      if ($('auto-refresh').checked && !document.hidden) loadAll();
+      if ($('auto-refresh').checked && !document.hidden && !loading && !document.querySelector('.row-details[open], #logs-body .log-expand-row:not(.hidden)')) loadAll();
     }, 10000);
   }
   function stopTimer(){
@@ -2781,7 +2642,8 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       $('new-weight').value = '1';
       $('new-allowed').value = '';
       $('new-excluded').value = '';
-      toast('已添加 key');
+      $('add-key-form').open = false;
+      toast('已添加 key，可前往连接测试验证');
       loadAll();
     }).catch(function(err){
       if (err.message !== 'unauthorized') toast('添加失败：' + err.message, true);
@@ -2813,6 +2675,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     $('new-gw-key').value = '';
     api('POST', '/admin/api/gateway-keys', payload).then(function(data){
       $('new-gw-label').value = '';
+      $('add-gw-form').open = false;
       toast('已创建网关密钥');
       if (data.key && data.key.apiKey) showGwReveal(data.key.apiKey);
       loadAll();
@@ -2848,7 +2711,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       systemPromptText: $('sys-text').value
     }).then(function(data){
       toast('提示词已保存');
-      if (data.config) {
+      if (data.config && !isUiDirty('system-prompt')) {
         $('sys-text').value = data.config.systemPrompt || '';
         $('sys-mode').value = data.config.systemPromptMode || $('sys-mode').value;
         updateSysCount();
@@ -2858,7 +2721,10 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       if (err.message !== 'unauthorized') toast('保存失败：' + err.message, true);
     });
   });
-  $('btn-load-sys').addEventListener('click', hydrateSystemPrompt);
+  $('btn-load-sys').addEventListener('click', function(){
+    if (isUiDirty('system-prompt') && !confirm('重新载入会放弃未保存的提示词修改，是否继续？')) return;
+    hydrateSystemPrompt(true);
+  });
 
   $('btn-save-proxy').addEventListener('click', function(){
     api('POST', '/admin/api/settings', { proxyUrl: $('proxy-url').value.trim() }).then(function(data){
@@ -2867,7 +2733,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       // 否则运维会以为点完保存模型流量就立刻进代理了。
       if (data && data.notice) toast(data.notice);
       if (data && data.executorResetWarning) toast(data.executorResetWarning, true);
-      $('proxy-url').value = '';
+      if (!isUiDirty('proxy')) $('proxy-url').value = '';
       loadAll();
       loadProxy();
     }).catch(function(err){
@@ -3038,10 +2904,10 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     button.textContent = '保存中…';
     api('POST', '/admin/api/settings', body).then(function(data){
       toast('设置已保存');
-      http1ModeDirty = false;
+      if (!isUiDirty('settings')) http1ModeDirty = false;
       // 执行器没释放掉＝旧连接还在用旧协议，运维必须知道要重启，不能只有「已保存」。
       if (data && data.executorResetWarning) toast(data.executorResetWarning, true);
-      if (data.config) {
+      if (data.config && !isUiDirty('settings')) {
         applyHttp1Form(data.config);
         applySettingsForm(data.config, true);
       }
@@ -3282,6 +3148,7 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
     });
   });
 
+  initAdminUx();
   fillCcChatModels();
   updateTestRouteHint();
 
@@ -3291,7 +3158,9 @@ tr.log-expand-row .expand-actions{margin-top:10px;display:flex;gap:8px}
       applyInitialSection();
       loadAll();
       startTimer();
-    }).catch(function(){ /* showLogin 已在 401 分支处理 */ });
+    }).catch(function(err){
+      if (err.message !== 'unauthorized') showLogin('连接失败，请重试：' + err.message);
+    });
   } else {
     showLogin('');
   }
