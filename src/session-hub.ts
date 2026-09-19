@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS,
   DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS,
   DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS,
   DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS
@@ -38,6 +39,10 @@ export interface PendingExecute {
   name: string;
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
+  /** 该 execute 自己的到期时刻；槽级 holdDeadline 取 pending 里的最大值。 */
+  holdDeadline?: number;
+  /** IDE 委派类工具（Task 等），LRU 不得挤掉、TTL 用 delegateHoldTtlMs。 */
+  delegated?: boolean;
 }
 
 /**
@@ -126,6 +131,8 @@ export interface SessionHubStore {
 
 export interface SessionHubOptions {
   holdTtlMs?: number;
+  /** 客户端委派工具（Task 等）的 hold TTL；默认 60 分钟。 */
+  delegateHoldTtlMs?: number;
   idleTtlMs?: number;
   maxLiveSessions?: number;
   parallelToolSettleMs?: number;
@@ -184,6 +191,13 @@ export function createSessionSlot(input: CreateSessionSlotInput): SessionSlot {
     historyChecksum: input.historyChecksum ?? historyChecksum(issuedToolCallIds, input.lastUserText),
     resumed: input.resumed
   };
+}
+
+function slotHasDelegatedHold(slot: SessionSlot): boolean {
+  for (const pending of slot.pending.values()) {
+    if (pending.delegated) return true;
+  }
+  return false;
 }
 
 /** Anthropic `tool_use.id` / Cursor 回传的实际上限；超长 id 会被截断。 */
@@ -419,6 +433,7 @@ export async function settleParallelTools(ms: number = PARALLEL_TOOL_SETTLE_MS):
  */
 export class SessionHub {
   holdTtlMs: number;
+  delegateHoldTtlMs: number;
   idleTtlMs: number;
   maxLiveSessions: number;
   readonly parallelToolSettleMs: number;
@@ -436,6 +451,7 @@ export class SessionHub {
 
   constructor(options: SessionHubOptions = {}) {
     this.holdTtlMs = positiveBound(options.holdTtlMs, DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS);
+    this.delegateHoldTtlMs = positiveBound(options.delegateHoldTtlMs, DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS);
     this.idleTtlMs = positiveBound(options.idleTtlMs, DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS);
     this.maxLiveSessions = positiveBound(options.maxLiveSessions, DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS);
     this.parallelToolSettleMs = options.parallelToolSettleMs ?? PARALLEL_TOOL_SETTLE_MS;
@@ -446,8 +462,9 @@ export class SessionHub {
   }
 
   /** 后台改 TTL / 上限后立即作用于后续 sweep / hold / 新槽，不丢现有会话。 */
-  configure(patch: { holdTtlMs?: number; idleTtlMs?: number; maxLiveSessions?: number }): void {
+  configure(patch: { holdTtlMs?: number; delegateHoldTtlMs?: number; idleTtlMs?: number; maxLiveSessions?: number }): void {
     if (patch.holdTtlMs !== undefined) this.holdTtlMs = positiveBound(patch.holdTtlMs, this.holdTtlMs);
+    if (patch.delegateHoldTtlMs !== undefined) this.delegateHoldTtlMs = positiveBound(patch.delegateHoldTtlMs, this.delegateHoldTtlMs);
     if (patch.idleTtlMs !== undefined) this.idleTtlMs = positiveBound(patch.idleTtlMs, this.idleTtlMs);
     if (patch.maxLiveSessions !== undefined) this.maxLiveSessions = positiveBound(patch.maxLiveSessions, this.maxLiveSessions);
   }
@@ -469,7 +486,16 @@ export class SessionHub {
 
   put(sessionId: string, slot: SessionSlot): void {
     const updating = this.slots.has(sessionId);
-    if (!updating) this.evictToFit(sessionId);
+    if (!updating) {
+      this.evictToFit(sessionId);
+      if (this.slots.size >= this.maxLiveSessions) {
+        throw new ApiError(
+          "Too many live SDK sessions to start a new one while a delegated client tool is still waiting.",
+          503,
+          "session_capacity"
+        );
+      }
+    }
     this.slots.delete(sessionId);
     slot.lastUsedAt = this.nowFn();
     this.slots.set(sessionId, slot);
@@ -529,18 +555,28 @@ export class SessionHub {
     toolCallId: string,
     name: string,
     resolve: PendingExecute["resolve"],
-    reject: PendingExecute["reject"]
+    reject: PendingExecute["reject"],
+    options?: { ttlMs?: number; delegated?: boolean }
   ): void {
     const slot = this.slots.get(sessionId);
     if (!slot) {
       reject(new Error(`session-hub: no slot for hold (${sessionId})`));
       return;
     }
-    slot.pending.set(toolCallId, { name, resolve, reject });
+    const delegated = options?.delegated === true;
+    const ttlMs = options?.ttlMs ?? (delegated ? this.delegateHoldTtlMs : this.holdTtlMs);
+    slot.pending.set(toolCallId, {
+      name,
+      resolve,
+      reject,
+      holdDeadline: this.nowFn() + ttlMs,
+      delegated
+    });
     rememberCallAlias(slot, toolCallId, responsesCallId(toolCallId));
     for (const token of toolCallIdTokens(toolCallId)) {
       rememberCallAlias(slot, toolCallId, token);
     }
+    if (slot.state === "awaiting_tools") this.refreshHoldDeadline(sessionId);
   }
 
   resolvePending(sessionId: string, toolCallId: string, result: unknown): boolean {
@@ -557,6 +593,8 @@ export class SessionHub {
       slot.state = "running";
       slot.holdDeadline = undefined;
       this.clearHoldTimer(sessionId);
+    } else if (slot.state === "awaiting_tools") {
+      this.refreshHoldDeadline(sessionId);
     }
     return true;
   }
@@ -569,6 +607,15 @@ export class SessionHub {
     slot.pending.delete(toolCallId);
     pending.reject(reason);
     this.touch(sessionId);
+    if (slot.state === "awaiting_tools") {
+      if (slot.pending.size === 0) {
+        slot.state = "running";
+        slot.holdDeadline = undefined;
+        this.clearHoldTimer(sessionId);
+      } else {
+        this.refreshHoldDeadline(sessionId);
+      }
+    }
     return true;
   }
 
@@ -576,8 +623,7 @@ export class SessionHub {
     const slot = this.slots.get(sessionId);
     if (!slot) return;
     slot.state = "awaiting_tools";
-    slot.holdDeadline = this.nowFn() + this.holdTtlMs;
-    this.armHoldTimer(sessionId);
+    this.refreshHoldDeadline(sessionId);
     this.touch(sessionId);
   }
 
@@ -683,9 +729,22 @@ export class SessionHub {
       if (state === "idle" || state === "dead") return id;
     }
     for (const id of ids) {
-      if (this.slots.get(id)?.state === "awaiting_tools") return id;
+      const slot = this.slots.get(id);
+      if (slot?.state === "awaiting_tools" && !slotHasDelegatedHold(slot)) return id;
     }
-    return ids[0];
+    return undefined;
+  }
+
+  private refreshHoldDeadline(sessionId: string): void {
+    const slot = this.slots.get(sessionId);
+    if (!slot) return;
+    let latest: number | undefined;
+    for (const pending of slot.pending.values()) {
+      const deadline = pending.holdDeadline ?? this.nowFn() + (pending.delegated ? this.delegateHoldTtlMs : this.holdTtlMs);
+      if (latest === undefined || deadline > latest) latest = deadline;
+    }
+    slot.holdDeadline = latest ?? this.nowFn() + this.holdTtlMs;
+    this.armHoldTimer(sessionId);
   }
 
   private armHoldTimer(sessionId: string): void {

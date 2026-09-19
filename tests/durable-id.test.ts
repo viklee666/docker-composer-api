@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS,
   DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS,
   DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS,
   DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS,
@@ -28,6 +29,7 @@ test("loadConfig defaults to durable with the session-resume kill switch off", (
   assert.equal(config.cursorSdkDisableSessionResume, false);
   assert.equal(config.cursorSdkSessionMode, "durable");
   assert.equal(config.cursorSdkToolHoldTtlMs, DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS);
+  assert.equal(config.cursorSdkDelegateHoldTtlMs, DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS);
   assert.equal(config.cursorSdkSessionIdleTtlMs, DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS);
   assert.equal(config.cursorSdkMaxLiveSessions, DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS);
   assert.equal(DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS, 900_000);

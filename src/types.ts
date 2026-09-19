@@ -27,6 +27,8 @@ export interface GatewayConfig {
   cursorSdkSessionMode: CursorSdkSessionMode;
   /** 挂起工具 execute 的最长等待（毫秒）。env: CURSOR_SDK_TOOL_HOLD_TTL_MS，默认 15min。 */
   cursorSdkToolHoldTtlMs: number;
+  /** 客户端委派工具（Task 等）的 hold 等待（毫秒）。env: CURSOR_SDK_DELEGATE_HOLD_TTL_MS，默认 60min。 */
+  cursorSdkDelegateHoldTtlMs?: number;
   /** durable 空闲 agent 回收阈值（毫秒）。env: CURSOR_SDK_SESSION_IDLE_TTL_MS，默认 60min。 */
   cursorSdkSessionIdleTtlMs: number;
   /** SessionHub 同时存活的会话上限（LRU）。env: CURSOR_SDK_MAX_LIVE_SESSIONS，默认 256。 */

@@ -18,10 +18,14 @@ const TOOL_ALIASES: Record<string, string[]> = {
 };
 
 /**
- * Claude Code / Cursor 宿主元工具不得进 customTools，否则内层会再演 MCP 发现或 Task 套娃。
- * 精确名、大小写不敏感。GetDynamicTools 是现行 Cursor agent 的发现入口。
+ * 永久隔离的宿主发现/控制工具：不得进 customTools、不得转发给客户端、
+ * 历史结果不当 durable 增量。精确名、大小写不敏感。
+ * GetDynamicTools 是现行 Cursor agent 的发现入口。
+ *
+ * Task / Agent / TaskOutput / TaskStop 不在此列——它们是「客户端委派候选」，
+ * 只有当前请求 tools[] 实际声明了才注册/转发，网关绝不伪造。
  */
-const HOST_META_TOOL_NAMES = new Set([
+const ISOLATED_HOST_TOOL_NAMES = new Set([
   "getmcptools",
   "callmcptool",
   "getdynamictools",
@@ -29,10 +33,6 @@ const HOST_META_TOOL_NAMES = new Set([
   "fetchmcpresource",
   "listmcpresources",
   "mcp_auth",
-  "task",
-  "taskoutput",
-  "taskstop",
-  "agent",
   "skill",
   "slashcommand",
   "enterplanmode",
@@ -42,8 +42,20 @@ const HOST_META_TOOL_NAMES = new Set([
   "askquestion"
 ]);
 
+/** IDE 子代理生命周期工具。候选 ≠ 自动注册；以入站声明为准。 */
+const CLIENT_DELEGATE_TOOL_NAMES = new Set([
+  "task",
+  "agent",
+  "taskoutput",
+  "taskstop"
+]);
+
 export function isHostMetaTool(name: string): boolean {
-  return HOST_META_TOOL_NAMES.has(name.toLowerCase());
+  return ISOLATED_HOST_TOOL_NAMES.has(name.toLowerCase());
+}
+
+export function isClientDelegateTool(name: string): boolean {
+  return CLIENT_DELEGATE_TOOL_NAMES.has(name.toLowerCase());
 }
 
 export function filterHostMetaTools(tools: GatewayTool[]): GatewayTool[] {
@@ -160,7 +172,7 @@ export function createSdkCustomTools(
 export function normalizeToolCallForClient(toolCall: GatewayToolCall, tools: GatewayTool[]): GatewayToolCall {
   const withSafeId = withSanitizedToolCallId(toolCall);
   if (!tools.length) return withSafeId;
-  const unwrapped = withSanitizedToolCallId(unwrapMcpToolCall(withSafeId));
+  const unwrapped = withSanitizedToolCallId(unwrapMcpToolCall(withSafeId, tools));
   const tool = findClientTool(unwrapped.name, tools);
   if (!tool) return unwrapped;
   return {
@@ -178,9 +190,12 @@ function withSanitizedToolCallId(toolCall: GatewayToolCall): GatewayToolCall {
 /** 该调用（解包/别名映射后）是否命中客户端声明过的工具；未命中的内置工具调用不应转发给客户端。 */
 export function matchesClientTool(toolCall: GatewayToolCall, tools: GatewayTool[]): boolean {
   if (!tools.length) return false;
-  const unwrapped = unwrapMcpToolCall(toolCall);
-  // unwrap 后内层 toolName 若是 GetMcpTools / Task 等宿主元名，直接 false，不转发。
+  const unwrapped = unwrapMcpToolCall(toolCall, tools);
+  // 发现/控制类即使客户端声明了也不转发。
   if (isHostMetaTool(unwrapped.name)) return false;
+  if (isClientDelegateTool(unwrapped.name) && !delegateCallFromRegisteredMapping(toolCall, unwrapped, tools)) {
+    return false;
+  }
   return findClientTool(unwrapped.name, tools) !== undefined;
 }
 
@@ -188,12 +203,15 @@ export function normalizeToolCallsForClient(toolCalls: GatewayToolCall[], tools:
   return toolCalls.map((toolCall) => normalizeToolCallForClient(toolCall, tools));
 }
 
-function unwrapMcpToolCall(toolCall: GatewayToolCall): GatewayToolCall {
+function unwrapMcpToolCall(toolCall: GatewayToolCall, tools: GatewayTool[] = []): GatewayToolCall {
   const envelope = unwrapCallEnvelope(toolCall);
   const args = envelope.arguments;
   const toolName = stringValue(args.toolName ?? args.tool_name ?? args.name);
   const provider = stringValue(args.providerIdentifier ?? args.provider_identifier ?? args.server);
-  if (toolName && (provider === "custom-user-tools" || envelope.name === "mcp" || envelope.name === "CallMcpTool")) {
+  // 只接受 custom-user-tools / 裸 mcp 外壳。CallMcpTool 是客户端动态调用入口，不得当委派通道。
+  if (toolName && isCustomUserToolsEnvelope(envelope.name, provider)) {
+    if (isHostMetaTool(toolName)) return envelope;
+    if (isClientDelegateTool(toolName) && !findClientTool(toolName, tools)) return envelope;
     const nestedRaw = args.args ?? args.arguments ?? args.input;
     const nestedArgs = recordValue(nestedRaw);
     // 嵌套参数存在但无法解析（畸形 JSON 字符串等）时不能静默降级成 {}——那会给客户端发缺参调用。
@@ -204,10 +222,34 @@ function unwrapMcpToolCall(toolCall: GatewayToolCall): GatewayToolCall {
     return { ...toolCall, name: toolName, arguments: nestedArgs ?? {} };
   }
   const customPrefix = "custom-user-tools-";
-  if (envelope.name.startsWith(customPrefix)) {
-    return { ...envelope, name: envelope.name.slice(customPrefix.length), arguments: args };
+  if (envelope.name.toLowerCase().startsWith(customPrefix)) {
+    const innerName = envelope.name.slice(customPrefix.length);
+    if (isHostMetaTool(innerName)) return envelope;
+    if (isClientDelegateTool(innerName) && !findClientTool(innerName, tools)) return envelope;
+    return { ...envelope, name: innerName, arguments: args };
   }
   return envelope;
+}
+
+function isCustomUserToolsEnvelope(envelopeName: string, provider: string | undefined): boolean {
+  if (provider === "custom-user-tools") return true;
+  return envelopeName === "mcp";
+}
+
+/**
+ * 委派类工具必须来自已注册的客户端映射：直呼声明名，或 custom-user-tools 外壳解包到声明名。
+ * 不能仅因外壳叫 mcp / CallMcpTool 就放行 Task。
+ */
+function delegateCallFromRegisteredMapping(
+  original: GatewayToolCall,
+  unwrapped: GatewayToolCall,
+  tools: GatewayTool[]
+): boolean {
+  if (!findClientTool(unwrapped.name, tools)) return false;
+  if (findClientTool(original.name, tools)) return true;
+  const provider = stringValue(original.arguments.providerIdentifier ?? original.arguments.provider_identifier ?? original.arguments.server);
+  return isCustomUserToolsEnvelope(original.name, provider)
+    || original.name.toLowerCase().startsWith("custom-user-tools-");
 }
 
 /** `to=Shell {"name":"Shell","arguments":{command}}` 不能把外壳当参数交给 Cursor。 */

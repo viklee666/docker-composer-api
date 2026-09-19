@@ -45,12 +45,13 @@ test("PARALLEL_TOOL_SETTLE_MS is 25ms and injectable on the hub", () => {
   assert.equal(hub.parallelToolSettleMs, 0);
 });
 
-test("hub configure updates TTL and live-session cap", () => {
+test("hub configure updates TTL and live-session cap", async () => {
   const hub = new SessionHub({ holdTtlMs: 1000, idleTtlMs: 2000, maxLiveSessions: 3 });
   hub.configure({ holdTtlMs: 5000, idleTtlMs: 6000, maxLiveSessions: 8 });
   assert.equal(hub.holdTtlMs, 5000);
   assert.equal(hub.idleTtlMs, 6000);
   assert.equal(hub.maxLiveSessions, 8);
+  await hub.dropAll();
 });
 
 test("hub parks HTTP1 on pending execute and resumes the same run after HTTP2 resolve", async () => {
@@ -431,6 +432,45 @@ test("max live sessions evict LRU idle slots", async () => {
   assert.equal(b.disposed, true);
   assert.equal(a.disposed, false);
   assert.deepEqual(deleted, ["sess-b"]);
+  await hub.dropAll();
+});
+
+test("delegated Task hold uses the longer TTL and is not LRU-evicted", async () => {
+  let now = 1_000;
+  const hub = new SessionHub({
+    holdTtlMs: 5_000,
+    delegateHoldTtlMs: 60_000,
+    maxLiveSessions: 1,
+    now: () => now
+  });
+  const parent = new FakeAgent("single");
+  hub.put("sess-parent", createSessionSlot({
+    agent: parent,
+    agentId: "parent",
+    apiKey: "k",
+    model: "m"
+  }));
+  hub.registerHold("sess-parent", "call_task", "Task", () => undefined, () => undefined, { delegated: true });
+  hub.beginAwaitingTools("sess-parent");
+  const parentSlot = hub.get("sess-parent");
+  assert.ok(parentSlot);
+  assert.equal(parentSlot.holdDeadline, 61_000);
+
+  now = 10_000;
+  assert.ok(hub.get("sess-parent"), "ordinary 15min TTL must not expire a delegated Task");
+
+  const incoming = new FakeAgent("single");
+  assert.throws(
+    () => hub.put("sess-new", createSessionSlot({
+      agent: incoming,
+      agentId: "new",
+      apiKey: "k",
+      model: "m"
+    })),
+    (error: unknown) => error instanceof Error && error.message.includes("delegated")
+  );
+  assert.ok(hub.get("sess-parent"), "LRU must not drop a parent waiting on Task");
+  assert.equal(parent.disposed, false);
   await hub.dropAll();
 });
 

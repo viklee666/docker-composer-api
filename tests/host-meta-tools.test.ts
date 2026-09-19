@@ -10,8 +10,8 @@ import type { GatewayTool } from "../src/types.js";
 
 /**
  * 宿主元工具过滤（090d4a7，983be1f 拆除后又补回）：
- * Task / GetMcpTools / GetDynamicTools 等不得进 customTools、不得转发、结果不得当 durable 增量。
- * 否则 SDK 只留 mcp 通道时模型会每轮再演一遍发现仪式。
+ * GetMcpTools / GetDynamicTools 等发现/控制类不得进 customTools、不得转发、结果不得当 durable 增量。
+ * 客户端声明的 Task/Agent 走委派通道，按声明转发。
  */
 
 const getMcpTools: GatewayTool = {
@@ -38,10 +38,10 @@ const readTool: GatewayTool = {
 
 const clientTools: GatewayTool[] = [getMcpTools, taskTool, readTool];
 
-test("createSdkCustomTools drops host-meta tools and keeps Read", () => {
+test("createSdkCustomTools drops isolated host-meta tools and keeps Read plus declared Task", () => {
   const customTools = createSdkCustomTools(clientTools, () => {});
   assert.ok(customTools);
-  assert.deepEqual(Object.keys(customTools), ["Read"]);
+  assert.deepEqual(Object.keys(customTools).sort(), ["Read", "Task"]);
 });
 
 test("createSdkCustomTools hold:true registers Read and drives its execute through onHold", async () => {
@@ -55,7 +55,7 @@ test("createSdkCustomTools hold:true registers Read and drives its execute throu
     }
   });
   assert.ok(customTools);
-  assert.equal(customTools.Task, undefined, "Task 是宿主元工具，不能进 customTools");
+  assert.ok(customTools.Task, "客户端声明了 Task，应作为委派工具注册");
   const pending = customTools.Read!.execute({ file_path: "README.md" }, { toolCallId: "call_read_1" });
   assert.equal(held, true, "Read execute 必须经 onHold 挂起");
   release[0]({ content: [{ type: "text", text: "subagent done" }] });
@@ -106,11 +106,11 @@ test("createSdkCustomTools hold:false returns the exact fake-success copy synchr
   });
 });
 
-test("matchesClientTool rejects client-declared Task and GetMcpTools", () => {
+test("matchesClientTool forwards client-declared Task but still rejects GetMcpTools", () => {
   assert.equal(
-    matchesClientTool({ id: "call_task", name: "Task", arguments: { prompt: "x" } }, clientTools),
-    false,
-    "即使客户端声明了 Task 也不转发，避免子代理/MCP 发现套娃"
+    matchesClientTool({ id: "call_task", name: "Task", arguments: { description: "explore", prompt: "x" } }, clientTools),
+    true,
+    "客户端声明了 Task 时按委派工具转发"
   );
   assert.equal(
     matchesClientTool({ id: "call_meta", name: "GetMcpTools", arguments: {} }, clientTools),
@@ -137,7 +137,7 @@ test("matchesClientTool still rejects tools the client never declared", () => {
   );
 });
 
-test("matchesClientTool does not unwrap mcp-wrapped Task onto the client", () => {
+test("matchesClientTool unwraps custom-user-tools Task only when the client declared Task", () => {
   assert.equal(
     matchesClientTool(
       {
@@ -146,26 +146,41 @@ test("matchesClientTool does not unwrap mcp-wrapped Task onto the client", () =>
         arguments: {
           providerIdentifier: "custom-user-tools",
           toolName: "Task",
+          args: { description: "explore", prompt: "search SessionHub" }
+        }
+      },
+      clientTools
+    ),
+    true
+  );
+  assert.equal(
+    matchesClientTool(
+      {
+        id: "c",
+        name: "CallMcpTool",
+        arguments: {
+          toolName: "Task",
           args: { prompt: "explore" }
         }
       },
       clientTools
     ),
-    false
+    false,
+    "CallMcpTool 外壳不得当成委派通道"
   );
 });
 
-test("extractDurableTurn drops Task tool results instead of sending them upstream", () => {
+test("extractDurableTurn keeps declared Task results as a normal durable increment", () => {
   const turn = extractDurableTurn("anthropic-messages", {
     max_tokens: 64,
     messages: [
       { role: "user", content: "review the changes" },
-      { role: "assistant", content: [{ type: "tool_use", id: "call_task_9", name: "Task", input: { prompt: "review" } }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_task_9", name: "Task", input: { description: "review", prompt: "review" } }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "call_task_9", content: "subagent report" }] }
     ]
   });
-  assert.notEqual(turn.kind, "tool_results");
-  assert.equal(turn.toolResults, undefined);
+  assert.equal(turn.kind, "tool_results");
+  assert.deepEqual(turn.toolResults, [{ id: "call_task_9", content: "subagent report" }]);
 });
 
 test("normalizeToolCallForClient still unwraps custom-user-tools MCP calls to Read", () => {

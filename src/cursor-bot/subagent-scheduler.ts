@@ -17,9 +17,8 @@ import type { ToolExecution } from "./tool-loop.js";
 
 /**
  * 工具名刻意不叫 `Task`。
- * `tool-compat.ts` 明确把宿主元工具 `Task` 挡在 customTools 之外
- * （"否则内层会再演 MCP 发现或 Task 套娃"）。那条过滤规则不动，
- * 网关在 `tools[]` 里追加自己的这一个，两者不撞名。
+ * 发现/控制类宿主元工具仍挡在 customTools 之外；IDE 声明的 `Task` 走客户端委派通道，
+ * 与网关自己编排的 `spawn_subagent` 不撞名。
  */
 export const SUBAGENT_TOOL_NAME = "spawn_subagent";
 

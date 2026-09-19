@@ -24,7 +24,7 @@ import {
   type SessionHub,
   type SessionSlot
 } from "./session-hub.js";
-import { createSdkCustomTools, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
+import { createSdkCustomTools, isClientDelegateTool, matchesClientTool, normalizeToolCallForClient, normalizeToolCallsForClient } from "./tool-compat.js";
 import type {
   AgentMode,
   CursorRunRequest,
@@ -903,7 +903,12 @@ export class CursorSdkRunner implements CursorRunner {
         // deliveredUserText 不播种：resume 轮 lastUserText 缺号，重试判定的「已交付」分支天然走不到。
         lastAssistantDigest: turn?.assistantDigest
       });
-      hub.put(sessionId, slot);
+      try {
+        hub.put(sessionId, slot);
+      } catch (error) {
+        await withCleanupTimeout(Promise.resolve(slot.agent.close?.())).catch(() => undefined);
+        throw error;
+      }
       this.durableCapturedPumps.set(sessionId, customTools.pumpRef);
       if (slot.agentId && slot.agentId !== agentId) {
         await this.store.saveSession(sessionId, slot.agentId);
@@ -971,7 +976,12 @@ export class CursorSdkRunner implements CursorRunner {
       systemFingerprint: turn?.systemFingerprint ?? "",
       state: "running"
     });
-    hub.put(sessionId, slot);
+    try {
+      hub.put(sessionId, slot);
+    } catch (error) {
+      await withCleanupTimeout(Promise.resolve(slot.agent.close?.())).catch(() => undefined);
+      throw error;
+    }
     this.durableCapturedPumps.set(sessionId, customTools.pumpRef);
     await this.store.saveSession(sessionId, slot.agentId);
     recordDurableDecision({
@@ -1012,7 +1022,10 @@ export class CursorSdkRunner implements CursorRunner {
     }, {
       hold: true,
       onHold: (toolCallId, resolve, reject) => {
-        hub.registerHold(sessionId, toolCallId, toolNames.get(toolCallId) ?? "tool", resolve, reject);
+        const name = toolNames.get(toolCallId) ?? "tool";
+        hub.registerHold(sessionId, toolCallId, name, resolve, reject, {
+          delegated: isClientDelegateTool(name)
+        });
       }
     });
     return { tools, pumpRef };
@@ -1261,7 +1274,7 @@ export class CursorSdkRunner implements CursorRunner {
       const declared = keepDeclaredOnly([toolCall]);
       if (!declared.length) return undefined;
       const normalized = normalizeToolCallForClient(declared[0], input.tools);
-      if (toolCalls.some((item) => item.id === normalized.id || sameToolInvocation(item, normalized))) {
+      if (toolCalls.some((item) => item.id === normalized.id || (!isClientDelegateTool(normalized.name) && sameToolInvocation(item, normalized)))) {
         return undefined;
       }
       // 已交付去重：SDK 消息级事件会整段重放 run 的 assistant 内容（含早前轮次的 tool_use），
@@ -1305,8 +1318,10 @@ export class CursorSdkRunner implements CursorRunner {
       if (slot.pending.size > 0) {
         for (const toolCall of capturedToolCalls) collectHeldToolCall(toolCall);
         for (const eventCall of sdkEventToolCalls) {
-          if (toolCalls.some((item) => item.id === eventCall.id || sameToolInvocation(item, eventCall))) continue;
-          const matchId = [...slot.pending.keys()].find((id) => slot.pending.get(id)?.name === eventCall.name);
+          if (toolCalls.some((item) => item.id === eventCall.id || (!isClientDelegateTool(eventCall.name) && sameToolInvocation(item, eventCall)))) continue;
+          const matchId = isClientDelegateTool(eventCall.name)
+            ? [...slot.pending.keys()].find((id) => id === eventCall.id || toolCallIdsOverlap(id, eventCall.id))
+            : [...slot.pending.keys()].find((id) => slot.pending.get(id)?.name === eventCall.name);
           if (matchId) collectHeldToolCall({ ...eventCall, id: matchId });
         }
       } else {
@@ -1851,12 +1866,19 @@ export class CursorSdkRunner implements CursorRunner {
         ...(customTools ? { customTools } : {})
       },
       clientVersion: this.input.sdkClientVersion,
-      // SDK >=1.0.27 的内置工具限制：无客户端工具 → []（纯文本，agent 不能动网关容器的文件/命令）；
-      // 有客户端工具 → 只留 "mcp" 元工具通道（send 时注入的 customTools 经 custom-user-tools MCP server 暴露）。
-      // 这从根上阻止 agent 在网关侧真实执行 shell/edit 后又把调用转发给客户端造成双重执行。
-      ...(liveFlag(this.input.allowBuiltinTools) ? {} : { tools: input.tools.length ? ["mcp"] : [] }),
+      // SDK 内置工具限制：IDE 转发路线永远不开放内层 `"task"`（原生 SDK 子代理）。
+      // 无客户端工具 → []（纯文本）；有客户端工具 → 只留 "mcp"（customTools 经 custom-user-tools 暴露）。
+      // allowBuiltinTools 只放开容器内 shell/edit 等，仍用 disallowedTools 关掉 task，避免静默绕过。
+      ...this.innerSdkToolLimits(input),
       ...(resolved.mode ? { mode: resolved.mode } : {})
     };
+  }
+
+  private innerSdkToolLimits(input: CursorRunRequest): Record<string, unknown> {
+    if (liveFlag(this.input.allowBuiltinTools)) {
+      return { disallowedTools: ["task"] };
+    }
+    return { tools: input.tools.length ? ["mcp"] : [] };
   }
 
   private sdkMessage(input: CursorRunRequest): unknown {

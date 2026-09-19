@@ -15,6 +15,8 @@ import type {
 
 /** 挂起工具 execute 的默认等待（15min）。env: CURSOR_SDK_TOOL_HOLD_TTL_MS。 */
 export const DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS = 900_000;
+/** 客户端委派工具（Task 等）的默认 hold 等待（60min）。env: CURSOR_SDK_DELEGATE_HOLD_TTL_MS。 */
+export const DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS = 3_600_000;
 /** durable 空闲 agent 默认回收阈值（60min）。env: CURSOR_SDK_SESSION_IDLE_TTL_MS。 */
 export const DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS = 3_600_000;
 /** SessionHub / 共享内存 store 默认同时存活会话上限。env: CURSOR_SDK_MAX_LIVE_SESSIONS。 */
@@ -41,6 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     // kill switch 打开时强制 stateless，即使 env 写了 durable。
     cursorSdkSessionMode: cursorSdkDisableSessionResume ? "stateless" : requestedSessionMode,
     cursorSdkToolHoldTtlMs: integerValue(env.CURSOR_SDK_TOOL_HOLD_TTL_MS, DEFAULT_CURSOR_SDK_TOOL_HOLD_TTL_MS),
+    cursorSdkDelegateHoldTtlMs: integerValue(env.CURSOR_SDK_DELEGATE_HOLD_TTL_MS, DEFAULT_CURSOR_SDK_DELEGATE_HOLD_TTL_MS),
     cursorSdkSessionIdleTtlMs: integerValue(env.CURSOR_SDK_SESSION_IDLE_TTL_MS, DEFAULT_CURSOR_SDK_SESSION_IDLE_TTL_MS),
     cursorSdkMaxLiveSessions: integerValue(env.CURSOR_SDK_MAX_LIVE_SESSIONS, DEFAULT_CURSOR_SDK_MAX_LIVE_SESSIONS),
     cursorSdkUseHttp1ForAgent: booleanValue(env.CURSOR_SDK_USE_HTTP1_FOR_AGENT, false),

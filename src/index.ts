@@ -225,6 +225,7 @@ const localAgentStore = createSqliteAgentStore(
 // 始终建 Hub：后台从 stateless 切回 durable 才不必重启。stateless / kill switch 只让 runner 不用它。
 const sessionHub = new SessionHub({
   holdTtlMs: config.cursorSdkToolHoldTtlMs,
+  delegateHoldTtlMs: config.cursorSdkDelegateHoldTtlMs,
   idleTtlMs: config.cursorSdkSessionIdleTtlMs,
   maxLiveSessions: config.cursorSdkMaxLiveSessions,
   store

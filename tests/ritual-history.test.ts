@@ -93,7 +93,7 @@ test("stripRitualAssistantText leaves earlier answer unchanged", () => {
   assert.equal(stripRitualAssistantText(EARLIER_ANSWER), EARLIER_ANSWER);
 });
 
-test("prepareAnthropicMessages TOOLS/REMINDER keep Read and drop GetMcpTools/Task", () => {
+test("prepareAnthropicMessages TOOLS/REMINDER keep Read and declared Task, drop GetMcpTools", () => {
   const prepared = prepareAnthropicMessages({
     model: "composer-2.5",
     max_tokens: 1024,
@@ -112,7 +112,7 @@ test("prepareAnthropicMessages TOOLS/REMINDER keep Read and drop GetMcpTools/Tas
   assert.ok(section.includes("TOOLS:"), "prompt must include a TOOLS section");
   assert.ok(section.includes("REMINDER:"), "prompt must include a REMINDER section");
   assert.equal(section.includes("GetMcpTools"), false, "host-meta GetMcpTools must not enter TOOLS");
-  assert.equal(section.includes("Task"), false, "host-meta Task must not enter TOOLS");
+  assert.ok(section.includes("Task"), "declared Task is a client-delegate tool and must enter TOOLS");
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
 });
 
@@ -157,7 +157,7 @@ test("prepareOpenAiChat drops ritual assistant content and keeps user schema men
   assert.ok(prompt.includes(USER_SCHEMA_MESSAGE), "user content mentioning schema must remain");
 });
 
-test("prepareOpenAiChat TOOLS/REMINDER keep Read and drop GetMcpTools/Task", () => {
+test("prepareOpenAiChat TOOLS/REMINDER keep Read and declared Task, drop GetMcpTools", () => {
   const prepared = prepareOpenAiChat({
     model: "composer-2.5",
     messages: [{ role: "user", content: "Hello" }],
@@ -170,7 +170,7 @@ test("prepareOpenAiChat TOOLS/REMINDER keep Read and drop GetMcpTools/Task", () 
   const section = toolsAndReminder(prepared.prompt);
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
   assert.equal(section.includes("GetMcpTools"), false, "host-meta GetMcpTools must not enter TOOLS");
-  assert.equal(section.includes("Task"), false, "host-meta Task must not enter TOOLS");
+  assert.ok(section.includes("Task"), "declared Task is a client-delegate tool and must enter TOOLS");
 });
 
 test("prepareOpenAiChat drops host-meta tool_calls and their tool results from history", () => {
@@ -198,7 +198,7 @@ test("prepareOpenAiChat drops host-meta tool_calls and their tool results from h
   assert.ok(prompt.includes("file body"), "Read tool result stays");
 });
 
-test("prepareOpenAiResponses TOOLS/REMINDER keep Read and drop GetMcpTools/Task", () => {
+test("prepareOpenAiResponses TOOLS/REMINDER keep Read and declared Task, drop GetMcpTools", () => {
   const prepared = prepareOpenAiResponses({
     model: "composer-2.5",
     input: "Hello",
@@ -211,7 +211,7 @@ test("prepareOpenAiResponses TOOLS/REMINDER keep Read and drop GetMcpTools/Task"
   const section = toolsAndReminder(prepared.prompt);
   assert.ok(section.includes("Read"), "TOOLS/REMINDER must still contain Read");
   assert.equal(section.includes("GetMcpTools"), false, "host-meta GetMcpTools must not enter TOOLS");
-  assert.equal(section.includes("Task"), false, "host-meta Task must not enter TOOLS");
+  assert.ok(section.includes("Task"), "declared Task is a client-delegate tool and must enter TOOLS");
 });
 
 test("prepareOpenAiResponses drops ritual assistant input and host-meta function_call items", () => {
